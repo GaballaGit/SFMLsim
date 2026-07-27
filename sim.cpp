@@ -44,10 +44,12 @@ struct barb {
     int stepTimer = 0;
     bool targetIsRock = false;
     bool deertargeting = false;
+    int targetDeerId = -1;
 };
 
 struct deer {
 int x, y;
+int id = -1;
 int health = 100;
 int stepTimer = 0;
 bool moving = false;
@@ -55,6 +57,8 @@ int targetx = -1, targety = -1;
 bool invincible = false;
 int invincibleTimer = 0;
 };
+
+int nextDeerId = 0;
 
 struct tree  {int x, y, health; bool dying = false;};
 struct rock  {int x, y, health; bool dying = false;};
@@ -87,6 +91,9 @@ void deerkilling(vector<deer>& deers, vector<RectangleShape>& deershape, vector<
 				float dx = deerpos.x - bpos.x, dy = deerpos.y - bpos.y;
 				if (dx * dx + dy * dy >= deerInfluenceDSq) continue;
 				b.deertargeting = true;
+				b.targetDeerId = d.id;
+			} else if (b.targetDeerId != d.id) {
+				continue;
 			}
 			b.targetx = (int)deerpos.x;
 			b.targety = (int)deerpos.y;
@@ -101,6 +108,7 @@ void deerkilling(vector<deer>& deers, vector<RectangleShape>& deershape, vector<
 					swapRemove(deers, i);
 					swapRemove(deershape, i);
 					b.deertargeting = false;
+					b.targetDeerId = -1;
 					b.moving = false;
 					food++;
 					printf("DEER KILLED - Food: %d\n", food);
@@ -115,6 +123,7 @@ void deerspawn(vector<deer>& deers, vector<RectangleShape>& deershape) {
 	if (deers.size() >= 10) return;
 	deer d;
 	if (DeerSpawnChance(gen) != 0) return;
+	d.id = nextDeerId++;
 	if (DeerSpawnRL(gen) == 0) {
 		d.x = -20;
 		d.targetx = DeerSpawnXgotoL(gen); 
