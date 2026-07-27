@@ -78,7 +78,6 @@ void deerkilling(vector<deer>& deers, vector<RectangleShape>& deershape, vector<
 void deerspawn(vector<deer>& deers, vector<RectangleShape>& deershape) {
 	if (deers.size() >= 1) return;
 
-void deerspawn(vector<deer>& deers, vector<RectangleShape>& deershape) {
 	deer d;
 	if (DeerSpawnChance(gen) != 0) return;
 	if (DeerSpawnRL(gen) == 0) {
