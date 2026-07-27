@@ -42,6 +42,7 @@ struct barb {
     bool reservedwood = false;
     int stepTimer = 0;
     bool targetIsRock = false;
+    bool deertarget = false;
 };
 
 struct deer {
@@ -67,17 +68,21 @@ void deerkilling(vector<deer>& deers, vector<RectangleShape>& deershape, vector<
 		auto& d = deers[i];
 		Vector2f deerpos = ds.getPosition();
 			for (int j = 0; j < (int)barbs.size(); ++j) {
-				auto& b = barbs[i];
-				auto& sq = squares[i];
-				if (b.building || b.movingbspot || b.chopping) continue;
-				
+				auto& b = barbs[j];
+				auto& sq = squares[j];
+				if (b.building || b.movingbspot || b.chopping || b.timer > 0) continue;
+				b.targetx = (int)deerpos.x;
+				b.targety = (int)deerpos.y;
+				b.moving = true;
+				if (sq.getGlobalBounds().intersects(ds.getGlobalBounds())) {
+					printf("DEER DEATH!\n");
+				}
 		}
 	}
 }
 
 void deerspawn(vector<deer>& deers, vector<RectangleShape>& deershape) {
 	if (deers.size() >= 1) return;
-
 	deer d;
 	if (DeerSpawnChance(gen) != 0) return;
 	if (DeerSpawnRL(gen) == 0) {
@@ -91,10 +96,10 @@ void deerspawn(vector<deer>& deers, vector<RectangleShape>& deershape) {
 	d.targety = d.y;
 	d.moving  = true;
 	deers.push_back(d);
-
 	RectangleShape ds;
 	ds.setPosition(Vector2f(d.x, d.y));
 	ds.setSize(Vector2f(6, 3));
+	FloatRect deerHitbox = ds.getGlobalBounds();
 	ds.setFillColor(Color(192, 133, 82));
 	deershape.push_back(ds);
 	printf("%zu\n", deers.size());
@@ -123,6 +128,7 @@ void deerwander(vector<RectangleShape>& deershape, vector<deer>& deers) {
             } else if (++d.stepTimer >= 10) {
                 d.stepTimer = 0;
                 ds.move(diff / sqrt(dSq));
+		ds.getGlobalBounds();
             }
         }
     }
@@ -212,7 +218,7 @@ void barbspawner(vector<RectangleShape>& squares, vector<barb>& barbs, vector<Re
     }
 }
 
-void barbwander(vector<RectangleShape>& squares, vector<barb>& barbs) {
+void barbmove(vector<RectangleShape>& squares, vector<barb>& barbs) {
     for (int i = 0; i < (int)squares.size(); i++) {
         auto& sq = squares[i];
         auto& b  = barbs[i];
@@ -236,6 +242,7 @@ void barbwander(vector<RectangleShape>& squares, vector<barb>& barbs) {
             } else if (++b.stepTimer >= 10) {
                 b.stepTimer = 0;
                 sq.move(diff / sqrt(dSq));
+		sq.getGlobalBounds();
             }
         }
     }
@@ -389,6 +396,7 @@ int main() {
     for (auto& b : barbs) {
         RectangleShape sq;
         sq.setPosition(Vector2f(b.x, b.y));
+	sq.getGlobalBounds();
         sq.setSize(Vector2f(2, 2));
         sq.setFillColor(Color::White);
         squares.push_back(sq);
@@ -442,11 +450,12 @@ int main() {
             timesincelastupdate -= Timepertick;
             buildhouse(barbs, squares, houses, houseshapes);
             minematerials(squares, barbs, tris, stumps, trees, octs, rocks);
-            barbwander(squares, barbs);
+            barbmove(squares, barbs);
             treespawn(trees, tris, stumps);
             barbspawner(squares, barbs, houseshapes);
 	    deerspawn(deers, deershape);
 	    deerwander(deershape, deers);
+	    deerkilling(deers, deershape, barbs, squares);
             clockk();
         }
 
@@ -485,8 +494,7 @@ int main() {
 		window.draw(ds);
 
         for (int i = 0; i < (int)tris.size(); i++) {
-            window.draw(tris[i]);
-            window.draw(stumps[i]);
+        	window.draw(stumps[i]);
         }
 	
         for (int j = 0; j < (int)squares.size(); j++) {
@@ -517,6 +525,9 @@ int main() {
                 window.draw(fgBar);
 	    }
         }
+
+	for (int k = 0; k < (int)tris.size(); ++k)
+		window.draw(tris[k]);
 
         int t = game_time;
         if (t >= 21 || t < 6)      {dnc.setFillColor(Color(4, 7, 32, 150));}      // Night
