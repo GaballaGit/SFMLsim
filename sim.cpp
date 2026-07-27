@@ -77,6 +77,8 @@ void deerkilling(vector<deer>& deers, vector<RectangleShape>& deershape, vector<
 
 void deerspawn(vector<deer>& deers, vector<RectangleShape>& deershape) {
 	if (deers.size() >= 1) return;
+
+void deerspawn(vector<deer>& deers, vector<RectangleShape>& deershape) {
 	deer d;
 	if (DeerSpawnChance(gen) != 0) return;
 	if (DeerSpawnRL(gen) == 0) {
@@ -96,6 +98,7 @@ void deerspawn(vector<deer>& deers, vector<RectangleShape>& deershape) {
 	ds.setSize(Vector2f(6, 3));
 	ds.setFillColor(Color(192, 133, 82));
 	deershape.push_back(ds);
+	printf("%zu\n", deers.size());
 }
 
 void deerwander(vector<RectangleShape>& deershape, vector<deer>& deers) {
