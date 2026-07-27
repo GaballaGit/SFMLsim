@@ -12,6 +12,7 @@ const int numrocks = 100;
 
 int wood = 0;
 int stone = 0;
+int food = 0;
 int game_time = 12;
 
 mt19937 gen(random_device{}());
@@ -42,7 +43,7 @@ struct barb {
     bool reservedwood = false;
     int stepTimer = 0;
     bool targetIsRock = false;
-    bool deertarget = false;
+    bool deertargeting = false;
 };
 
 struct deer {
@@ -51,6 +52,8 @@ int health = 100;
 int stepTimer = 0;
 bool moving = false;
 int targetx = -1, targety = -1;
+bool invincible = false;
+int invincibleTimer = 0;
 };
 
 struct tree  {int x, y, health; bool dying = false;};
@@ -63,26 +66,53 @@ void swapRemove(vector<T>& v, int i) {
 }
 
 void deerkilling(vector<deer>& deers, vector<RectangleShape>& deershape, vector<barb>& barbs, vector<RectangleShape>& squares) {
+	const float deerInfluenceDSq = 625.0f;
 	for (int i = 0; i < (int)deers.size(); ++i) {
 		auto& ds = deershape[i];
 		auto& d = deers[i];
 		Vector2f deerpos = ds.getPosition();
-			for (int j = 0; j < (int)barbs.size(); ++j) {
-				auto& b = barbs[j];
-				auto& sq = squares[j];
-				if (b.building || b.movingbspot || b.chopping || b.timer > 0) continue;
-				b.targetx = (int)deerpos.x;
-				b.targety = (int)deerpos.y;
-				b.moving = true;
-				if (sq.getGlobalBounds().intersects(ds.getGlobalBounds())) {
-					printf("DEER DESTRUCTION!\n");
+		if (d.invincible) {
+			ds.setFillColor(d.invincibleTimer > 50 ? Color::Red : Color(192, 133, 82));
+			if (--d.invincibleTimer <= 0) {
+				d.invincible = false;
+				ds.setFillColor(Color(192, 133, 82));
+			}
+		}
+		for (int j = 0; j < (int)barbs.size(); ++j) {
+			auto& b = barbs[j];
+			auto& sq = squares[j];
+			if (b.building || b.movingbspot || b.chopping || b.timer > 0) continue;
+			if (!b.deertargeting) {
+				Vector2f bpos = sq.getPosition();
+				float dx = deerpos.x - bpos.x, dy = deerpos.y - bpos.y;
+				if (dx * dx + dy * dy >= deerInfluenceDSq) continue;
+				b.deertargeting = true;
+			}
+			b.targetx = (int)deerpos.x;
+			b.targety = (int)deerpos.y;
+			b.moving = true;
+			if (!d.invincible && sq.getGlobalBounds().intersects(ds.getGlobalBounds())) {
+				d.health -= 5;
+				d.invincible = true;
+				d.invincibleTimer = 60;
+				ds.setFillColor(Color::Red);
+				printf("Deer Health: %d\n", d.health);
+				if (d.health <= 0) {
+					swapRemove(deers, i);
+					swapRemove(deershape, i);
+					b.deertargeting = false;
+					b.moving = false;
+					food++;
+					printf("DEER KILLED - Food: %d\n", food);
+					break;
 				}
+			}
 		}
 	}
 }
 
 void deerspawn(vector<deer>& deers, vector<RectangleShape>& deershape) {
-	if (deers.size() >= 1) return;
+	if (deers.size() >= 10) return;
 	deer d;
 	if (DeerSpawnChance(gen) != 0) return;
 	if (DeerSpawnRL(gen) == 0) {
@@ -125,7 +155,7 @@ void deerwander(vector<RectangleShape>& deershape, vector<deer>& deers) {
             if (dSq < 1.0f) {
                 d.moving    = false;
                 d.stepTimer = 0;
-            } else if (++d.stepTimer >= 10) {
+            } else if (++d.stepTimer >= 3) {
                 d.stepTimer = 0;
                 ds.move(diff / sqrt(dSq));
 		ds.getGlobalBounds();
@@ -499,7 +529,11 @@ int main() {
 	
         for (int j = 0; j < (int)squares.size(); j++) {
             window.draw(squares[j]);
-            auto& b = barbs[j];
+	}
+	for (int k = 0; k < (int)tris.size(); ++k)
+		window.draw(tris[k]);
+	for (int q = 0; q < (int)squares.size(); ++q) {
+            auto& b = barbs[q];
             if (b.chopping && b.timer > 0 && !b.targetIsRock) {
                 bgBar.setPosition(Vector2f(b.targetx - 10, b.targety - 20));
                 window.draw(bgBar);
@@ -524,10 +558,7 @@ int main() {
                 fgBar.setPosition(Vector2f(b.targetx - 10, b.targety - 16));
                 window.draw(fgBar);
 	    }
-        }
-
-	for (int k = 0; k < (int)tris.size(); ++k)
-		window.draw(tris[k]);
+	}
 
         int t = game_time;
         if (t >= 21 || t < 6)      {dnc.setFillColor(Color(4, 7, 32, 150));}      // Night
