@@ -75,7 +75,7 @@ void deerkilling(vector<deer>& deers, vector<RectangleShape>& deershape, vector<
 				b.targety = (int)deerpos.y;
 				b.moving = true;
 				if (sq.getGlobalBounds().intersects(ds.getGlobalBounds())) {
-					printf("DEER DEATH!\n");
+					printf("DEER DESTRUCTION!\n");
 				}
 		}
 	}
