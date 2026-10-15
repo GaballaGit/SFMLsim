@@ -151,6 +151,9 @@ const float barbWorkSearchRadius = 25.0f;  // barbs only notice trees/rocks with
 const float noSearchRadius = numeric_limits<float>::infinity(); // findNearest with no distance limit
 const Vector2f treeWorkOffset(8.0f, 15.0f); // where a barb stands to chop a tree, relative to its shape
 const Vector2f rockWorkOffset(6.0f, 10.0f); // where a barb stands to mine a rock, relative to its shape
+const float treeNeedBoost = 1.0f;          // tree weight rises up to 1 + this as wood falls from houseWoodCost to 0
+const float needWeightMin = 0.5f;          // job weights are clamped to [min, max] so no resource is ever starved
+const float needWeightMax = 2.0f;          // 2x weight = a tree up to 2x farther still wins (distance / weight)
 
 const int numBushClumps = 4;
 const int bushesPerClump = 5;
@@ -1557,9 +1560,19 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
             int bestBush = findNearest(bpos, barbWorkSearchRadius, (int)bushes.size(),
                                        [&](int k) { return bushWorkSpot(bushshapes[k]); },
                                        [&](int k) { return !bushes[k].ripe || bushes[k].picking; }, &bushDSq);
-            // a rock wins only when strictly closer, as when trees were scanned first; a bush likewise
-            bestIsRock = bestRock != -1 && rockDSq < treeDSq;
-            bool bestIsBush = bestBush != -1 && bushDSq < (bestIsRock ? rockDSq : treeDSq);
+            // need weighting: wood short of a house makes trees count as nearer. Scores are squared
+            // distances divided by weight^2; not-found stays infinite so a boosted miss never wins.
+            float woodShort = clamp((float)(houseWoodCost - wood) / (float)houseWoodCost, 0.0f, 1.0f);
+            float treeW = clamp(1.0f + treeNeedBoost * woodShort, needWeightMin, needWeightMax);
+            float rockW = clamp(1.0f, needWeightMin, needWeightMax);
+            float bushW = clamp(1.0f, needWeightMin, needWeightMax);
+            const float notFound = numeric_limits<float>::infinity();
+            float treeScore = bestTree != -1 ? treeDSq / (treeW * treeW) : notFound;
+            float rockScore = bestRock != -1 ? rockDSq / (rockW * rockW) : notFound;
+            float bushScore = bestBush != -1 ? bushDSq / (bushW * bushW) : notFound;
+            // a rock wins only when strictly better, as when trees were scanned first; a bush likewise
+            bestIsRock = bestRock != -1 && rockScore < treeScore;
+            bool bestIsBush = bestBush != -1 && bushScore < (bestIsRock ? rockScore : treeScore);
             int best = bestIsRock ? bestRock : bestTree;
             if (bestIsBush && b.moving==false) {
                 Vector2f wp = bushWorkSpot(bushshapes[bestBush]);
