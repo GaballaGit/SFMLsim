@@ -2,6 +2,7 @@
 #include <random>
 #include <vector>
 #include <cstdio>
+#include <optional>
 
 using namespace sf;
 using namespace std;
@@ -39,6 +40,17 @@ const int clearWeatherTicks = 108000;     // ticks of clear weather between rain
 const int rainWeatherTicks = 36000;       // ticks a rain lasts
 const Color rainOverlayColor(70, 90, 120, 70);
 bool raining = false;
+
+const int traderIntervalTicks = 216000;   // one in-game hour between trader visits
+const int traderStepInterval = 6;         // ticks per 1px step while walking
+const int traderTradeTicks = 300;         // ticks spent at the village center
+const int tradeStoneCost = 2;             // stone paid per lot
+const int tradeWoodGain = 1;              // wood received per lot
+const int tradeMaxLots = 5;               // max lots per visit (caps at 5 wood/hour)
+const int tradeMsgTicks = 600;            // ticks the last-trade line stays on the HUD
+const Vector2f traderSize(3.0f, 3.0f);
+const Color traderColor(190, 140, 230);
+const Vector2f villageCenter(400.0f, 400.0f);
 
 mt19937 gen(random_device{}());
 uniform_int_distribution<int> distrib(0, 800);
@@ -84,6 +96,17 @@ int invincibleTimer = 0;
 };
 
 int nextDeerId = 0;
+
+struct trader {
+    enum Phase {Arriving, Trading, Leaving} phase = Arriving;
+    Vector2f exit;
+    int stepTimer = 0;
+    int timer = 0;
+    RectangleShape shape;
+};
+
+char tradeMsg[64] = "";
+int tradeMsgTimer = 0;
 
 struct tree  {int x, y, health; bool dying = false;};
 struct rock  {int x, y, health; bool dying = false;};
@@ -232,6 +255,58 @@ bool weatherTick() {
 }
 
 int stepLimit() { return raining ? rainStepInterval : stepInterval; }
+
+void traderTick(optional<trader>& tr) {
+    static int ttimer = 0;
+    if (tradeMsgTimer > 0) tradeMsgTimer--;
+    if (!tr) {
+        if (++ttimer < traderIntervalTicks) return;
+        ttimer = 0;
+        trader t;
+        float along = (float)clamp(distrib(gen), 20, 780);
+        switch (uniform_int_distribution<int>(0, 3)(gen)) {
+            case 0:  t.exit = Vector2f(-10.0f, along); break;
+            case 1:  t.exit = Vector2f(worldSize + 10.0f, along); break;
+            case 2:  t.exit = Vector2f(along, -10.0f); break;
+            default: t.exit = Vector2f(along, worldSize + 10.0f); break;
+        }
+        t.shape.setSize(traderSize);
+        t.shape.setFillColor(traderColor);
+        t.shape.setPosition(t.exit);
+        tr = t;
+        printf("Trader arriving\n");
+        return;
+    }
+    trader& t = *tr;
+    if (t.phase == trader::Trading) {
+        if (++t.timer >= traderTradeTicks) {
+            t.phase = trader::Leaving;
+            printf("Trader leaving\n");
+        }
+        return;
+    }
+    Vector2f goal = t.phase == trader::Arriving ? villageCenter : t.exit;
+    Vector2f diff = goal - t.shape.getPosition();
+    float dSq = diff.x * diff.x + diff.y * diff.y;
+    if (dSq < 1.0f) {
+        if (t.phase == trader::Leaving) {
+            tr.reset();
+            return;
+        }
+        int lots = min(stone / tradeStoneCost, tradeMaxLots);
+        stone -= lots * tradeStoneCost;
+        wood  += lots * tradeWoodGain;
+        if (lots > 0) snprintf(tradeMsg, sizeof(tradeMsg), "Traded: -%d stone +%d wood", lots * tradeStoneCost, lots * tradeWoodGain);
+        else          snprintf(tradeMsg, sizeof(tradeMsg), "Trader: no stone to buy");
+        tradeMsgTimer = tradeMsgTicks;
+        printf("TRADE - %d stone for %d wood - stone: %d wood: %d\n", lots * tradeStoneCost, lots * tradeWoodGain, stone, wood);
+        t.phase = trader::Trading;
+        t.timer = 0;
+    } else if (++t.stepTimer >= traderStepInterval) {
+        t.stepTimer = 0;
+        t.shape.move(dSq > 1.0f ? diff / sqrt(dSq) : diff);
+    }
+}
 
 void drawOverlay(RenderWindow& window, RectangleShape& shape, Color c) {
     shape.setFillColor(c);
@@ -546,6 +621,7 @@ int main() {
     bool panning = false;
     Vector2i lastMouse;
     View worldView(FloatRect({0.0f, 0.0f}, {worldSize, worldSize}));
+    optional<trader> activeTrader;
 
     while (window.isOpen()) {
         while (const optional event = window.pollEvent())
@@ -603,6 +679,7 @@ int main() {
                 deerkilling(deers, deershape, barbs, squares);
                 clockk();
                 weatherTick();
+                traderTick(activeTrader);
             }
         }
 
@@ -649,6 +726,7 @@ int main() {
             squares[j].setFillColor(barbColor(barbs[j]));
             window.draw(squares[j]);
 	}
+	if (activeTrader) window.draw(activeTrader->shape);
 	for (int k = 0; k < (int)tris.size(); ++k)
 		window.draw(tris[k]);
 	for (int q = 0; q < (int)squares.size(); ++q) {
@@ -690,12 +768,19 @@ int main() {
 
         if (hudFontOk) {
             window.setView(window.getDefaultView());
-            window.draw(hudPanel);
             const char* phase = (t >= 21 || t < 6) ? "Night" : "Day";
-            char buf[200];
-            snprintf(buf, sizeof(buf), "Wood: %d\nStone: %d\nFood: %d\nPopulation: %d\nHouses: %d\nTime: %02d:00 (%s)\nSpeed: %dx%s\nWeather: %s",
-                     wood, stone, food, (int)barbs.size(), (int)houses.size(), t < 0 ? 0 : t, phase, simSpeed, paused ? " PAUSED" : "", raining ? "Rain" : "Clear");
+            const char* traderState = !activeTrader ? "Away"
+                : activeTrader->phase == trader::Arriving ? "Arriving"
+                : activeTrader->phase == trader::Trading ? "Trading" : "Leaving";
+            char buf[300];
+            snprintf(buf, sizeof(buf), "Wood: %d\nStone: %d\nFood: %d\nPopulation: %d\nHouses: %d\nTime: %02d:00 (%s)\nSpeed: %dx%s\nWeather: %s\nTrader: %s%s%s",
+                     wood, stone, food, (int)barbs.size(), (int)houses.size(), t < 0 ? 0 : t, phase, simSpeed, paused ? " PAUSED" : "", raining ? "Rain" : "Clear",
+                     traderState, tradeMsgTimer > 0 ? "\n" : "", tradeMsgTimer > 0 ? tradeMsg : "");
             Text hudText(hudFont, buf, hudFontSize);
+            FloatRect tb = hudText.getLocalBounds();
+            hudPanel.setSize(Vector2f(max(hudPanelSize.x, tb.position.x + tb.size.x + 2 * hudTextOffset.x),
+                                      max(hudPanelSize.y, tb.position.y + tb.size.y + 2 * hudTextOffset.y)));
+            window.draw(hudPanel);
             hudText.setFillColor(Color::White);
             hudText.setPosition(hudPos + hudTextOffset);
             window.draw(hudText);
