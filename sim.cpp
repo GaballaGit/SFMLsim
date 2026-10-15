@@ -3,6 +3,8 @@
 #include <vector>
 #include <cstdio>
 #include <optional>
+#include <deque>
+#include <string>
 
 using namespace sf;
 using namespace std;
@@ -56,6 +58,18 @@ const int hungerThreshold = 54000;        // ticks between meals (~quarter in-ga
 const int hungerWorkSlowdown = 2;         // hungry barbs with no food work and walk this many times slower
 const Color hungryTintColor(140, 100, 60);
 const float hungryTintAmount = 0.45f;     // 0 = pure task colour, 1 = pure tint
+
+const int eventMaxLines = 5;              // ticker shows (and stores) at most this many events
+const int eventFadeTicks = 300;           // frames an event stays on screen (~5s at 60fps)
+const int eventHoldTicks = 120;           // frames at full opacity before fading starts
+const int eventHungryCooldownTicks = 3600; // min sim ticks between "no food" events
+const unsigned int eventFontSize = 12;
+const Vector2f eventMargin(6.0f, 6.0f);   // gap from the window's bottom-left corner
+const Vector2f eventPad(6.0f, 4.0f);
+const float eventStripMinWidth = 150.0f;
+const Color eventTextColor(205, 200, 180);
+const uint8_t eventTextAlpha = 220;
+const uint8_t eventStripAlpha = 90;
 
 mt19937 gen(random_device{}());
 uniform_int_distribution<int> distrib(0, 800);
@@ -114,6 +128,54 @@ struct trader {
 
 char tradeMsg[64] = "";
 int tradeMsgTimer = 0;
+
+struct gameEvent {string text; int age = 0;};
+deque<gameEvent> events;
+
+void logEvent(const string& text) {
+    events.push_back({text, 0});
+    while ((int)events.size() > eventMaxLines) events.pop_front();
+}
+
+// Ages ticker lines once per rendered frame so fade time is real-time regardless of sim speed
+void eventTick() {
+    for (auto& e : events) e.age++;
+    while (!events.empty() && events.front().age >= eventFadeTicks) events.pop_front();
+}
+
+uint8_t eventFade(const gameEvent& e, uint8_t full) {
+    if (e.age <= eventHoldTicks) return full;
+    float f = 1.0f - (float)(e.age - eventHoldTicks) / (eventFadeTicks - eventHoldTicks);
+    return (uint8_t)(full * clamp(f, 0.0f, 1.0f));
+}
+
+void drawEvents(RenderWindow& window, const Font& font) {
+    if (events.empty()) return;
+    window.setView(window.getDefaultView());
+    float lineH = font.getLineSpacing(eventFontSize);
+    float width = eventStripMinWidth;
+    uint8_t newest = 0;
+    for (auto& e : events) {
+        Text t(font, e.text, eventFontSize);
+        FloatRect lb = t.getLocalBounds();
+        width = max(width, lb.position.x + lb.size.x + 2 * eventPad.x);
+        newest = max(newest, eventFade(e, eventStripAlpha));
+    }
+    float height = events.size() * lineH + 2 * eventPad.y;
+    Vector2f topLeft(eventMargin.x, window.getDefaultView().getSize().y - eventMargin.y - height);
+    RectangleShape strip({width, height});
+    strip.setPosition(topLeft);
+    strip.setFillColor(Color(0, 0, 0, newest));
+    window.draw(strip);
+    for (int i = 0; i < (int)events.size(); i++) {
+        Text t(font, events[i].text, eventFontSize);
+        Color c = eventTextColor;
+        c.a = eventFade(events[i], eventTextAlpha);
+        t.setFillColor(c);
+        t.setPosition(topLeft + eventPad + Vector2f(0.0f, i * lineH));
+        window.draw(t);
+    }
+}
 
 struct tree  {int x, y, health; bool dying = false;};
 struct rock  {int x, y, health; bool dying = false;};
@@ -176,6 +238,7 @@ void deerkilling(vector<deer>& deers, vector<RectangleShape>& deershape, vector<
 					b.moving = false;
 					food++;
 					printf("DEER KILLED - Food: %d\n", food);
+					logEvent("Deer killed (food " + to_string(food) + ")");
 					break;
 				}
 			}
@@ -257,6 +320,7 @@ bool weatherTick() {
         raining = !raining;
         wtimer = 0;
         printf(raining ? "Rain starts\n" : "Rain stops\n");
+        logEvent(raining ? "Rain starts" : "Rain stops");
     }
     return raining;
 }
@@ -275,8 +339,17 @@ bool workTick(barb& b) {
 }
 
 void hungerTick(vector<barb>& barbs) {
+    static int hungryLogCooldown = 0;
+    if (hungryLogCooldown > 0) hungryLogCooldown--;
     for (auto& b : barbs) {
-        if (!isHungry(b)) { b.hunger++; continue; }
+        if (!isHungry(b)) {
+            b.hunger++;
+            if (isHungry(b) && food <= 0 && hungryLogCooldown == 0) {
+                logEvent("A barb is hungry - no food");
+                hungryLogCooldown = eventHungryCooldownTicks;
+            }
+            continue;
+        }
         if (food <= 0) continue;
         food--;
         b.hunger = 0;
@@ -309,6 +382,7 @@ void traderTick(optional<trader>& tr) {
         t.shape.setPosition(t.exit);
         tr = t;
         printf("Trader arriving\n");
+        logEvent("Trader arriving");
         return;
     }
     trader& t = *tr;
@@ -316,6 +390,7 @@ void traderTick(optional<trader>& tr) {
         if (++t.timer >= traderTradeTicks) {
             t.phase = trader::Leaving;
             printf("Trader leaving\n");
+            logEvent("Trader leaving");
         }
         return;
     }
@@ -333,6 +408,7 @@ void traderTick(optional<trader>& tr) {
         if (lots > 0) snprintf(tradeMsg, sizeof(tradeMsg), "Traded: -%d stone +%d wood", lots * tradeStoneCost, lots * tradeWoodGain);
         else          snprintf(tradeMsg, sizeof(tradeMsg), "Trader: no stone to buy");
         tradeMsgTimer = tradeMsgTicks;
+        logEvent(tradeMsg);
         printf("TRADE - %d stone for %d wood - stone: %d wood: %d\n", lots * tradeStoneCost, lots * tradeWoodGain, stone, wood);
         t.phase = trader::Trading;
         t.timer = 0;
@@ -391,6 +467,7 @@ void buildhouse(vector<barb>& barbs, vector<RectangleShape>& squares, vector<hou
                     b.building = b.moving = b.movingbspot = false;
                     b.timer = 0;
 		            printf("---HOUSE BUILT---\n");
+                    logEvent("House built");
                 }
             } else {
                 if (++b.stepTimer >= stepLimit(b)) {
@@ -415,6 +492,7 @@ void barbspawner(vector<RectangleShape>& squares, vector<barb>& barbs, vector<Re
         sq.setSize(Vector2f(2, 2));
         sq.setFillColor(Color::White);
         squares.push_back(sq);
+        logEvent("A barb is born (pop " + to_string(barbs.size()) + ")");
     }
 }
 
@@ -822,7 +900,9 @@ int main() {
             hudText.setFillColor(Color::White);
             hudText.setPosition(hudPos + hudTextOffset);
             window.draw(hudText);
+            drawEvents(window, hudFont);
         }
+        eventTick();
         window.display();
     }
     return 0;
