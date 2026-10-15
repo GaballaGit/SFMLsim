@@ -63,6 +63,13 @@ const int rainStepInterval = 16;          // slower barb stepping in rain (~0.6x
 const int clearWeatherTicks = 108000;     // ticks of clear weather between rains
 const int rainWeatherTicks = 36000;       // ticks a rain lasts
 const Color rainOverlayColor(70, 90, 120, 70);
+// Falling rain streaks: draw-only, positions hashed from (frame cycle, index) so there is no stored state
+const int rainStreakCount = 150;           // sparse over the 800x800 map
+const int rainStreakPixels = 3;            // 1x3 streak, bottom pixel stepped 1px left for the wind slant
+const int rainStreakLifeFrames = 40;       // frames a streak falls before it respawns at a new hashed spot
+const float rainStreakFallPx = 4.0f;       // px fallen per frame (~240px/s)
+const float rainStreakDriftPx = 1.0f;      // px drifted left per frame, matches the slant
+const Color rainStreakColor(170, 195, 225, 64); // pale blue, ~25% alpha
 bool raining = false;
 
 const int traderIntervalTicks = 216000;   // one in-game hour between trader visits
@@ -900,6 +907,25 @@ void drawBirds(RenderWindow& window, const vector<bird>& birds, RectangleShape& 
         shape.setPosition(Vector2f(round(b.pos.x), round(b.pos.y)));
         window.draw(shape);
     }
+}
+
+// Rain streaks, batched; each streak's spawn spot comes from hash(cycle, index) and it falls for one cycle
+void drawRain(RenderWindow& window, VertexArray& va, int frame) {
+    va.clear();
+    for (int i = 0; i < rainStreakCount; i++) {
+        uint32_t phase = (uint32_t)i * 2654435761u % rainStreakLifeFrames; // stagger respawns across streaks
+        uint32_t f = (uint32_t)frame + phase;
+        uint32_t cycle = f / rainStreakLifeFrames;
+        int age = (int)(f % rainStreakLifeFrames);
+        uint32_t h = cycle * 73856093u ^ (uint32_t)i * 19349663u;
+        h ^= h >> 13; h *= 0x5bd1e995u; h ^= h >> 15;
+        float x = (float)(h % (uint32_t)worldSize) - age * rainStreakDriftPx + rainStreakLifeFrames * rainStreakDriftPx / 2;
+        float y = (float)((h >> 10) % (uint32_t)worldSize) + age * rainStreakFallPx - rainStreakLifeFrames * rainStreakFallPx / 2;
+        Vector2f p = snapPx(Vector2f(fmod(x + worldSize, worldSize), fmod(y + worldSize, worldSize))); // wrap so streaks stay on the map
+        for (int k = 0; k < rainStreakPixels; k++)
+            pushQuad(va, p + Vector2f(k == rainStreakPixels - 1 ? -1.0f : 0.0f, (float)k), Vector2f(1.0f, 1.0f), rainStreakColor);
+    }
+    if (va.getVertexCount() > 0) window.draw(va);
 }
 
 // Returns true on ticks where the barb makes work progress; hungry barbs skip some ticks
@@ -1777,6 +1803,7 @@ int main() {
     spawnBushes(bushes, bushshapes, trees, tris, stumps);
 
     VertexArray treeVerts(PrimitiveType::Triangles);
+    VertexArray rainVerts(PrimitiveType::Triangles); // scratch buffer for drawRain, rebuilt every frame
 
     RectangleShape dnc({800, 800});
 
@@ -1930,6 +1957,7 @@ int main() {
 	if (activeTrader) drawSnapped(window, activeTrader->shape);
 	drawTrees(window, tris, treeVerts);
 	drawBirds(window, birds, birdShape, frameCount++);
+	if (raining) drawRain(window, rainVerts, frameCount);
 	for (int q = 0; q < (int)squares.size(); ++q) {
             auto& b = barbs[q];
             if (b.chopping && b.timer > 0 && !b.targetIsRock && !b.targetIsBush)
