@@ -17,6 +17,12 @@ const Vector2f hudPanelSize(150.0f, 112.0f);
 const Vector2f hudTextOffset(6.0f, 4.0f);
 const Color hudPanelColor(0, 0, 0, 160);
 
+const Color barbIdleColor(255, 255, 255);
+const Color barbChopColor(120, 220, 90);
+const Color barbMineColor(255, 165, 0);
+const Color barbBuildColor(80, 170, 255);
+const Color barbHuntColor(255, 70, 70);
+
 int wood = 0;
 int stone = 0;
 int food = 0;
@@ -74,6 +80,15 @@ template<typename T>
 void swapRemove(vector<T>& v, int i) {
     v[i] = move(v.back());
     v.pop_back();
+}
+
+// Priority when flags overlap: hunting > building > mining > chopping > idle
+Color barbColor(const barb& b) {
+    if (b.deertargeting) return barbHuntColor;
+    if (b.building) return barbBuildColor;
+    if (b.chopping && b.targetIsRock) return barbMineColor;
+    if (b.chopping) return barbChopColor;
+    return barbIdleColor;
 }
 
 void deerkilling(vector<deer>& deers, vector<RectangleShape>& deershape, vector<barb>& barbs, vector<RectangleShape>& squares) {
@@ -551,6 +566,7 @@ int main() {
         }
 	
         for (int j = 0; j < (int)squares.size(); j++) {
+            squares[j].setFillColor(barbColor(barbs[j]));
             window.draw(squares[j]);
 	}
 	for (int k = 0; k < (int)tris.size(); ++k)
