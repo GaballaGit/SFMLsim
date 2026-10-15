@@ -147,6 +147,17 @@ const int wolfStepInterval = 2;            // ticks per 1px step (deer step ever
 const Vector2f wolfSize(5.0f, 3.0f);
 const Color wolfColor(150, 150, 160);      // cool mid grey: lighter than rocks, darker than birds, far from deer tan
 
+// Skittish deer: bolt away from a nearby barb for a short, capped time, then a cooldown so hunts can still land
+const int deerStepInterval = 3;            // ticks per 1px step while wandering
+const int deerFleeStepInterval = 1;        // ticks per 1px step while fleeing (3x wander speed; barbs step every 10)
+const float deerFleeRadius = 20.0f;        // barb this close starts a flee (inside the 25px hunt pickup range)
+const float deerFleeRadiusSq = deerFleeRadius * deerFleeRadius;
+const int deerFleeCheckInterval = 10;      // proximity scan runs once per this many ticks
+const int deerFleeTicks = 40;              // hard cap on one flee (~40px at flee speed)
+const float deerFleeDistance = 40.0f;      // how far the flee target is set from the deer
+const int deerFleeCooldown = 600;          // ticks after a flee before the deer can flee again (barb gains ~60px)
+const float deerFleeEdgeMargin = 4.0f;     // flee targets stay this far inside the map and below the HUD strip
+
 const float barbWorkSearchRadius = 25.0f;  // barbs only notice trees/rocks within this many px (findNearest)
 const float noSearchRadius = numeric_limits<float>::infinity(); // findNearest with no distance limit
 const Vector2f treeWorkOffset(8.0f, 15.0f); // where a barb stands to chop a tree, relative to its shape
@@ -449,6 +460,8 @@ bool moving = false;
 int targetx = -1, targety = -1;
 bool invincible = false;
 int invincibleTimer = 0;
+int fleeTimer = 0;      // ticks of flee left; only deerwander touches the flee fields (never health/invincible)
+int fleeCooldown = 0;
 };
 
 int nextDeerId = 0;
@@ -728,11 +741,51 @@ void deerspawn(vector<deer>& deers, vector<RectangleShape>& deershape) {
 	printf("%zu\n", deers.size());
 }
 
-void deerwander(vector<RectangleShape>& deershape, vector<deer>& deers) {
+// Ends a flee and starts its cooldown; the deer goes back to normal wandering from where it stopped
+void endFlee(deer& d) {
+    d.fleeTimer = 0;
+    d.fleeCooldown = deerFleeCooldown;
+    d.moving = false;
+    d.stepTimer = 0;
+}
+
+void deerwander(vector<RectangleShape>& deershape, vector<deer>& deers, const vector<RectangleShape>& squares) {
+    static int fleeCheckTick = 0;
+    bool checkFlee = ++fleeCheckTick >= deerFleeCheckInterval;
+    if (checkFlee) fleeCheckTick = 0;
     for (int i = 0; i < (int)deershape.size(); i++) {
         auto& ds = deershape[i];
         auto& d  = deers[i];
         Vector2f pos = ds.getPosition();
+        if (d.fleeTimer > 0) {
+            if (--d.fleeTimer <= 0) endFlee(d);
+        } else if (d.fleeCooldown > 0) {
+            d.fleeCooldown--;
+        } else if (checkFlee) {
+            // Nearest barb inside the flee radius (squared distance, barbs only)
+            float bestSq = deerFleeRadiusSq;
+            Vector2f away;
+            bool found = false;
+            for (const auto& sq : squares) {
+                Vector2f diff = pos - sq.getPosition();
+                float dSq = diff.x * diff.x + diff.y * diff.y;
+                if (dSq < bestSq) { bestSq = dSq; away = diff; found = true; }
+            }
+            if (found) {
+                float len = sqrt(bestSq);
+                Vector2f dir = len > 0.0f ? away / len : Vector2f(1.0f, 0.0f);
+                Vector2f size = ds.getSize();
+                Vector2f goal = pos + dir * deerFleeDistance;
+                goal.x = clamp(goal.x, deerFleeEdgeMargin, worldSize - size.x - deerFleeEdgeMargin);
+                goal.y = clamp(goal.y, hudBarHeight + deerFleeEdgeMargin, worldSize - size.y - deerLegPx - deerFleeEdgeMargin);
+                d.targetx = (int)goal.x;
+                d.targety = (int)goal.y;
+                d.moving = true;
+                d.stepTimer = 0;
+                d.fleeTimer = deerFleeTicks;
+                printf("Deer %d fleeing\n", d.id);
+            }
+        }
         if (!d.moving) {
             if (wanderChance(gen) != 0) continue;
             int tx = (int)pos.x + wanderDX(gen);
@@ -746,9 +799,10 @@ void deerwander(vector<RectangleShape>& deershape, vector<deer>& deers) {
             Vector2f diff = Vector2f(d.targetx, d.targety) - pos;
             float dSq = diff.x * diff.x + diff.y * diff.y;
             if (dSq < 1.0f) {
+                if (d.fleeTimer > 0) endFlee(d);   // reached safety early: flee over, cooldown starts
                 d.moving    = false;
                 d.stepTimer = 0;
-            } else if (++d.stepTimer >= 3) {
+            } else if (++d.stepTimer >= (d.fleeTimer > 0 ? deerFleeStepInterval : deerStepInterval)) {
                 d.stepTimer = 0;
                 ds.move(diff / sqrt(dSq));
 		ds.getGlobalBounds();
@@ -1901,7 +1955,7 @@ int main() {
                 barbspawner(squares, barbs, houseshapes, birthRings);
                 birthRingTick(birthRings);
                 deerspawn(deers, deershape);
-                deerwander(deershape, deers);
+                deerwander(deershape, deers, squares);
                 deerkilling(deers, deershape, barbs, squares);
                 wolfTick(wolves, deers, deershape, barbs);
                 clockk();
