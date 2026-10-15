@@ -160,6 +160,7 @@ const float bushRadius = 3.0f;             // 6px bush: bigger than a barb, well
 const Vector2f bushWorkOffset(3.0f, 7.0f); // where a barb stands to pick a bush (just below it)
 const int bushPickTicks = 180;             // ~3s to pick, +1 food
 const int bushRegrowTicks = 7200;          // ~2 min for a bare bush to ripen again
+const int rainRegrowMult = 2;              // bushes ripen this many times faster while raining
 const Color bushRipeColor(150, 55, 95);    // muted berry red-violet, darker than every barb task colour
 const Color bushBareColor(62, 78, 46);     // dull olive: readable on the dark ground, distinct from tree green
 const Color barbPickColor(255, 140, 190);  // pink: distinct from the other task colours and the trader
@@ -771,8 +772,8 @@ bool weatherTick() {
     if (++wtimer >= (raining ? rainWeatherTicks : clearWeatherTicks)) {
         raining = !raining;
         wtimer = 0;
-        printf(raining ? "Rain starts\n" : "Rain stops\n");
-        logEvent(raining ? "Rain starts" : "Rain stops");
+        printf(raining ? "Rain starts - berries ripening\n" : "Rain stops\n");
+        logEvent(raining ? "Rain starts - berries ripening" : "Rain stops");
     }
     return raining;
 }
@@ -1731,10 +1732,12 @@ void spawnBushes(vector<bush>& bushes, vector<CircleShape>& bushshapes, vector<t
     printf("Spawned %zu bushes in %d clumps\n", bushes.size(), numBushClumps);
 }
 
-// Bare bushes ripen again after bushRegrowTicks
+// Bare bushes ripen again after bushRegrowTicks (rainRegrowMult times faster in rain)
 void bushTick(vector<bush>& bushes, vector<CircleShape>& bushshapes) {
     for (int i = 0; i < (int)bushes.size(); i++) {
-        if (bushes[i].ripe || ++bushes[i].regrow < bushRegrowTicks) continue;
+        if (bushes[i].ripe) continue;
+        bushes[i].regrow += raining ? rainRegrowMult : 1;
+        if (bushes[i].regrow < bushRegrowTicks) continue; // >= ripens, so overshoot can't skip it
         bushes[i].ripe = true;
         bushes[i].regrow = 0;
         bushshapes[i].setFillColor(bushRipeColor);
