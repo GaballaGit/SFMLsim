@@ -13,8 +13,9 @@ const int numrocks = 100;
 const char* const hudFontPath = "assets/DejaVuSans.ttf";
 const unsigned int hudFontSize = 14;
 const Vector2f hudPos(6.0f, 6.0f);
-const Vector2f hudPanelSize(150.0f, 112.0f);
+const Vector2f hudPanelSize(150.0f, 130.0f);
 const Vector2f hudTextOffset(6.0f, 4.0f);
+const int maxTicksPerFrame = 20;
 const Color hudPanelColor(0, 0, 0, 160);
 
 const Color barbIdleColor(255, 255, 255);
@@ -509,13 +510,27 @@ int main() {
     hudPanel.setPosition(hudPos);
     hudPanel.setFillColor(hudPanelColor);
 
+    bool paused = false;
+    int simSpeed = 1;
+
     while (window.isOpen()) {
         while (const optional event = window.pollEvent())
             if (event->is<Event::Closed>()) window.close();
+            else if (const auto* kp = event->getIf<Event::KeyPressed>()) {
+                if (kp->code == Keyboard::Key::Space) paused = !paused;
+                else if (kp->code == Keyboard::Key::Num1) simSpeed = 1;
+                else if (kp->code == Keyboard::Key::Num2) simSpeed = 2;
+                else if (kp->code == Keyboard::Key::Num3) simSpeed = 4;
+            }
 
         timesincelastupdate += clock.restart();
+        if (paused) timesincelastupdate = Time::Zero;
+        int ticksThisFrame = 0;
         while (timesincelastupdate > Timepertick) {
             timesincelastupdate -= Timepertick;
+            if (ticksThisFrame >= maxTicksPerFrame) { timesincelastupdate = Time::Zero; break; }
+            ticksThisFrame++;
+            for (int rep = 0; rep < simSpeed; rep++) {
             buildhouse(barbs, squares, houses, houseshapes);
             minematerials(squares, barbs, tris, stumps, trees, octs, rocks);
             barbmove(squares, barbs);
@@ -525,6 +540,7 @@ int main() {
 	    deerwander(deershape, deers);
 	    deerkilling(deers, deershape, barbs, squares);
             clockk();
+            }
         }
 
         for (int i = (int)tris.size() - 1; i >= 0; i--) {
@@ -611,8 +627,8 @@ int main() {
             window.draw(hudPanel);
             const char* phase = (t >= 21 || t < 6) ? "Night" : "Day";
             char buf[200];
-            snprintf(buf, sizeof(buf), "Wood: %d\nStone: %d\nFood: %d\nPopulation: %d\nHouses: %d\nTime: %02d:00 (%s)",
-                     wood, stone, food, (int)barbs.size(), (int)houses.size(), t < 0 ? 0 : t, phase);
+            snprintf(buf, sizeof(buf), "Wood: %d\nStone: %d\nFood: %d\nPopulation: %d\nHouses: %d\nTime: %02d:00 (%s)\nSpeed: %dx%s",
+                     wood, stone, food, (int)barbs.size(), (int)houses.size(), t < 0 ? 0 : t, phase, simSpeed, paused ? " PAUSED" : "");
             Text hudText(hudFont, buf, hudFontSize);
             hudText.setFillColor(Color::White);
             hudText.setPosition(hudPos + hudTextOffset);
