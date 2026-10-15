@@ -18,15 +18,21 @@ const int numrocks = 100;
 
 const char* const hudFontPath = "assets/DejaVuSans.ttf";
 const unsigned int hudFontSize = 14;
-const Vector2f hudPos(6.0f, 6.0f);
-const Vector2f hudPanelSize(150.0f, 148.0f);
-const Vector2f hudTextOffset(6.0f, 4.0f);
+// Icon HUD strip: full-width top bar of 8x8 pixel icons (drawn at 2x) + numbers; hovering the bar shows the full text
+const float hudBarHeight = 24.0f;           // includes the 1px rim along the bottom
+const float hudRimPx = 1.0f;
+const int hudIconGrid = 8;                  // icon patterns are 8x8 cells
+const float hudIconPx = 2.0f;               // screen px per icon cell
+const float hudIconSize = hudIconGrid * hudIconPx; // 16px icon, ~4px margin inside the bar
+const float hudPadX = 8.0f;                 // left margin before the first icon
+const float hudIconGap = 4.0f;              // icon -> number
+const float hudCellGap = 14.0f;             // number -> next icon
+const char* const hudMinNumber = "000";     // each number reserves at least this width so cells don't jump as values grow
 const int maxTicksPerFrame = 20;
 const float worldSize = 800.0f;
 const float minZoom = 1.0f;
 const float maxZoom = 4.0f;
 const float zoomStep = 1.1f;
-const Color hudPanelColor(0, 0, 0, 160);
 
 const Color barbIdleColor(255, 255, 255);
 const Color barbChopColor(120, 220, 90);
@@ -185,6 +191,10 @@ struct palette {
     Color barFrame;      // 1px dark rim around every progress bar
     Color barTrack;      // empty part of a bar
     Color barChop, barPick, barBuild, barMine; // muted versions of the barb task colours
+    Color hudBar;        // translucent top strip
+    Color hudRim;        // 1px line under the strip, separates it from the world
+    Color hudText;       // numbers on the strip
+    Color hudAlert;      // "Paused" and other attention states
 };
 const palette pal{
     Color(128, 126, 118),
@@ -194,6 +204,10 @@ const palette pal{
     Color(205, 115, 160),
     Color(90, 155, 215),
     Color(215, 145, 55),
+    Color(10, 14, 12, 185),
+    Color(70, 80, 66, 200),
+    Color(225, 220, 200),
+    Color(240, 210, 90),
 };
 const int treeTiers = 3;                    // stepped pine: three stacked blocks inside the old 16px triangle footprint
 const Vector2f treeTierSize[treeTiers] = {{6.0f, 4.0f}, {10.0f, 4.0f}, {14.0f, 4.0f}};
@@ -203,6 +217,45 @@ const float treeShadeAmount = 0.78f;        // bottom tier is darkened to this f
 const int rockPointCount = 4;               // rocks draw as diamonds (logic shape keeps its pentagon)
 const Vector2f barSize(20.0f, 3.0f);        // inner fill area of a progress bar
 const float barFramePx = 1.0f;
+
+// HUD icon table: 8x8 patterns, '.' = empty, 'a'..'d' = the icon's colour key
+enum hudIconId { iconWood, iconStone, iconFood, iconPeople, iconHouse, iconSun, iconMoon, iconSpeed, iconPause, iconRain, iconCount };
+struct iconDef {
+    const char* rows[hudIconGrid];
+    Color key[4];
+};
+const iconDef hudIcons[iconCount] = {
+    // wood: brown log with a pale cut end and growth ring
+    {{"........", ".aaaabb.", "aaaabccb", "aaaabcdb", "aaaabcdb", "aaaabccb", ".aaaabb.", "........"},
+     {Color(112, 74, 42), Color(165, 125, 75), Color(205, 170, 115), Color(135, 95, 55)}},
+    // stone: the world rock diamond, lit top-left
+    {{"...aa...", "..abaa..", ".abaaaa.", "abaaaaaa", "aaaaaaac", ".aaaaac.", "..aaac..", "...ac..."},
+     {pal.rock, Color(176, 172, 160), Color(88, 86, 80), Color::Transparent}},
+    // food: berry with a shine and a leaf
+    {{"....cc..", "...cc...", "..aaaa..", ".abaaaa.", ".aaaaaa.", ".aaaaaa.", "..aaaa..", "........"},
+     {Color(185, 70, 105), Color(235, 160, 180), Color(95, 150, 70), Color::Transparent}},
+    // people: head and shoulders
+    {{"...aa...", "..aaaa..", "..aaaa..", "...aa...", ".bbbbbb.", "bbbbbbbb", "bbbbbbbb", "bbbbbbbb"},
+     {barbSkinColor, Color(105, 125, 160), Color::Transparent, Color::Transparent}},
+    // house: red roof, pale walls, dark door
+    {{"...aa...", "..aaaa..", ".aaaaaa.", "aaaaaaaa", ".bbbbbb.", ".bbbcbb.", ".bbbcbb.", ".bbbcbb."},
+     {Color(150, 72, 52), Color(190, 170, 130), Color(92, 60, 34), Color::Transparent}},
+    // sun: disc with eight rays
+    {{"a..aa..a", "........", "..bbbb..", "a.bbbb.a", "a.bbbb.a", "..bbbb..", "........", "a..aa..a"},
+     {Color(230, 150, 50), Color(245, 205, 90), Color::Transparent, Color::Transparent}},
+    // moon: pale crescent with a star
+    {{"..aaaa..", ".aaa....", "aaa...b.", "aaa.....", "aaa.....", "aaa.....", ".aaa....", "..aaaa.."},
+     {Color(210, 215, 235), Color(240, 210, 90), Color::Transparent, Color::Transparent}},
+    // speed: double chevron
+    {{"........", "a...a...", "aa..aa..", ".aa..aa.", ".aa..aa.", "aa..aa..", "a...a...", "........"},
+     {Color(190, 195, 185), Color::Transparent, Color::Transparent, Color::Transparent}},
+    // pause: two bars
+    {{"........", ".aa..aa.", ".aa..aa.", ".aa..aa.", ".aa..aa.", ".aa..aa.", ".aa..aa.", "........"},
+     {pal.hudAlert, Color::Transparent, Color::Transparent, Color::Transparent}},
+    // rain: grey cloud with falling drops
+    {{"........", "..aaa...", ".aaaaaa.", "aaaaaaaa", ".aaaaaa.", "........", ".b..b..b", "b..b..b."},
+     {Color(150, 158, 172), Color(100, 150, 220), Color::Transparent, Color::Transparent}},
+};
 
 mt19937 gen(random_device{}());
 uniform_int_distribution<int> distrib(0, 800);
@@ -999,6 +1052,85 @@ void drawTooltip(RenderWindow& window, const Font& font, const string& label, Ve
     window.draw(t);
 }
 
+// Everything the HUD shows, gathered once per frame in main
+struct hudValues {
+    int wood, stone, food, hungry, people, houses, hour, speed;
+    bool night, paused, raining;
+    const char* trader;      // Away / Arriving / Trading / Leaving
+    const char* tradeLine;   // last trade message, "" when expired
+};
+
+// Draws one table icon at pos (top-left, screen px), one quad per filled cell
+void drawIcon(RenderWindow& window, hudIconId id, Vector2f pos) {
+    const iconDef& d = hudIcons[id];
+    VertexArray va(PrimitiveType::Triangles);
+    pos = snapPx(pos);
+    for (int y = 0; y < hudIconGrid; y++)
+        for (int x = 0; x < hudIconGrid && d.rows[y][x]; x++) {
+            char ch = d.rows[y][x];
+            if (ch < 'a' || ch > 'd') continue;
+            pushQuad(va, pos + Vector2f(x * hudIconPx, y * hudIconPx), Vector2f(hudIconPx, hudIconPx), d.key[ch - 'a']);
+        }
+    window.draw(va);
+}
+
+// The old full text block, now shown as a tooltip while hovering the strip
+string hudDetailText(const hudValues& v) {
+    char buf[320];
+    snprintf(buf, sizeof(buf), "Wood: %d\nStone: %d\nFood: %d\nHungry: %d\nPopulation: %d\nHouses: %d\nTime: %02d:00 (%s)\nSpeed: %dx%s\nWeather: %s\nTrader: %s%s%s",
+             v.wood, v.stone, v.food, v.hungry, v.people, v.houses, v.hour, v.night ? "Night" : "Day", v.speed, v.paused ? " PAUSED" : "",
+             v.raining ? "Rain" : "Clear", v.trader, v.tradeLine[0] ? "\n" : "", v.tradeLine);
+    return buf;
+}
+
+// Full-width top strip of icon + number cells; returns the strip rect for the hover/tooltip checks
+FloatRect drawHud(RenderWindow& window, const Font& font, const hudValues& v) {
+    window.setView(window.getDefaultView());
+    Vector2f win = window.getDefaultView().getSize();
+    FloatRect bar({0.0f, 0.0f}, {win.x, hudBarHeight});
+    RectangleShape r(bar.size);
+    r.setFillColor(pal.hudBar);
+    window.draw(r);
+    r.setSize({win.x, hudRimPx});
+    r.setPosition({0.0f, hudBarHeight - hudRimPx});
+    r.setFillColor(pal.hudRim);
+    window.draw(r);
+
+    char hour[8], speed[8];
+    snprintf(hour, sizeof(hour), "%02d:00", v.hour);
+    snprintf(speed, sizeof(speed), "%dx", v.speed);
+    struct cell { hudIconId icon; string text; Color color; };
+    vector<cell> cells = {
+        {iconWood,   to_string(v.wood),   pal.hudText},
+        {iconStone,  to_string(v.stone),  pal.hudText},
+        {iconFood,   to_string(v.food),   pal.hudText},
+        {iconPeople, to_string(v.people), pal.hudText},
+        {iconHouse,  to_string(v.houses), pal.hudText},
+        {v.night ? iconMoon : iconSun, hour, pal.hudText},
+        {v.paused ? iconPause : iconSpeed, v.paused ? string("Paused") : string(speed), v.paused ? pal.hudAlert : pal.hudText},
+    };
+    if (v.raining) cells.push_back({iconRain, "Rain", pal.hudText}); // last, so it never shifts the other cells
+
+    // Centre on a fixed reference string so every number sits on the same baseline
+    Text ref(font, hudMinNumber, hudFontSize);
+    FloatRect rb = ref.getLocalBounds();
+    float inner = hudBarHeight - hudRimPx;
+    float textY = round((inner - rb.size.y) / 2 - rb.position.y);
+    float iconY = round((inner - hudIconSize) / 2);
+    float x = hudPadX;
+    for (auto& c : cells) {
+        drawIcon(window, c.icon, {x, iconY});
+        x += hudIconSize + hudIconGap;
+        Text t(font, c.text, hudFontSize);
+        FloatRect tb = t.getLocalBounds();
+        t.setFillColor(c.color);
+        t.setPosition({round(x - tb.position.x), textY});
+        window.draw(t);
+        x += max(tb.size.x, rb.size.x) + hudCellGap;
+    }
+    return bar;
+}
+
 void drawOverlay(RenderWindow& window, RectangleShape& shape, Color c) {
     shape.setFillColor(c);
     window.setView(window.getDefaultView());
@@ -1504,9 +1636,6 @@ int main() {
     bool hudFontOk = hudFont.openFromFile(hudFontPath);
     if (!hudFontOk) printf("HUD font failed to load: %s\n", hudFontPath);
     else printf("HUD font loaded: %s\n", hudFontPath);
-    RectangleShape hudPanel(hudPanelSize);
-    hudPanel.setPosition(hudPos);
-    hudPanel.setFillColor(hudPanelColor);
 
     bool paused = false;
     int simSpeed = 1;
@@ -1517,6 +1646,7 @@ int main() {
     View worldView(FloatRect({0.0f, 0.0f}, {worldSize, worldSize}));
     optional<trader> activeTrader;
     FloatRect tickerRect;                 // last frame's ticker strip, used to suppress hover over it
+    FloatRect hudRect;                    // last frame's HUD strip, same use
     VertexArray trailVerts(PrimitiveType::Triangles);
     vector<bird> birds;
     Vector2f birdHeading(1.0f, 0.0f);
@@ -1678,11 +1808,13 @@ int main() {
         if (t >= 21 || t < 6) drawCampfireGlow(window, worldView, fire, frameCount);
 
         optional<hoverHit> hover;
+        bool overHud = false;
         {
             Vector2i mpx = Mouse::getPosition(window);
             Vector2u wsz = window.getSize();
             Vector2f mscreen = window.mapPixelToCoords(mpx, window.getDefaultView());
-            bool overUi = (hudFontOk && hudPanel.getGlobalBounds().contains(mscreen)) || tickerRect.contains(mscreen);
+            overHud = hudFontOk && window.hasFocus() && !panning && hudRect.contains(mscreen);
+            bool overUi = overHud || tickerRect.contains(mscreen);
             if (window.hasFocus() && !panning && !overUi && mpx.x >= 0 && mpx.y >= 0 && mpx.x < (int)wsz.x && mpx.y < (int)wsz.y) {
                 Vector2f mworld = window.mapPixelToCoords(mpx, worldView);
                 hover = pickHover(mworld, tooltipPickRadius / zoom, barbs, squares, activeTrader, wolves, deers, deershape, rocks, octs, bushes, bushshapes, houseshapes);
@@ -1692,27 +1824,27 @@ int main() {
 
         if (hudFontOk) {
             window.setView(window.getDefaultView());
-            const char* phase = (t >= 21 || t < 6) ? "Night" : "Day";
-            const char* traderState = !activeTrader ? "Away"
+            hudValues hv{};
+            hv.wood = wood; hv.stone = stone; hv.food = food;
+            for (auto& b : barbs) if (isHungry(b)) hv.hungry++;
+            hv.people = (int)barbs.size();
+            hv.houses = (int)houses.size();
+            hv.hour = t < 0 ? 0 : t;
+            hv.speed = simSpeed;
+            hv.night = (t >= 21 || t < 6);
+            hv.paused = paused;
+            hv.raining = raining;
+            hv.trader = !activeTrader ? "Away"
                 : activeTrader->phase == trader::Arriving ? "Arriving"
                 : activeTrader->phase == trader::Trading ? "Trading" : "Leaving";
-            int hungry = 0;
-            for (auto& b : barbs) if (isHungry(b)) hungry++;
-            char buf[320];
-            snprintf(buf, sizeof(buf), "Wood: %d\nStone: %d\nFood: %d\nHungry: %d\nPopulation: %d\nHouses: %d\nTime: %02d:00 (%s)\nSpeed: %dx%s\nWeather: %s\nTrader: %s%s%s",
-                     wood, stone, food, hungry, (int)barbs.size(), (int)houses.size(), t < 0 ? 0 : t, phase, simSpeed, paused ? " PAUSED" : "", raining ? "Rain" : "Clear",
-                     traderState, tradeMsgTimer > 0 ? "\n" : "", tradeMsgTimer > 0 ? tradeMsg : "");
-            Text hudText(hudFont, buf, hudFontSize);
-            FloatRect tb = hudText.getLocalBounds();
-            hudPanel.setSize(Vector2f(max(hudPanelSize.x, tb.position.x + tb.size.x + 2 * hudTextOffset.x),
-                                      max(hudPanelSize.y, tb.position.y + tb.size.y + 2 * hudTextOffset.y)));
-            window.draw(hudPanel);
-            hudText.setFillColor(Color::White);
-            hudText.setPosition(hudPos + hudTextOffset);
-            window.draw(hudText);
+            hv.tradeLine = tradeMsgTimer > 0 ? tradeMsg : "";
+            hudRect = drawHud(window, hudFont, hv);
             tickerRect = drawEvents(window, hudFont);
-            if (hover) drawTooltip(window, hudFont, hover->label, window.mapPixelToCoords(Mouse::getPosition(window), window.getDefaultView()),
-                                   hudPanel.getGlobalBounds(), tickerRect);
+            Vector2f mouse = window.mapPixelToCoords(Mouse::getPosition(window), window.getDefaultView());
+            if (overHud) // full details hang just under the strip, beside the cursor
+                drawTooltip(window, hudFont, hudDetailText(hv),
+                            Vector2f(mouse.x, hudRect.position.y + hudRect.size.y + tooltipEdgeMargin - tooltipOffset.y), hudRect, tickerRect);
+            else if (hover) drawTooltip(window, hudFont, hover->label, mouse, hudRect, tickerRect);
         }
         eventTick();
         window.display();
