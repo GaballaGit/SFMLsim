@@ -123,6 +123,19 @@ const float noSearchRadius = numeric_limits<float>::infinity(); // findNearest w
 const Vector2f treeWorkOffset(8.0f, 15.0f); // where a barb stands to chop a tree, relative to its shape
 const Vector2f rockWorkOffset(6.0f, 10.0f); // where a barb stands to mine a rock, relative to its shape
 
+const int numBushClumps = 4;
+const int bushesPerClump = 5;
+const float bushClumpSpread = 14.0f;       // max px from the clump centre on each axis
+const float bushClumpMinCenterDist = 120.0f; // clumps stay clear of the village center (and its tree clearing)
+const float bushTreeClearance = 3.0f;      // startup trees overlapping a bush (plus this margin) are removed
+const float bushRadius = 3.0f;             // 6px bush: bigger than a barb, well under a 16px tree
+const Vector2f bushWorkOffset(3.0f, 7.0f); // where a barb stands to pick a bush (just below it)
+const int bushPickTicks = 180;             // ~3s to pick, +1 food
+const int bushRegrowTicks = 7200;          // ~2 min for a bare bush to ripen again
+const Color bushRipeColor(150, 55, 95);    // muted berry red-violet, darker than every barb task colour
+const Color bushBareColor(62, 78, 46);     // dull olive: readable on the dark ground, distinct from tree green
+const Color barbPickColor(255, 140, 190);  // pink: distinct from the other task colours and the trader
+
 mt19937 gen(random_device{}());
 uniform_int_distribution<int> distrib(0, 800);
 uniform_int_distribution<int> wanderChance(0, 149);
@@ -151,6 +164,8 @@ struct barb {
     bool reservedwood = false;
     int stepTimer = 0;
     bool targetIsRock = false;
+    bool targetIsBush = false;   // chopping + targetIsBush = picking; shares timer/chopping with chop and mine
+    int targetBush = -1;         // bush index (bushes are never removed, so indices are stable)
     bool deertargeting = false;
     int targetDeerId = -1;
     int hunger = 0;
@@ -241,6 +256,7 @@ FloatRect drawEvents(RenderWindow& window, const Font& font) {
 
 struct tree  {int x, y, health; bool dying = false;};
 struct rock  {int x, y, health; bool dying = false;};
+struct bush  {int x, y; bool ripe = true; bool picking = false; int regrow = 0;};
 
 // Nearest candidate to pos strictly inside radius: posOf(i) gives candidate i's position and
 // skip(i) == true excludes it. Returns the index or -1; ties keep the lowest index. If outDSq is
@@ -265,10 +281,11 @@ void swapRemove(vector<T>& v, int i) {
     v.pop_back();
 }
 
-// Priority when flags overlap: hunting > building > mining > chopping > idle
+// Priority when flags overlap: hunting > building > picking > mining > chopping > idle
 Color barbColor(const barb& b) {
     if (b.deertargeting) return barbHuntColor;
     if (b.building) return barbBuildColor;
+    if (b.chopping && b.targetIsBush) return barbPickColor;
     if (b.chopping && b.targetIsRock) return barbMineColor;
     if (b.chopping) return barbChopColor;
     return barbIdleColor;
@@ -278,6 +295,7 @@ Color barbColor(const barb& b) {
 const char* barbTaskName(const barb& b) {
     if (b.deertargeting) return "hunting";
     if (b.building) return "building";
+    if (b.chopping && b.targetIsBush) return "picking";
     if (b.chopping && b.targetIsRock) return "mining";
     if (b.chopping) return "chopping";
     return "idle";
@@ -723,10 +741,11 @@ float rectDistSq(const FloatRect& r, Vector2f p) {
     return dx * dx + dy * dy;
 }
 
-// Fresh scan each frame, no stored selection. Returns the first hit: barbs, trader, wolves, deer, rocks, houses.
+// Fresh scan each frame, no stored selection. Returns the first hit: barbs, trader, wolves, deer, rocks, bushes, houses.
 optional<hoverHit> pickHover(Vector2f p, float radius, const vector<barb>& barbs, const vector<RectangleShape>& squares,
                              const optional<trader>& tr, const vector<wolf>& wolves, const vector<deer>& deers, const vector<RectangleShape>& deershape,
-                             const vector<rock>& rocks, const vector<CircleShape>& octs, const vector<RectangleShape>& houseshapes) {
+                             const vector<rock>& rocks, const vector<CircleShape>& octs,
+                             const vector<bush>& bushes, const vector<CircleShape>& bushshapes, const vector<RectangleShape>& houseshapes) {
     float rSq = radius * radius;
     auto near = [&](const Shape& s) { return rectDistSq(s.getGlobalBounds(), p) <= rSq; };
     for (int i = 0; i < (int)squares.size() && i < (int)barbs.size(); i++)
@@ -742,6 +761,8 @@ optional<hoverHit> pickHover(Vector2f p, float radius, const vector<barb>& barbs
         if (near(deershape[i])) return hoverHit{"Deer " + to_string(deers[i].health) + "hp", deershape[i], nullopt};
     for (int i = 0; i < (int)octs.size() && i < (int)rocks.size(); i++)
         if (near(octs[i])) return hoverHit{rocks[i].dying ? "Rock: being mined" : "Rock", nullopt, octs[i]};
+    for (int i = 0; i < (int)bushshapes.size() && i < (int)bushes.size(); i++)
+        if (near(bushshapes[i])) return hoverHit{bushes[i].ripe ? "Bush: ripe" : "Bush: bare", nullopt, bushshapes[i]};
     for (auto& hs : houseshapes)
         if (near(hs)) return hoverHit{"House", hs, nullopt};
     return nullopt;
@@ -905,7 +926,13 @@ void barbmove(vector<RectangleShape>& squares, vector<barb>& barbs) {
     }
 }
 
-void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<CircleShape>& tris, vector<RectangleShape>& stumps, vector<tree>& trees, vector<CircleShape>& octs, vector<rock>& rocks) {
+Vector2f bushWorkSpot(const CircleShape& bs) {
+    Vector2f p = bs.getPosition() + bushWorkOffset;
+    return Vector2f((float)(int)p.x, (float)(int)p.y);
+}
+
+void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<CircleShape>& tris, vector<RectangleShape>& stumps, vector<tree>& trees, vector<CircleShape>& octs, vector<rock>& rocks,
+                   vector<bush>& bushes, vector<CircleShape>& bushshapes) {
     for (int j = 0; j < (int)squares.size(); j++) {
         auto& sq = squares[j];
         auto& b  = barbs[j];
@@ -913,31 +940,77 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
         Vector2f bpos = sq.getPosition();
         bool bestIsRock = false;
         if (b.timer == 0 && !b.chopping) {
-            float treeDSq, rockDSq;
+            float treeDSq, rockDSq, bushDSq;
             int bestTree = findNearest(bpos, barbWorkSearchRadius, (int)trees.size(),
                                        [&](int i) { return tris[i].getPosition() + treeWorkOffset; },
                                        [&](int i) { return trees[i].dying; }, &treeDSq);
             int bestRock = findNearest(bpos, barbWorkSearchRadius, (int)rocks.size(),
                                        [&](int k) { return octs[k].getPosition() + rockWorkOffset; },
                                        [&](int k) { return rocks[k].dying; }, &rockDSq);
-            // a rock wins only when strictly closer, as when trees were scanned first
+            int bestBush = findNearest(bpos, barbWorkSearchRadius, (int)bushes.size(),
+                                       [&](int k) { return bushWorkSpot(bushshapes[k]); },
+                                       [&](int k) { return !bushes[k].ripe || bushes[k].picking; }, &bushDSq);
+            // a rock wins only when strictly closer, as when trees were scanned first; a bush likewise
             bestIsRock = bestRock != -1 && rockDSq < treeDSq;
+            bool bestIsBush = bestBush != -1 && bushDSq < (bestIsRock ? rockDSq : treeDSq);
             int best = bestIsRock ? bestRock : bestTree;
-            if (best != -1 && !bestIsRock && b.moving==false) {
+            if (bestIsBush && b.moving==false) {
+                Vector2f wp = bushWorkSpot(bushshapes[bestBush]);
+                b.targetx = (int)wp.x;
+                b.targety = (int)wp.y;
+                b.moving  = true;
+                b.targetIsRock = false;
+                b.targetIsBush = true;
+                b.targetBush = bestBush;
+            }
+            if (best != -1 && !bestIsBush && !bestIsRock && b.moving==false) {
                 Vector2f tp = tris[best].getPosition();
                 b.targetx = (int)(tp.x + 8);
                 b.targety = (int)(tp.y + 15);
                 b.moving  = true;
                 b.targetIsRock = false;
+                b.targetIsBush = false;
             }
-	    if (best != -1 && bestIsRock && b.moving==false) {
+	    if (best != -1 && !bestIsBush && bestIsRock && b.moving==false) {
 		    Vector2f rp = octs[best].getPosition();
 		    b.targetx = (int)(rp.x + 6);
 		    b.targety = (int)(rp.y + 10);
 		    b.moving = true;
 		    b.targetIsRock = true;
+		    b.targetIsBush = false;
         }
         if (b.targetx == -1) continue;
+	}
+	if (b.targetIsBush) {
+            int i = b.targetBush;
+            if (i < 0 || i >= (int)bushes.size()) continue;
+            Vector2f wp = bushWorkSpot(bushshapes[i]);
+            if (b.targetx != (int)wp.x || b.targety != (int)wp.y) continue; // retargeted (e.g. a hunt)
+            if ((!bushes[i].ripe || bushes[i].picking) && !b.chopping) {   // someone else got there first
+                b.moving = false;
+                b.targetx = b.targety = -1;
+                b.targetIsBush = false;
+                b.targetBush = -1;
+                continue;
+            }
+            float dx = wp.x - bpos.x, dy = wp.y - bpos.y;
+            if (dx * dx + dy * dy >= 4.0f) continue;
+            b.chopping = true;
+            bushes[i].picking = true;
+            if (workTick(b)) b.timer++;
+            if (b.timer >= bushPickTicks) {
+                food++;
+                bushes[i].ripe = bushes[i].picking = false;
+                bushes[i].regrow = 0;
+                bushshapes[i].setFillColor(bushBareColor);
+                b.moving = b.chopping = false;
+                b.timer = 0;
+                b.targetx = b.targety = -1;
+                b.targetIsBush = false;
+                b.targetBush = -1;
+                printf("BERRIES PICKED - food: %d\n", food);
+            }
+            continue;
 	}
 	if (!b.targetIsRock) {
         for (int i = 0; i < (int)trees.size(); i++) {
@@ -1017,6 +1090,48 @@ void treespawn(vector<tree>& trees, vector<CircleShape>& tris, vector<RectangleS
     stumps.push_back(stump);
 }
 
+// A few clumps of bushes, away from the village center. Startup trees overlapping a bush are
+// cleared (trees, tris and stumps together) so the clumps sit in small clearings and stay visible.
+void spawnBushes(vector<bush>& bushes, vector<CircleShape>& bushshapes, vector<tree>& trees, vector<CircleShape>& tris, vector<RectangleShape>& stumps) {
+    uniform_int_distribution<int> centre(60, 740);
+    uniform_real_distribution<float> spread(-bushClumpSpread, bushClumpSpread);
+    for (int c = 0; c < numBushClumps; c++) {
+        Vector2f cp;
+        do cp = Vector2f((float)centre(gen), (float)centre(gen));
+        while (hypot(cp.x - villageCenter.x, cp.y - villageCenter.y) < bushClumpMinCenterDist);
+        for (int k = 0; k < bushesPerClump; k++) {
+            bush bu{(int)(cp.x + spread(gen)), (int)(cp.y + spread(gen))};
+            bushes.push_back(bu);
+            CircleShape bs(bushRadius);
+            bs.setPosition(Vector2f(bu.x, bu.y));
+            bs.setFillColor(bushRipeColor);
+            bushshapes.push_back(bs);
+        }
+    }
+    for (int i = (int)tris.size() - 1; i >= 0; i--) {
+        FloatRect tb = tris[i].getGlobalBounds();
+        for (auto& bs : bushshapes) {
+            FloatRect bb = bs.getGlobalBounds();
+            bb.position -= Vector2f(bushTreeClearance, bushTreeClearance);
+            bb.size += Vector2f(2 * bushTreeClearance, 2 * bushTreeClearance + bushWorkOffset.y); // keep the work spot clear too
+            if (!tb.findIntersection(bb)) continue;
+            swapRemove(trees, i); swapRemove(tris, i); swapRemove(stumps, i);
+            break;
+        }
+    }
+    printf("Spawned %zu bushes in %d clumps\n", bushes.size(), numBushClumps);
+}
+
+// Bare bushes ripen again after bushRegrowTicks
+void bushTick(vector<bush>& bushes, vector<CircleShape>& bushshapes) {
+    for (int i = 0; i < (int)bushes.size(); i++) {
+        if (bushes[i].ripe || ++bushes[i].regrow < bushRegrowTicks) continue;
+        bushes[i].ripe = true;
+        bushes[i].regrow = 0;
+        bushshapes[i].setFillColor(bushRipeColor);
+    }
+}
+
 int main() {
     RenderWindow window(VideoMode({800, 800}), "sim");
     window.setFramerateLimit(60);
@@ -1082,6 +1197,10 @@ int main() {
         oct.setFillColor(Color(125, 125, 125));
         octs.push_back(oct);
     }
+
+    vector<bush> bushes;
+    vector<CircleShape> bushshapes;
+    spawnBushes(bushes, bushshapes, trees, tris, stumps);
 
     RectangleShape bgBar({20, 3});
     bgBar.setFillColor(Color::Black);
@@ -1160,7 +1279,7 @@ int main() {
             ticksThisFrame++;
             for (int rep = 0; rep < simSpeed; rep++) {
                 buildhouse(barbs, squares, houses, houseshapes);
-                minematerials(squares, barbs, tris, stumps, trees, octs, rocks);
+                minematerials(squares, barbs, tris, stumps, trees, octs, rocks, bushes, bushshapes);
                 barbmove(squares, barbs);
                 treespawn(trees, tris, stumps);
                 barbspawner(squares, barbs, houseshapes);
@@ -1174,6 +1293,7 @@ int main() {
                 hungerTick(barbs);
                 trailTick();
                 birdTick(birds, birdHeading, squares);
+                bushTick(bushes, bushshapes);
             }
         }
 
@@ -1183,7 +1303,7 @@ int main() {
             if (dx*dx + dy*dy < 2500.0f) { // 50^2
                 int tix = (int)(p.x + 8), tiy = (int)(p.y + 15);
                 for (auto& b : barbs) {
-                    if (b.targetx == tix && b.targety == tiy) {
+                    if (!b.targetIsBush && b.targetx == tix && b.targety == tiy) {
                         b.moving = b.chopping = false;
                         b.timer  = 0;
                         b.targetx = b.targety = -1;
@@ -1206,6 +1326,9 @@ int main() {
 	
 	for (auto& oct : octs)
 		window.draw(oct);
+
+	for (auto& bs : bushshapes)
+		window.draw(bs);
 
 	for (auto& hs : houseshapes)
 		window.draw(hs);
@@ -1231,12 +1354,20 @@ int main() {
 	drawBirds(window, birds, birdShape, frameCount++);
 	for (int q = 0; q < (int)squares.size(); ++q) {
             auto& b = barbs[q];
-            if (b.chopping && b.timer > 0 && !b.targetIsRock) {
+            if (b.chopping && b.timer > 0 && !b.targetIsRock && !b.targetIsBush) {
                 bgBar.setPosition(Vector2f(b.targetx - 10, b.targety - 20));
                 window.draw(bgBar);
                 fgBar.setSize(Vector2f(b.timer * 20.0f / 180.0f, 3));
                 fgBar.setFillColor(Color(1, 121, 111));
                 fgBar.setPosition(Vector2f(b.targetx - 10, b.targety - 20));
+                window.draw(fgBar);
+            }
+            if (b.chopping && b.timer > 0 && b.targetIsBush) {
+                bgBar.setPosition(Vector2f(b.targetx - 10, b.targety - 14));
+                window.draw(bgBar);
+                fgBar.setSize(Vector2f(b.timer * 20.0f / bushPickTicks, 3));
+                fgBar.setFillColor(barbPickColor);
+                fgBar.setPosition(Vector2f(b.targetx - 10, b.targety - 14));
                 window.draw(fgBar);
             }
             if (b.building &&  b.timer > 0) {
@@ -1274,7 +1405,7 @@ int main() {
             bool overUi = (hudFontOk && hudPanel.getGlobalBounds().contains(mscreen)) || tickerRect.contains(mscreen);
             if (window.hasFocus() && !panning && !overUi && mpx.x >= 0 && mpx.y >= 0 && mpx.x < (int)wsz.x && mpx.y < (int)wsz.y) {
                 Vector2f mworld = window.mapPixelToCoords(mpx, worldView);
-                hover = pickHover(mworld, tooltipPickRadius / zoom, barbs, squares, activeTrader, wolves, deers, deershape, rocks, octs, houseshapes);
+                hover = pickHover(mworld, tooltipPickRadius / zoom, barbs, squares, activeTrader, wolves, deers, deershape, rocks, octs, bushes, bushshapes, houseshapes);
                 if (hover) drawHoverOutline(window, worldView, *hover, zoom);
             }
         }
