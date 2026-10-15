@@ -92,6 +92,24 @@ const int roadStepBonus = 1;               // ticks shaved off the step limit on
 const Color trailPathColor(150, 125, 85, 26);
 const Color trailRoadColor(150, 125, 85, 52);
 
+const int birdFlockSize = 8;               // birds per flock (cosmetic only, no gameplay effect)
+const float birdFleeRadius = 30.0f;        // birds scatter from barbs closer than this (world px)
+const float birdCruiseSpeed = 0.4f;        // px per tick (~24px/s, crosses the map in ~35s)
+const float birdMaxSpeed = 1.0f;           // cap while fleeing
+const float birdMinSpeed = 0.2f;
+const float birdCohesion = 0.002f;         // pull toward flock centre (regroup)
+const float birdAlign = 0.02f;             // pull toward the flock's travel heading
+const float birdSeparationDist = 5.0f;     // birds closer than this push apart
+const float birdSeparation = 0.03f;
+const float birdFleeForce = 0.08f;
+const float birdSpawnSpread = 12.0f;       // initial cluster half-size
+const float birdExitMargin = 40.0f;        // flock is gone once every bird is this far off-map
+const int birdGapTicks = 7200;             // ~2 min of quiet sky between flocks
+const int birdFlapFrames = 8;              // frames per wing-flap half cycle
+const Vector2f birdWingsOut(3.0f, 2.0f);
+const Vector2f birdWingsIn(2.0f, 2.0f);
+const Color birdColor(205, 215, 230);      // pale blue-white: readable on dark green, distinct from white idle barbs
+
 mt19937 gen(random_device{}());
 uniform_int_distribution<int> distrib(0, 800);
 uniform_int_distribution<int> wanderChance(0, 149);
@@ -419,6 +437,74 @@ void drawTrails(RenderWindow& window, VertexArray& va) {
         trailDirty = false;
     }
     if (va.getVertexCount() > 0) window.draw(va);
+}
+
+// Cosmetic flock: crosses the map along a heading, scatters from nearby barbs, regroups by cohesion
+struct bird {Vector2f pos, vel; int flapOffset = 0;};
+
+void birdTick(vector<bird>& birds, Vector2f& heading, const vector<RectangleShape>& squares) {
+    static int gap = birdGapTicks / 4;
+    if (birds.empty()) {
+        if (--gap > 0) return;
+        gap = birdGapTicks;
+        uniform_real_distribution<float> along(100.0f, worldSize - 100.0f), spread(-birdSpawnSpread, birdSpawnSpread), jitter(-0.4f, 0.4f);
+        Vector2f start;
+        float ang;
+        switch (uniform_int_distribution<int>(0, 3)(gen)) {
+            case 0:  start = {-20.0f, along(gen)};             ang = 0.0f;   break;
+            case 1:  start = {worldSize + 20.0f, along(gen)};  ang = 3.1416f; break;
+            case 2:  start = {along(gen), -20.0f};             ang = 1.5708f; break;
+            default: start = {along(gen), worldSize + 20.0f};  ang = -1.5708f; break;
+        }
+        ang += jitter(gen);
+        heading = Vector2f(cos(ang), sin(ang));
+        for (int i = 0; i < birdFlockSize; i++)
+            birds.push_back({start + Vector2f(spread(gen), spread(gen)), heading * birdCruiseSpeed,
+                             uniform_int_distribution<int>(0, 2 * birdFlapFrames - 1)(gen)});
+        printf("Birds arriving\n");
+        return;
+    }
+    Vector2f center(0.0f, 0.0f);
+    for (auto& b : birds) center += b.pos;
+    center /= (float)birds.size();
+    const float fleeSq = birdFleeRadius * birdFleeRadius, sepSq = birdSeparationDist * birdSeparationDist;
+    bool allOut = true;
+    for (int i = 0; i < (int)birds.size(); i++) {
+        bird& b = birds[i];
+        Vector2f acc = (center - b.pos) * birdCohesion + (heading * birdCruiseSpeed - b.vel) * birdAlign;
+        for (int j = 0; j < (int)birds.size(); j++) {
+            if (j == i) continue;
+            Vector2f d = b.pos - birds[j].pos;
+            float dSq = d.x * d.x + d.y * d.y;
+            if (dSq > 0.0001f && dSq < sepSq) acc += d / sqrt(dSq) * birdSeparation;
+        }
+        for (auto& sq : squares) {
+            Vector2f d = b.pos - sq.getPosition();
+            float dSq = d.x * d.x + d.y * d.y;
+            if (dSq > 0.0001f && dSq < fleeSq) acc += d / sqrt(dSq) * birdFleeForce;
+        }
+        b.vel += acc;
+        float sp = sqrt(b.vel.x * b.vel.x + b.vel.y * b.vel.y);
+        if (sp > birdMaxSpeed) b.vel *= birdMaxSpeed / sp;
+        else if (sp < birdMinSpeed) b.vel = sp > 0.0001f ? b.vel * (birdMinSpeed / sp) : heading * birdMinSpeed;
+        b.pos += b.vel;
+        if (b.pos.x > -birdExitMargin && b.pos.x < worldSize + birdExitMargin && b.pos.y > -birdExitMargin && b.pos.y < worldSize + birdExitMargin)
+            allOut = false;
+    }
+    if (allOut) birds.clear();
+}
+
+// Wings alternate between 3x2 (out) and 2x2 (in) for a subtle flap flicker; centred so the bird doesn't jitter
+void drawBirds(RenderWindow& window, const vector<bird>& birds, RectangleShape& shape, int frame) {
+    shape.setFillColor(birdColor);
+    for (auto& b : birds) {
+        bool out = ((frame + b.flapOffset) / birdFlapFrames) % 2 == 0;
+        Vector2f sz = out ? birdWingsOut : birdWingsIn;
+        shape.setSize(sz);
+        shape.setOrigin(Vector2f(floor(sz.x / 2.0f), floor(sz.y / 2.0f))); // whole-px origin keeps edges pixel-aligned
+        shape.setPosition(Vector2f(round(b.pos.x), round(b.pos.y)));
+        window.draw(shape);
+    }
 }
 
 // Returns true on ticks where the barb makes work progress; hungry barbs skip some ticks
@@ -906,6 +992,10 @@ int main() {
     optional<trader> activeTrader;
     FloatRect tickerRect;                 // last frame's ticker strip, used to suppress hover over it
     VertexArray trailVerts(PrimitiveType::Triangles);
+    vector<bird> birds;
+    Vector2f birdHeading(1.0f, 0.0f);
+    RectangleShape birdShape;
+    int frameCount = 0;
 
     while (window.isOpen()) {
         while (const optional event = window.pollEvent())
@@ -966,6 +1056,7 @@ int main() {
                 traderTick(activeTrader);
                 hungerTick(barbs);
                 trailTick();
+                birdTick(birds, birdHeading, squares);
             }
         }
 
@@ -1017,6 +1108,7 @@ int main() {
 	if (activeTrader) window.draw(activeTrader->shape);
 	for (int k = 0; k < (int)tris.size(); ++k)
 		window.draw(tris[k]);
+	drawBirds(window, birds, birdShape, frameCount++);
 	for (int q = 0; q < (int)squares.size(); ++q) {
             auto& b = barbs[q];
             if (b.chopping && b.timer > 0 && !b.targetIsRock) {
