@@ -71,6 +71,17 @@ const Color eventTextColor(205, 200, 180);
 const uint8_t eventTextAlpha = 220;
 const uint8_t eventStripAlpha = 90;
 
+const float tooltipPickRadius = 7.0f;     // screen px around the cursor that counts as a hover hit
+const float tooltipOutlinePx = 1.0f;      // highlight outline width in screen px (scaled by zoom)
+const Color tooltipOutlineColor(240, 210, 90);
+const unsigned int tooltipFontSize = 12;
+const Vector2f tooltipPad(5.0f, 3.0f);
+const Vector2f tooltipOffset(12.0f, 20.0f); // label offset below-right of the cursor (clears the arrow)
+const float tooltipFlipGap = 8.0f;        // gap from the cursor when flipped left/above
+const float tooltipEdgeMargin = 2.0f;
+const Color tooltipPanelColor(0, 0, 0, 170);
+const Color tooltipTextColor(225, 220, 200);
+
 mt19937 gen(random_device{}());
 uniform_int_distribution<int> distrib(0, 800);
 uniform_int_distribution<int> wanderChance(0, 149);
@@ -149,8 +160,9 @@ uint8_t eventFade(const gameEvent& e, uint8_t full) {
     return (uint8_t)(full * clamp(f, 0.0f, 1.0f));
 }
 
-void drawEvents(RenderWindow& window, const Font& font) {
-    if (events.empty()) return;
+// Returns the strip's screen rect (empty when nothing is shown) so the tooltip can avoid it
+FloatRect drawEvents(RenderWindow& window, const Font& font) {
+    if (events.empty()) return FloatRect();
     window.setView(window.getDefaultView());
     float lineH = font.getLineSpacing(eventFontSize);
     float width = eventStripMinWidth;
@@ -175,6 +187,7 @@ void drawEvents(RenderWindow& window, const Font& font) {
         t.setPosition(topLeft + eventPad + Vector2f(0.0f, i * lineH));
         window.draw(t);
     }
+    return FloatRect(topLeft, {width, height});
 }
 
 struct tree  {int x, y, health; bool dying = false;};
@@ -193,6 +206,15 @@ Color barbColor(const barb& b) {
     if (b.chopping && b.targetIsRock) return barbMineColor;
     if (b.chopping) return barbChopColor;
     return barbIdleColor;
+}
+
+// Same priority as barbColor() so the tooltip always matches the colour on screen
+const char* barbTaskName(const barb& b) {
+    if (b.deertargeting) return "hunting";
+    if (b.building) return "building";
+    if (b.chopping && b.targetIsRock) return "mining";
+    if (b.chopping) return "chopping";
+    return "idle";
 }
 
 void deerkilling(vector<deer>& deers, vector<RectangleShape>& deershape, vector<barb>& barbs, vector<RectangleShape>& squares) {
@@ -416,6 +438,84 @@ void traderTick(optional<trader>& tr) {
         t.stepTimer = 0;
         t.shape.move(dSq > 1.0f ? diff / sqrt(dSq) : diff);
     }
+}
+
+struct hoverHit {string label; optional<RectangleShape> rect; optional<CircleShape> circle;};
+
+float rectDistSq(const FloatRect& r, Vector2f p) {
+    float dx = max(max(r.position.x - p.x, p.x - (r.position.x + r.size.x)), 0.0f);
+    float dy = max(max(r.position.y - p.y, p.y - (r.position.y + r.size.y)), 0.0f);
+    return dx * dx + dy * dy;
+}
+
+// Fresh scan each frame, no stored selection. Returns the first hit: barbs, trader, deer, rocks, houses.
+optional<hoverHit> pickHover(Vector2f p, float radius, const vector<barb>& barbs, const vector<RectangleShape>& squares,
+                             const optional<trader>& tr, const vector<deer>& deers, const vector<RectangleShape>& deershape,
+                             const vector<rock>& rocks, const vector<CircleShape>& octs, const vector<RectangleShape>& houseshapes) {
+    float rSq = radius * radius;
+    auto near = [&](const Shape& s) { return rectDistSq(s.getGlobalBounds(), p) <= rSq; };
+    for (int i = 0; i < (int)squares.size() && i < (int)barbs.size(); i++)
+        if (near(squares[i]))
+            return hoverHit{string("Barb: ") + barbTaskName(barbs[i]) + (isHungry(barbs[i]) ? " (hungry)" : ""), squares[i], nullopt};
+    if (tr && near(tr->shape)) {
+        const char* ph = tr->phase == trader::Arriving ? "arriving" : tr->phase == trader::Trading ? "trading" : "leaving";
+        return hoverHit{string("Trader: ") + ph, tr->shape, nullopt};
+    }
+    for (int i = 0; i < (int)deershape.size() && i < (int)deers.size(); i++)
+        if (near(deershape[i])) return hoverHit{"Deer " + to_string(deers[i].health) + "hp", deershape[i], nullopt};
+    for (int i = 0; i < (int)octs.size() && i < (int)rocks.size(); i++)
+        if (near(octs[i])) return hoverHit{rocks[i].dying ? "Rock: being mined" : "Rock", nullopt, octs[i]};
+    for (auto& hs : houseshapes)
+        if (near(hs)) return hoverHit{"House", hs, nullopt};
+    return nullopt;
+}
+
+// Outline-only copy of the hit shape, drawn above the overlays so it stays readable at night
+void drawHoverOutline(RenderWindow& window, const View& worldView, hoverHit& h, float zoom) {
+    window.setView(worldView);
+    float th = tooltipOutlinePx / zoom;
+    if (h.rect) {
+        h.rect->setFillColor(Color::Transparent);
+        h.rect->setOutlineThickness(th);
+        h.rect->setOutlineColor(tooltipOutlineColor);
+        window.draw(*h.rect);
+    }
+    if (h.circle) {
+        h.circle->setFillColor(Color::Transparent);
+        h.circle->setOutlineThickness(th);
+        h.circle->setOutlineColor(tooltipOutlineColor);
+        window.draw(*h.circle);
+    }
+}
+
+// Places the label beside the cursor, flipping left/above to stay on screen and off the HUD and ticker
+void drawTooltip(RenderWindow& window, const Font& font, const string& label, Vector2f mouse, const FloatRect& hudRect, const FloatRect& tickerRect) {
+    window.setView(window.getDefaultView());
+    Vector2f win = window.getDefaultView().getSize();
+    Text t(font, label, tooltipFontSize);
+    FloatRect lb = t.getLocalBounds();
+    Vector2f size(lb.size.x + 2 * tooltipPad.x, lb.size.y + 2 * tooltipPad.y);
+    float right = mouse.x + tooltipOffset.x, left = mouse.x - tooltipFlipGap - size.x;
+    float below = mouse.y + tooltipOffset.y, above = mouse.y - tooltipFlipGap - size.y;
+    Vector2f cands[4] = {{right, below}, {left, below}, {right, above}, {left, above}};
+    Vector2f pos(clamp(right, tooltipEdgeMargin, max(tooltipEdgeMargin, win.x - tooltipEdgeMargin - size.x)),
+                 clamp(below, tooltipEdgeMargin, max(tooltipEdgeMargin, win.y - tooltipEdgeMargin - size.y)));
+    for (auto& c : cands) {
+        FloatRect box(c, size);
+        bool inside = c.x >= tooltipEdgeMargin && c.y >= tooltipEdgeMargin
+                   && c.x + size.x <= win.x - tooltipEdgeMargin && c.y + size.y <= win.y - tooltipEdgeMargin;
+        bool hitsHud = hudRect.size.x > 0 && box.findIntersection(hudRect).has_value();
+        bool hitsTicker = tickerRect.size.x > 0 && box.findIntersection(tickerRect).has_value();
+        if (inside && !hitsHud && !hitsTicker) { pos = c; break; }
+    }
+    pos = Vector2f(round(pos.x), round(pos.y));
+    RectangleShape panel(size);
+    panel.setPosition(pos);
+    panel.setFillColor(tooltipPanelColor);
+    window.draw(panel);
+    t.setFillColor(tooltipTextColor);
+    t.setPosition(pos + tooltipPad - lb.position);
+    window.draw(t);
 }
 
 void drawOverlay(RenderWindow& window, RectangleShape& shape, Color c) {
@@ -734,6 +834,7 @@ int main() {
     Vector2i lastMouse;
     View worldView(FloatRect({0.0f, 0.0f}, {worldSize, worldSize}));
     optional<trader> activeTrader;
+    FloatRect tickerRect;                 // last frame's ticker strip, used to suppress hover over it
 
     while (window.isOpen()) {
         while (const optional event = window.pollEvent())
@@ -880,6 +981,19 @@ int main() {
         drawOverlay(window, dnc, dncColor);
         if (raining) drawOverlay(window, dnc, rainOverlayColor);
 
+        optional<hoverHit> hover;
+        {
+            Vector2i mpx = Mouse::getPosition(window);
+            Vector2u wsz = window.getSize();
+            Vector2f mscreen = window.mapPixelToCoords(mpx, window.getDefaultView());
+            bool overUi = (hudFontOk && hudPanel.getGlobalBounds().contains(mscreen)) || tickerRect.contains(mscreen);
+            if (window.hasFocus() && !panning && !overUi && mpx.x >= 0 && mpx.y >= 0 && mpx.x < (int)wsz.x && mpx.y < (int)wsz.y) {
+                Vector2f mworld = window.mapPixelToCoords(mpx, worldView);
+                hover = pickHover(mworld, tooltipPickRadius / zoom, barbs, squares, activeTrader, deers, deershape, rocks, octs, houseshapes);
+                if (hover) drawHoverOutline(window, worldView, *hover, zoom);
+            }
+        }
+
         if (hudFontOk) {
             window.setView(window.getDefaultView());
             const char* phase = (t >= 21 || t < 6) ? "Night" : "Day";
@@ -900,7 +1014,9 @@ int main() {
             hudText.setFillColor(Color::White);
             hudText.setPosition(hudPos + hudTextOffset);
             window.draw(hudText);
-            drawEvents(window, hudFont);
+            tickerRect = drawEvents(window, hudFont);
+            if (hover) drawTooltip(window, hudFont, hover->label, window.mapPixelToCoords(Mouse::getPosition(window), window.getDefaultView()),
+                                   hudPanel.getGlobalBounds(), tickerRect);
         }
         eventTick();
         window.display();
