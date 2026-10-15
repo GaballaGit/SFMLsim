@@ -114,7 +114,8 @@ const Color tooltipTextColor(225, 220, 200);
 const float trailCellSize = 8.0f;          // world px per trail grid cell
 const int trailGridN = 100;                // cells per side (800 / 8)
 const int trailDecayIntervalTicks = 120;   // every 2s each cell loses 1 wear, so stray steps fade out
-const int trailMaxWear = 240;              // cap so abandoned roads fade within ~8 min
+const int rainErodeMult = 2;               // trails decay this many times faster while raining (4 needed a barb per cell every 4s to hold a road through a shower)
+const int trailMaxWear = 240;             // cap so abandoned roads fade within ~8 min
 const int trailPathThreshold = 48;         // wear for the faint "path" tint (~6 recent crossings)
 const int trailRoadThreshold = 144;        // wear for "road": darker tint and the speed bonus
 const int roadStepBonus = 1;               // ticks shaved off the step limit on road cells (~10% faster)
@@ -809,7 +810,8 @@ void trailStep(Vector2f p) {
 
 void trailTick() {
     static int dtimer = 0;
-    if (++dtimer < trailDecayIntervalTicks) return;
+    int interval = raining ? trailDecayIntervalTicks / rainErodeMult : trailDecayIntervalTicks;
+    if (++dtimer < interval) return; // dtimer >= interval falls through, so rain starting mid-countdown can't stall it
     dtimer = 0;
     for (int c = 0; c < (int)trailWear.size(); c++) {
         if (trailWear[c] == 0) continue;
