@@ -16,6 +16,10 @@ const Vector2f hudPos(6.0f, 6.0f);
 const Vector2f hudPanelSize(150.0f, 130.0f);
 const Vector2f hudTextOffset(6.0f, 4.0f);
 const int maxTicksPerFrame = 20;
+const float worldSize = 800.0f;
+const float minZoom = 1.0f;
+const float maxZoom = 4.0f;
+const float zoomStep = 1.1f;
 const Color hudPanelColor(0, 0, 0, 160);
 
 const Color barbIdleColor(255, 255, 255);
@@ -512,6 +516,11 @@ int main() {
 
     bool paused = false;
     int simSpeed = 1;
+    float zoom = minZoom;
+    Vector2f camCenter(worldSize / 2, worldSize / 2);
+    bool panning = false;
+    Vector2i lastMouse;
+    View worldView(FloatRect({0.0f, 0.0f}, {worldSize, worldSize}));
 
     while (window.isOpen()) {
         while (const optional event = window.pollEvent())
@@ -522,6 +531,34 @@ int main() {
                 else if (kp->code == Keyboard::Key::Num2) simSpeed = 2;
                 else if (kp->code == Keyboard::Key::Num3) simSpeed = 4;
             }
+            else if (const auto* ms = event->getIf<Event::MouseWheelScrolled>()) {
+                float nz = clamp(zoom * (ms->delta > 0 ? zoomStep : 1.0f / zoomStep), minZoom, maxZoom);
+                Vector2f before = window.mapPixelToCoords(ms->position, worldView);
+                worldView.setSize({worldSize / nz, worldSize / nz});
+                Vector2f after = window.mapPixelToCoords(ms->position, worldView);
+                camCenter = worldView.getCenter() + (before - after);
+                zoom = nz;
+            }
+            else if (const auto* mp = event->getIf<Event::MouseButtonPressed>()) {
+                if (mp->button == Mouse::Button::Middle) { panning = true; lastMouse = mp->position; }
+            }
+            else if (const auto* mr = event->getIf<Event::MouseButtonReleased>()) {
+                if (mr->button == Mouse::Button::Middle) panning = false;
+            }
+            else if (const auto* mm = event->getIf<Event::MouseMoved>()) {
+                if (panning) {
+                    camCenter -= Vector2f(mm->position - lastMouse) / zoom;
+                    lastMouse = mm->position;
+                }
+            }
+
+        {
+            float half = worldSize / zoom / 2;
+            camCenter.x = clamp(camCenter.x, half, worldSize - half);
+            camCenter.y = clamp(camCenter.y, half, worldSize - half);
+            worldView.setSize({worldSize / zoom, worldSize / zoom});
+            worldView.setCenter(camCenter);
+        }
 
         timesincelastupdate += clock.restart();
         if (paused) timesincelastupdate = Time::Zero;
@@ -531,15 +568,15 @@ int main() {
             if (ticksThisFrame >= maxTicksPerFrame) { timesincelastupdate = Time::Zero; break; }
             ticksThisFrame++;
             for (int rep = 0; rep < simSpeed; rep++) {
-            buildhouse(barbs, squares, houses, houseshapes);
-            minematerials(squares, barbs, tris, stumps, trees, octs, rocks);
-            barbmove(squares, barbs);
-            treespawn(trees, tris, stumps);
-            barbspawner(squares, barbs, houseshapes);
-	    deerspawn(deers, deershape);
-	    deerwander(deershape, deers);
-	    deerkilling(deers, deershape, barbs, squares);
-            clockk();
+                buildhouse(barbs, squares, houses, houseshapes);
+                minematerials(squares, barbs, tris, stumps, trees, octs, rocks);
+                barbmove(squares, barbs);
+                treespawn(trees, tris, stumps);
+                barbspawner(squares, barbs, houseshapes);
+                deerspawn(deers, deershape);
+                deerwander(deershape, deers);
+                deerkilling(deers, deershape, barbs, squares);
+                clockk();
             }
         }
 
@@ -567,6 +604,7 @@ int main() {
         }
 
         window.clear(Color(4, 20, 14)); //bg color
+        window.setView(worldView);
 	
 	for (auto& oct : octs)
 		window.draw(oct);
@@ -620,6 +658,7 @@ int main() {
         else if (t < 12)           {dnc.setFillColor(Color(250, 231, 190, 30));}  // Morning
         else if (t < 18)           {dnc.setFillColor(Color(233, 255, 253, 30));}  // Midday
         else                       {dnc.setFillColor(Color(255, 178, 127, 50));}  // Evening
+        window.setView(window.getDefaultView());
         window.draw(dnc);
 
         if (hudFontOk) {
