@@ -54,6 +54,25 @@ const int barbPickFrames = 10;              // picking: arm dips to the bush on 
 const float barbHungryDroopPx = 1.0f;       // hungry barbs slouch: body 1px shorter
 const Color barbSkinColor(196, 158, 122);   // muted tan (HUD people icon)
 
+// Kin lines: every barb rolls a race at birth. Body colour stays shared so task stripes read the same;
+// races differ by body size (which is also the hitbox) and a hat mark drawn above the head.
+const int rockMineTicks = 480;              // base work ticks to mine one rock
+enum barbRace { raceHuman, raceDwarf, raceElf, raceCount };
+struct raceDef {
+    const char* name;      // capitalised, for the tooltip
+    const char* birthName; // with article, for the birth log line ("An elf is born")
+    Vector2f bodySize;     // drawn body and hitbox (width x height)
+    Vector2f hatSize;      // 0x0 = no hat; sits on top of the body
+    Vector2f hatTipSize;   // optional point on top of the hat, left-aligned
+    Color hatColor;
+    float mineSpeed;       // rock-mining rate multiplier (dwarf edge: 480 -> 320 ticks per rock)
+};
+constexpr raceDef raceDefs[raceCount] = {
+    {"Human", "A human", {2.0f, 4.0f}, {0.0f, 0.0f}, {0.0f, 0.0f}, Color(0, 0, 0),       1.0f},
+    {"Dwarf", "A dwarf", {3.0f, 3.0f}, {3.0f, 1.0f}, {0.0f, 0.0f}, Color(150, 92, 58),   1.5f}, // stocky, rust-brown cap
+    {"Elf",   "An elf",  {2.0f, 5.0f}, {2.0f, 1.0f}, {1.0f, 1.0f}, Color(170, 196, 150), 1.0f}, // tall, pale sage pointed hat
+};
+
 int wood = 0;
 int stone = 0;
 int food = 0;
@@ -450,7 +469,11 @@ struct barb {
     int targetDeerId = -1;
     int hunger = 0;
     int slowTick = 0;
+    barbRace race = raceHuman;   // rolled once in makeBarb()
 };
+
+const raceDef& raceOf(const barb& b) { return raceDefs[b.race]; }
+int mineTicks(const barb& b) { return (int)(rockMineTicks / raceOf(b).mineSpeed); }
 
 struct deer {
 int x, y;
@@ -1025,9 +1048,11 @@ Color hungryTint(Color c) {
 // Plain white 2x4 rectangle (no head/hair); the task shows as a 2x1 stripe and a tinted tool pixel.
 // Pose comes from existing flags only: walking bob, chop/mine/build tool tick, pick arm dip, hungry droop.
 void drawBarbs(RenderWindow& window, const vector<barb>& barbs, const vector<RectangleShape>& squares, int frame) {
-    RectangleShape body(barbBodySize), stripe(Vector2f(barbBodySize.x, barbStripeH)), tool(barbToolSize);
+    RectangleShape body(barbBodySize), stripe(Vector2f(barbBodySize.x, barbStripeH)), tool(barbToolSize), hat, tip;
     for (int i = 0; i < (int)squares.size() && i < (int)barbs.size(); i++) {
         const barb& b = barbs[i];
+        const raceDef& rd = raceOf(b);
+        Vector2f bodySize = rd.bodySize;
         bool hungry = isHungry(b);
         int phase = frame + b.id * 3;   // desync barbs so they don't animate in lockstep
         bool working = b.chopping || (b.building && b.timer > 0);
@@ -1038,23 +1063,37 @@ void drawBarbs(RenderWindow& window, const vector<barb>& barbs, const vector<Rec
         float bob = (walking && (phase / barbBobFrames) % 2 == 1) ? -barbBobPx : 0.0f;
         float droop = hungry ? barbHungryDroopPx : 0.0f;
 
-        float bodyH = barbBodySize.y - droop;
+        float bodyH = bodySize.y - droop;
         float bodyTop = feet - bodyH + bob;
 
         Color tc = barbColor(b);                         // task colour; barbIdleColor means no task
         bool idle = tc == barbIdleColor;
         if (hungry) tc = hungryTint(tc);
-        body.setSize(Vector2f(barbBodySize.x, bodyH));
+        body.setSize(Vector2f(bodySize.x, bodyH));
         body.setFillColor(hungry ? hungryTint(barbBodyColor) : barbBodyColor);
         body.setPosition(Vector2f(base.x, bodyTop));
         window.draw(body);
         if (!idle) {
+            stripe.setSize(Vector2f(bodySize.x, barbStripeH));
             stripe.setFillColor(tc);
             stripe.setPosition(Vector2f(base.x, bodyTop + barbStripeTop));
             window.draw(stripe);
         }
+        if (rd.hatSize.x > 0.0f) {                       // race mark above the head, never on the body
+            float hatTop = bodyTop - rd.hatSize.y;
+            hat.setSize(rd.hatSize);
+            hat.setFillColor(rd.hatColor);
+            hat.setPosition(Vector2f(base.x, hatTop));
+            window.draw(hat);
+            if (rd.hatTipSize.x > 0.0f) {
+                tip.setSize(rd.hatTipSize);
+                tip.setFillColor(rd.hatColor);
+                tip.setPosition(Vector2f(base.x, hatTop - rd.hatTipSize.y));
+                window.draw(tip);
+            }
+        }
 
-        float side = base.x + barbBodySize.x;            // tool/arm sits just right of the body
+        float side = base.x + bodySize.x;                // tool/arm sits just right of the body
         tool.setFillColor(tc);
         if (b.chopping && b.targetIsBush) {
             bool dip = (phase / barbPickFrames) % 2 == 1;
@@ -1221,7 +1260,7 @@ optional<hoverHit> pickHover(Vector2f p, float radius, const vector<barb>& barbs
     auto near = [&](const Shape& s) { return rectDistSq(s.getGlobalBounds(), p) <= rSq; };
     for (int i = 0; i < (int)squares.size() && i < (int)barbs.size(); i++)
         if (near(squares[i]))
-            return hoverHit{string("Barb: ") + barbTaskName(barbs[i]) + (isHungry(barbs[i]) ? " (hungry)" : ""), squares[i], nullopt};
+            return hoverHit{string(raceOf(barbs[i]).name) + ": " + barbTaskName(barbs[i]) + (isHungry(barbs[i]) ? " (hungry)" : ""), squares[i], nullopt};
     if (tr && near(tr->shape)) {
         const char* ph = tr->phase == trader::Arriving ? "arriving" : tr->phase == trader::Trading ? "trading" : "leaving";
         return hoverHit{string("Trader: ") + ph, tr->shape, nullopt};
@@ -1519,13 +1558,16 @@ void makeBarb(Vector2i pos, vector<barb>& barbs, vector<RectangleShape>& squares
     b.id = nextBarbId++;
     b.x = pos.x;
     b.y = pos.y;
+    b.race = (barbRace)uniform_int_distribution<int>(0, raceCount - 1)(gen);
     barbs.push_back(b);
+    Vector2f bodySize = raceOf(b).bodySize;   // hitbox = drawn body, so hover/collision match what you see
     RectangleShape sq;
     sq.setPosition(Vector2f(b.x, b.y));
-    sq.setSize(Vector2f(2, 2));
+    sq.setSize(bodySize);
     sq.setFillColor(Color::White);
     squares.push_back(sq);
-    rings.push_back({Vector2f(b.x + 1.0f, b.y + 1.0f)}); // centred on the 2x2 square
+    rings.push_back({Vector2f(b.x, b.y) + bodySize / 2.0f}); // centred on the body
+    printf("BARB BORN - %s\n", raceOf(b).name);
 }
 
 void birthRingTick(vector<birthRing>& rings) {
@@ -1556,7 +1598,7 @@ void barbspawner(vector<RectangleShape>& squares, vector<barb>& barbs, vector<Re
         if (spawnChance(gen) != 0) continue;
         Vector2f pos = houseshapes[i].getPosition();
         makeBarb(Vector2i((int)(pos.x + 4), (int)(pos.y + 13)), barbs, squares, rings);
-        logEvent("A barb is born (pop " + to_string(barbs.size()) + ")");
+        logEvent(string(raceOf(barbs.back()).birthName) + " is born (pop " + to_string(barbs.size()) + ")");
     }
 }
 
@@ -1763,7 +1805,7 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
 			b.chopping = true;
 			rocks[i].dying = true;
 			if (workTick(b)) b.timer++;
-			if (b.timer >= 480) {
+			if (b.timer >= mineTicks(b)) {           // dwarves finish rocks faster
 				stone++;
 				swapRemove(rocks, i);
 				swapRemove(octs, i);
@@ -2073,7 +2115,7 @@ int main() {
             if (b.building &&  b.timer > 0)
                 drawBar(window, Vector2f(b.targetx - 9, b.targety - 10), b.timer / 600.0f, pal.barBuild);
 	    if (b.chopping && b.timer > 0 && b.targetIsRock)
-                drawBar(window, Vector2f(b.targetx - 10, b.targety - 16), b.timer / 480.0f, pal.barMine);
+                drawBar(window, Vector2f(b.targetx - 10, b.targety - 16), (float)b.timer / mineTicks(b), pal.barMine);
 	}
 	drawBirthRings(window, birthRings);
 
