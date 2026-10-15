@@ -10,6 +10,13 @@ const int numbarbs = 1;
 const int numtrees = 2000;
 const int numrocks = 100;
 
+const char* const hudFontPath = "assets/DejaVuSans.ttf";
+const unsigned int hudFontSize = 14;
+const Vector2f hudPos(6.0f, 6.0f);
+const Vector2f hudPanelSize(150.0f, 112.0f);
+const Vector2f hudTextOffset(6.0f, 4.0f);
+const Color hudPanelColor(0, 0, 0, 160);
+
 int wood = 0;
 int stone = 0;
 int food = 0;
@@ -479,6 +486,14 @@ int main() {
 
     RectangleShape dnc({800, 800});
 
+    Font hudFont;
+    bool hudFontOk = hudFont.openFromFile(hudFontPath);
+    if (!hudFontOk) printf("HUD font failed to load: %s\n", hudFontPath);
+    else printf("HUD font loaded: %s\n", hudFontPath);
+    RectangleShape hudPanel(hudPanelSize);
+    hudPanel.setPosition(hudPos);
+    hudPanel.setFillColor(hudPanelColor);
+
     while (window.isOpen()) {
         while (const optional event = window.pollEvent())
             if (event->is<Event::Closed>()) window.close();
@@ -574,6 +589,19 @@ int main() {
         else if (t < 18)           {dnc.setFillColor(Color(233, 255, 253, 30));}  // Midday
         else                       {dnc.setFillColor(Color(255, 178, 127, 50));}  // Evening
         window.draw(dnc);
+
+        if (hudFontOk) {
+            window.setView(window.getDefaultView());
+            window.draw(hudPanel);
+            const char* phase = (t >= 21 || t < 6) ? "Night" : "Day";
+            char buf[200];
+            snprintf(buf, sizeof(buf), "Wood: %d\nStone: %d\nFood: %d\nPopulation: %d\nHouses: %d\nTime: %02d:00 (%s)",
+                     wood, stone, food, (int)barbs.size(), (int)houses.size(), t < 0 ? 0 : t, phase);
+            Text hudText(hudFont, buf, hudFontSize);
+            hudText.setFillColor(Color::White);
+            hudText.setPosition(hudPos + hudTextOffset);
+            window.draw(hudText);
+        }
         window.display();
     }
     return 0;
