@@ -138,6 +138,13 @@ const Color bushRipeColor(150, 55, 95);    // muted berry red-violet, darker tha
 const Color bushBareColor(62, 78, 46);     // dull olive: readable on the dark ground, distinct from tree green
 const Color barbPickColor(255, 140, 190);  // pink: distinct from the other task colours and the trader
 
+const int birthRingTicks = 40;             // ~0.7s lifetime
+const float birthRingStartRadius = 1.5f;   // starts just around the 2px barb
+const float birthRingEndRadius = 8.0f;     // ends about half a tree wide
+const float birthRingThickness = 1.0f;
+const Color birthRingColor(225, 220, 190); // pale warm cream, matches ticker text
+const uint8_t birthRingMaxAlpha = 70;      // faint at birth, fades linearly to 0
+
 mt19937 gen(random_device{}());
 uniform_int_distribution<int> distrib(0, 800);
 uniform_int_distribution<int> wanderChance(0, 149);
@@ -156,6 +163,7 @@ uniform_int_distribution<int> DeerSpawnXgotoR(700, 780);
 struct house {int x, y, health;};
 
 struct barb {
+    int id = -1;                 // stable, unique; assigned only by makeBarb()
     int x, y, health = 100;
     bool moving = false;
     int targetx = -1, targety = -1;
@@ -880,19 +888,53 @@ void buildhouse(vector<barb>& barbs, vector<RectangleShape>& squares, vector<hou
     }
 }
 
-void barbspawner(vector<RectangleShape>& squares, vector<barb>& barbs, vector<RectangleShape>& houseshapes) {
+struct birthRing {Vector2f pos; int age = 0;};
+
+int nextBarbId = 0;
+
+// The only place a barb is created: keeps barbs/squares in sync and owns nextBarbId
+void makeBarb(Vector2i pos, vector<barb>& barbs, vector<RectangleShape>& squares, vector<birthRing>& rings) {
+    barb b;
+    b.id = nextBarbId++;
+    b.x = pos.x;
+    b.y = pos.y;
+    barbs.push_back(b);
+    RectangleShape sq;
+    sq.setPosition(Vector2f(b.x, b.y));
+    sq.setSize(Vector2f(2, 2));
+    sq.setFillColor(Color::White);
+    squares.push_back(sq);
+    rings.push_back({Vector2f(b.x + 1.0f, b.y + 1.0f)}); // centred on the 2x2 square
+}
+
+void birthRingTick(vector<birthRing>& rings) {
+    for (auto& r : rings) r.age++;
+    for (int i = (int)rings.size() - 1; i >= 0; i--)
+        if (rings[i].age >= birthRingTicks) swapRemove(rings, i);
+}
+
+void drawBirthRings(RenderWindow& window, const vector<birthRing>& rings) {
+    CircleShape c;
+    c.setFillColor(Color::Transparent);
+    c.setOutlineThickness(birthRingThickness);
+    for (auto& r : rings) {
+        float t = (float)r.age / birthRingTicks;
+        float rad = birthRingStartRadius + (birthRingEndRadius - birthRingStartRadius) * t;
+        Color col = birthRingColor;
+        col.a = (uint8_t)(birthRingMaxAlpha * (1.0f - t));
+        c.setRadius(rad);
+        c.setOrigin({rad, rad});
+        c.setPosition(r.pos);
+        c.setOutlineColor(col);
+        window.draw(c);
+    }
+}
+
+void barbspawner(vector<RectangleShape>& squares, vector<barb>& barbs, vector<RectangleShape>& houseshapes, vector<birthRing>& rings) {
     for (int i = 0; i < (int)houseshapes.size(); i++) {
         if (spawnChance(gen) != 0) continue;
         Vector2f pos = houseshapes[i].getPosition();
-        barb b;
-        b.x = (int)(pos.x + 4);
-        b.y = (int)(pos.y + 13);
-        barbs.push_back(b);
-        RectangleShape sq;
-        sq.setPosition(Vector2f(b.x, b.y));
-        sq.setSize(Vector2f(2, 2));
-        sq.setFillColor(Color::White);
-        squares.push_back(sq);
+        makeBarb(Vector2i((int)(pos.x + 4), (int)(pos.y + 13)), barbs, squares, rings);
         logEvent("A barb is born (pop " + to_string(barbs.size()) + ")");
     }
 }
@@ -1142,10 +1184,17 @@ int main() {
     Time timesincelastupdate = Time::Zero;
     const Time Timepertick = seconds(1.0f / 60.0f);
 
-    vector<barb> barbs(numbarbs);
+    vector<barb> barbs;
+    vector<RectangleShape> squares;
+    vector<birthRing> birthRings;
+    barbs.reserve(numbarbs);
+    squares.reserve(numbarbs);
     {
         uniform_int_distribution<int> d(350, 450);
-        for (auto& b : barbs) {b.x = d(gen); b.y = d(gen);}
+        for (int i = 0; i < numbarbs; i++) {
+            int x = d(gen), y = d(gen);
+            makeBarb(Vector2i(x, y), barbs, squares, birthRings);
+        }
     }
 
     vector<tree> trees(numtrees);
@@ -1156,17 +1205,6 @@ int main() {
 
     vector<house> houses;
     vector<RectangleShape> houseshapes;
-
-    vector<RectangleShape> squares;
-    squares.reserve(numbarbs);
-    for (auto& b : barbs) {
-        RectangleShape sq;
-        sq.setPosition(Vector2f(b.x, b.y));
-	sq.getGlobalBounds();
-        sq.setSize(Vector2f(2, 2));
-        sq.setFillColor(Color::White);
-        squares.push_back(sq);
-    }
 
     vector<deer> deers;
     vector<RectangleShape> deershape;
@@ -1284,7 +1322,8 @@ int main() {
                 minematerials(squares, barbs, tris, stumps, trees, octs, rocks, bushes, bushshapes);
                 barbmove(squares, barbs);
                 treespawn(trees, tris, stumps);
-                barbspawner(squares, barbs, houseshapes);
+                barbspawner(squares, barbs, houseshapes, birthRings);
+                birthRingTick(birthRings);
                 deerspawn(deers, deershape);
                 deerwander(deershape, deers);
                 deerkilling(deers, deershape, barbs, squares);
@@ -1389,6 +1428,7 @@ int main() {
                 window.draw(fgBar);
 	    }
 	}
+	drawBirthRings(window, birthRings);
 
         int t = game_time;
         Color dncColor;
