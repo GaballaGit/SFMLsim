@@ -245,9 +245,33 @@ const char* barbTaskName(const barb& b) {
     return "idle";
 }
 
+// Index of the deer with this id, or -1 if it is gone (killed by any system)
+int findDeerById(const vector<deer>& deers, int id) {
+	if (id < 0) return -1;
+	for (int i = 0; i < (int)deers.size(); ++i)
+		if (deers[i].id == id) return i;
+	return -1;
+}
+
+// Drop a hunt as one unit so no barb is left half-targeting
+void clearHunt(barb& b) {
+	b.deertargeting = false;
+	b.targetDeerId = -1;
+	b.moving = false;
+	b.timer = 0;
+	b.targetx = b.targety = -1;
+}
+
+// Any barb whose target deer no longer exists stops hunting. Safe to call after any deer removal.
+void validateDeerTargets(vector<barb>& barbs, const vector<deer>& deers) {
+	for (auto& b : barbs)
+		if (b.deertargeting && findDeerById(deers, b.targetDeerId) == -1) clearHunt(b);
+}
+
 void deerkilling(vector<deer>& deers, vector<RectangleShape>& deershape, vector<barb>& barbs, vector<RectangleShape>& squares) {
 	const float deerInfluenceDSq = 625.0f;
-	for (int i = 0; i < (int)deers.size(); ++i) {
+	validateDeerTargets(barbs, deers);
+	for (int i = 0; i < (int)deers.size(); ) {
 		auto& ds = deershape[i];
 		auto& d = deers[i];
 		Vector2f deerpos = ds.getPosition();
@@ -258,6 +282,7 @@ void deerkilling(vector<deer>& deers, vector<RectangleShape>& deershape, vector<
 				ds.setFillColor(Color(192, 133, 82));
 			}
 		}
+		bool removed = false;
 		for (int j = 0; j < (int)barbs.size(); ++j) {
 			auto& b = barbs[j];
 			auto& sq = squares[j];
@@ -281,11 +306,9 @@ void deerkilling(vector<deer>& deers, vector<RectangleShape>& deershape, vector<
 				ds.setFillColor(Color::Red);
 				printf("Deer Health: %d\n", d.health);
 				if (d.health <= 0) {
-					swapRemove(deers, i);
+					swapRemove(deers, i);      // d and ds are invalid from here on
 					swapRemove(deershape, i);
-					b.deertargeting = false;
-					b.targetDeerId = -1;
-					b.moving = false;
+					removed = true;
 					food++;
 					printf("DEER KILLED - Food: %d\n", food);
 					logEvent("Deer killed (food " + to_string(food) + ")");
@@ -293,6 +316,11 @@ void deerkilling(vector<deer>& deers, vector<RectangleShape>& deershape, vector<
 				}
 			}
 		}
+		if (removed) {
+			validateDeerTargets(barbs, deers); // frees every barb that was chasing the dead deer
+			continue;                          // re-check index i: it now holds the swapped-in deer
+		}
+		++i;
 	}
 }
 
