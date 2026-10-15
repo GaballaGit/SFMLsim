@@ -3,3 +3,8 @@ sim.run
 
 # feature-review run log
 feature-reports/run.log
+
+# board bridge files (watcher <-> headless runs)
+feature-reports/inbox.json
+feature-reports/board-sync.json
+feature-reports/run.state
