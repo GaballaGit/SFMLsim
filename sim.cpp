@@ -41,16 +41,17 @@ const Color barbBuildColor(80, 170, 255);
 const Color barbHuntColor(255, 70, 70);
 
 // Barb sprite (drawn over the 2x2 hitbox square; feet line up with the square's bottom edge)
-const Vector2f barbBodySize(2.0f, 3.0f);    // task-coloured body
-const Vector2f barbHeadSize(2.0f, 1.0f);    // skin-tone head on top of the body
-const Vector2f barbToolSize(1.0f, 1.0f);    // tool tick / arm pixel beside the body
+const Vector2f barbBodySize(2.0f, 4.0f);    // plain white rectangle, no head/hair (same 2x4 footprint as before)
+const Color barbBodyColor(226, 224, 214);   // soft off-white: bright on dark green without glaring
+const float barbStripeTop = 1.0f;           // task stripe row, measured from the top of the body
+const float barbStripeH = 1.0f;             // 2x1 task-coloured band; idle barbs have none
+const Vector2f barbToolSize(1.0f, 1.0f);    // tool tick / arm pixel beside the body, tinted with the task colour
 const int barbBobFrames = 5;                // walking bobs 1px up every this many frames
 const float barbBobPx = 1.0f;
 const int barbToolFrames = 6;               // chop/mine/build swing: tool raised then struck
 const int barbPickFrames = 10;              // picking: arm dips to the bush on alternate periods
-const float barbHungryDroopPx = 1.0f;       // hungry barbs slouch: body 1px shorter, head 1px lower
-const Color barbSkinColor(196, 158, 122);   // muted tan, readable on dark green and distinct from task colours
-const Color barbToolColor(170, 165, 150);   // dull steel-grey tool tick
+const float barbHungryDroopPx = 1.0f;       // hungry barbs slouch: body 1px shorter
+const Color barbSkinColor(196, 158, 122);   // muted tan (HUD people icon)
 
 int wood = 0;
 int stone = 0;
@@ -167,6 +168,38 @@ const int houseWoodCost = 30;
 const int houseStoneCost = 2;              // small; with less stone a plain house is built instead
 const Vector2f houseSlabSize(10.0f, 10.0f); // centred under the 4px house (6px with outline): 2px rim shows
 const Color houseSlabColor(50, 56, 52);    // dim grey, low contrast on the dark ground, darker than rocks
+// House sprite, offsets relative to the 4x4 logic shape's top-left (hitbox unchanged). 8x7 overall, inside the 10x10 slab.
+const int houseRoofRows = 3;               // stepped roof: 2, 6, 8 px wide
+const float houseRoofLeft[houseRoofRows]  = {1.0f, -1.0f, -2.0f};
+const float houseRoofWidth[houseRoofRows] = {2.0f, 6.0f, 8.0f};
+const float houseRoofTop = -2.0f;          // first roof row; walls start right under the last one
+const Vector2f houseWallPos(-1.0f, 1.0f);
+const Vector2f houseWallSize(6.0f, 4.0f);
+const Vector2f houseDoorPos(0.0f, 3.0f);   // 2x2 door at the bottom of the walls
+const Vector2f houseDoorSize(2.0f, 2.0f);
+const Vector2f houseWindowPos(3.0f, 2.0f); // 1x1 window right of the door
+const Vector2f houseWindowSize(1.0f, 1.0f);
+const Color houseWallColor(197, 149, 82);  // same timber tan the houses always had
+const Color houseRoofColor(120, 64, 48);   // muted brick
+const Color houseDoorColor(70, 46, 26);
+const Color houseWindowDayColor(52, 54, 50);   // dark glass by day
+const Color houseWindowNightColor(240, 190, 95); // warm lamp, drawn after the night overlay
+const float houseWindowGlowPx = 1.0f;      // faint additive halo this far around a lit window
+const Color houseWindowGlowColor(90, 60, 20, 255); // additive, so this is a gentle warm lift
+// Deer sprite, offsets relative to the 6x3 logic shape (hitbox unchanged), written for a deer facing right
+const Vector2f deerHeadPos(5.0f, -1.0f);   // 2x2 head overhangs the front-top corner
+const Vector2f deerHeadSize(2.0f, 2.0f);
+const int deerAntlerPixels = 2;            // tiny swept-back tine above the back of the head
+const Vector2f deerAntlerPos[deerAntlerPixels] = {{5.0f, -2.0f}, {4.0f, -3.0f}};
+const int deerLegCount = 4;
+const float deerLegX[deerLegCount] = {0.0f, 1.0f, 4.0f, 5.0f}; // back pair, front pair
+const float deerLegPx = 2.0f;              // planted leg length below the body
+const float deerLegLiftedPx = 1.0f;        // lifted leg while walking
+const int deerLegFrames = 6;               // diagonal leg pairs swap every this many frames when moving
+const Color deerBodyColor(192, 133, 82);
+const Color deerHeadColor(176, 120, 74);   // a shade darker so the head reads against the body
+const Color deerLegColor(112, 78, 48);
+const Color deerAntlerColor(178, 162, 132); // dull bone
 
 // Campfire at villageCenter: burns wood slowly, glows at night (cosmetic only, no barb behaviour yet)
 const int campfireTicksPerWood = 18000;    // 1 wood per ~5 min at 1x (12 per in-game hour): a sliver of one chopper's output
@@ -902,9 +935,10 @@ Color hungryTint(Color c) {
 }
 
 // Read-only on game state: squares stay the hitbox, the sprite is built from temporary shapes.
+// Plain white 2x4 rectangle (no head/hair); the task shows as a 2x1 stripe and a tinted tool pixel.
 // Pose comes from existing flags only: walking bob, chop/mine/build tool tick, pick arm dip, hungry droop.
 void drawBarbs(RenderWindow& window, const vector<barb>& barbs, const vector<RectangleShape>& squares, int frame) {
-    RectangleShape body(barbBodySize), head(barbHeadSize), tool(barbToolSize);
+    RectangleShape body(barbBodySize), stripe(Vector2f(barbBodySize.x, barbStripeH)), tool(barbToolSize);
     for (int i = 0; i < (int)squares.size() && i < (int)barbs.size(); i++) {
         const barb& b = barbs[i];
         bool hungry = isHungry(b);
@@ -919,28 +953,111 @@ void drawBarbs(RenderWindow& window, const vector<barb>& barbs, const vector<Rec
 
         float bodyH = barbBodySize.y - droop;
         float bodyTop = feet - bodyH + bob;
-        float headTop = bodyTop - barbHeadSize.y;
 
-        Color bc = barbColor(b);
+        Color tc = barbColor(b);                         // task colour; barbIdleColor means no task
+        bool idle = tc == barbIdleColor;
+        if (hungry) tc = hungryTint(tc);
         body.setSize(Vector2f(barbBodySize.x, bodyH));
-        body.setFillColor(hungry ? hungryTint(bc) : bc);
+        body.setFillColor(hungry ? hungryTint(barbBodyColor) : barbBodyColor);
         body.setPosition(Vector2f(base.x, bodyTop));
-        head.setFillColor(hungry ? hungryTint(barbSkinColor) : barbSkinColor);
-        head.setPosition(Vector2f(base.x, headTop));
         window.draw(body);
-        window.draw(head);
+        if (!idle) {
+            stripe.setFillColor(tc);
+            stripe.setPosition(Vector2f(base.x, bodyTop + barbStripeTop));
+            window.draw(stripe);
+        }
 
         float side = base.x + barbBodySize.x;            // tool/arm sits just right of the body
+        tool.setFillColor(tc);
         if (b.chopping && b.targetIsBush) {
             bool dip = (phase / barbPickFrames) % 2 == 1;
-            tool.setFillColor(head.getFillColor());
             tool.setPosition(Vector2f(side, dip ? feet - barbToolSize.y : bodyTop + 1.0f));
             window.draw(tool);
         } else if (working && b.timer > 0) {
             bool raised = (phase / barbToolFrames) % 2 == 0;
-            tool.setFillColor(barbToolColor);
-            tool.setPosition(Vector2f(side, raised ? headTop : bodyTop + 1.0f));
+            tool.setPosition(Vector2f(side, raised ? bodyTop - barbToolSize.y : bodyTop + 1.0f));
             window.draw(tool);
+        }
+    }
+}
+
+// Roofed houses: slab is drawn separately underneath. Window is dark glass here; drawHouseLights lights it at night.
+void drawHouses(RenderWindow& window, const vector<RectangleShape>& houseshapes) {
+    RectangleShape r;
+    for (auto& hs : houseshapes) {
+        Vector2f o = snapPx(hs.getPosition());
+        r.setFillColor(houseRoofColor);
+        for (int k = 0; k < houseRoofRows; k++) {
+            r.setSize(Vector2f(houseRoofWidth[k], 1.0f));
+            r.setPosition(o + Vector2f(houseRoofLeft[k], houseRoofTop + k));
+            window.draw(r);
+        }
+        r.setSize(houseWallSize);
+        r.setPosition(o + houseWallPos);
+        r.setFillColor(houseWallColor);
+        window.draw(r);
+        r.setSize(houseDoorSize);
+        r.setPosition(o + houseDoorPos);
+        r.setFillColor(houseDoorColor);
+        window.draw(r);
+        r.setSize(houseWindowSize);
+        r.setPosition(o + houseWindowPos);
+        r.setFillColor(houseWindowDayColor);
+        window.draw(r);
+    }
+}
+
+// Lit windows, drawn after the night overlay (which leaves the default view set) so they read as lamplight
+void drawHouseLights(RenderWindow& window, const View& worldView, const vector<RectangleShape>& houseshapes) {
+    window.setView(worldView);
+    RectangleShape glow(houseWindowSize + Vector2f(2 * houseWindowGlowPx, 2 * houseWindowGlowPx));
+    glow.setFillColor(houseWindowGlowColor);
+    RectangleShape lamp(houseWindowSize);
+    lamp.setFillColor(houseWindowNightColor);
+    for (auto& hs : houseshapes) {
+        Vector2f w = snapPx(hs.getPosition()) + houseWindowPos;
+        glow.setPosition(w - Vector2f(houseWindowGlowPx, houseWindowGlowPx));
+        window.draw(glow, BlendAdd);
+        lamp.setPosition(w);
+        window.draw(lamp);
+    }
+}
+
+// Deer with head, antler and legs over the unchanged 6x3 hitbox. Facing and leg swap come from existing state + frame.
+void drawDeer(RenderWindow& window, const vector<deer>& deers, const vector<RectangleShape>& deershape, int frame) {
+    RectangleShape r;
+    for (int i = 0; i < (int)deershape.size() && i < (int)deers.size(); i++) {
+        const deer& d = deers[i];
+        const RectangleShape& ds = deershape[i];
+        Vector2f o = snapPx(ds.getPosition());
+        float bw = ds.getSize().x, bh = ds.getSize().y;
+        bool left = d.moving ? d.targetx < ds.getPosition().x : d.id % 2 == 1;
+        // mirror a right-facing x offset (and width) across the body
+        auto at = [&](Vector2f p, float w) { return o + Vector2f(left ? bw - p.x - w : p.x, p.y); };
+        Color body = ds.getFillColor();                  // keeps the red hit flash from deerkilling
+        bool flashing = body != deerBodyColor;
+
+        int legPhase = ((frame + d.id * 4) / deerLegFrames) % 2;
+        r.setFillColor(deerLegColor);
+        for (int k = 0; k < deerLegCount; k++) {
+            bool lifted = d.moving && (k % 2) == legPhase; // diagonal pairs (0+2, 1+3) alternate
+            r.setSize(Vector2f(1.0f, lifted ? deerLegLiftedPx : deerLegPx));
+            r.setPosition(at(Vector2f(deerLegX[k], bh), 1.0f));
+            window.draw(r);
+        }
+        r.setSize(Vector2f(bw, bh));
+        r.setPosition(o);
+        r.setFillColor(body);
+        window.draw(r);
+        r.setSize(deerHeadSize);
+        r.setPosition(at(deerHeadPos, deerHeadSize.x));
+        r.setFillColor(flashing ? body : deerHeadColor);
+        window.draw(r);
+        r.setSize(Vector2f(1.0f, 1.0f));
+        r.setFillColor(deerAntlerColor);
+        for (int k = 0; k < deerAntlerPixels; k++) {
+            r.setPosition(at(deerAntlerPos[k], 1.0f));
+            window.draw(r);
         }
     }
 }
@@ -1285,7 +1402,7 @@ void buildhouse(vector<barb>& barbs,vector<RectangleShape>& squares, vector<hous
                     houses.push_back(h);
                     RectangleShape hs(Vector2f(4, 4));
                     hs.setPosition(Vector2f(h.x, h.y));
-                    hs.setFillColor(Color(197, 149, 82));
+                    hs.setFillColor(houseWallColor);
                     hs.setOutlineColor(Color(54, 35, 16));
                     hs.setOutlineThickness(1);
                     houseshapes.push_back(hs);
@@ -1796,13 +1913,11 @@ int main() {
 			window.draw(slab);
 		}
 	}
-	for (auto& hs : houseshapes)
-		window.draw(hs);
+	drawHouses(window, houseshapes);
 
 	drawCampfire(window, fire, frameCount);
 
-	for (auto& ds : deershape)
-		drawSnapped(window, ds);
+	drawDeer(window, deers, deershape, frameCount);
 
 	for (auto& w : wolves)
 		drawSnapped(window, w.shape);
@@ -1837,6 +1952,7 @@ int main() {
         drawOverlay(window, dnc, dncColor);
         if (raining) drawOverlay(window, dnc, rainOverlayColor);
         if (t >= 21 || t < 6) drawCampfireGlow(window, worldView, fire, frameCount);
+        if (t >= 21 || t < 6) drawHouseLights(window, worldView, houseshapes);
 
         optional<hoverHit> hover;
         bool overHud = false;
