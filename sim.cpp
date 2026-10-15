@@ -150,6 +150,23 @@ const int houseStoneCost = 2;              // small; with less stone a plain hou
 const Vector2f houseSlabSize(10.0f, 10.0f); // centred under the 4px house (6px with outline): 2px rim shows
 const Color houseSlabColor(50, 56, 52);    // dim grey, low contrast on the dark ground, darker than rocks
 
+// Campfire at villageCenter: burns wood slowly, glows at night (cosmetic only, no barb behaviour yet)
+const int campfireTicksPerWood = 18000;    // 1 wood per ~5 min at 1x (12 per in-game hour): a sliver of one chopper's output
+const int campfireStartFuel = 2 * campfireTicksPerWood; // lit at startup without touching the wood stock
+const float campfireStoneRadius = 5.0f;    // 10px stone ring (plus outline): smaller than a 16px tree
+const Color campfireStoneColor(95, 95, 90);
+const Vector2f campfireLogSize(8.0f, 2.0f);
+const float campfireLogAngle = 30.0f;      // logs cross at +/- this many degrees
+const Color campfireLogColor(92, 60, 34);
+const Color campfireAshColor(70, 66, 60);
+const float campfireFlameRadius = 2.5f;    // at full fuel; shrinks to 40% as the fire dies
+const Color campfireFlameColor(235, 140, 50);
+const Color campfireEmberColor(120, 50, 25);
+const int campfireGlowLayers = 4;          // stacked additive circles give a soft radial falloff
+const float campfireGlowRadius = 40.0f;    // outer layer radius (world px)
+const Color campfireGlowColor(255, 150, 60);
+const uint8_t campfireGlowLayerAlpha = 12; // per layer; ~48 at the centre, so the night stays dark
+
 mt19937 gen(random_device{}());
 uniform_int_distribution<int> distrib(0, 800);
 uniform_int_distribution<int> wanderChance(0, 149);
@@ -838,7 +855,83 @@ void drawOverlay(RenderWindow& window, RectangleShape& shape, Color c) {
     window.draw(shape);
 }
 
-void buildhouse(vector<barb>& barbs, vector<RectangleShape>& squares, vector<house>& houses, vector<RectangleShape>& houseshapes) {
+struct campfire {int fuel = campfireStartFuel; bool lit = true;};
+
+// Keeps up to one wood of buffer: takes 1 wood only once the fuel drops to one wood's worth,
+// so with steady wood the fire stays at full strength and it fades over campfireTicksPerWood once wood runs out
+void campfireTick(campfire& f) {
+    if (f.fuel <= campfireTicksPerWood && wood > 0) {
+        wood--;
+        f.fuel += campfireTicksPerWood;
+        printf("CAMPFIRE FED - wood: %d\n", wood);
+    }
+    if (f.fuel > 0) f.fuel--;
+    if (f.lit && f.fuel == 0) {
+        f.lit = false;
+        printf("Campfire burned out\n");
+        logEvent("Campfire burned out");
+    } else if (!f.lit && f.fuel > 0) {
+        f.lit = true;
+        printf("Campfire relit\n");
+        logEvent("Campfire relit");
+    }
+}
+
+float campfireIntensity(const campfire& f) { return min(1.0f, (float)f.fuel / campfireTicksPerWood); }
+
+float campfireFlicker(int frame) { return 0.88f + 0.12f * sin(frame * 0.37f) * sin(frame * 0.13f + 1.0f); }
+
+Color lerpColor(Color a, Color b, float t) {
+    return Color((uint8_t)(a.r + (b.r - a.r) * t), (uint8_t)(a.g + (b.g - a.g) * t), (uint8_t)(a.b + (b.b - a.b) * t));
+}
+
+void drawCampfire(RenderWindow& window, const campfire& f, int frame) {
+    CircleShape ring(campfireStoneRadius);
+    ring.setOrigin({campfireStoneRadius, campfireStoneRadius});
+    ring.setPosition(villageCenter);
+    ring.setFillColor(Color::Transparent);
+    ring.setOutlineThickness(1.0f);
+    ring.setOutlineColor(campfireStoneColor);
+    window.draw(ring);
+
+    RectangleShape log(campfireLogSize);
+    log.setOrigin(campfireLogSize / 2.0f);
+    log.setPosition(villageCenter);
+    log.setFillColor(campfireLogColor);
+    for (float a : {campfireLogAngle, -campfireLogAngle}) {
+        log.setRotation(degrees(a));
+        window.draw(log);
+    }
+
+    float in = campfireIntensity(f);
+    float r = in > 0.0f ? campfireFlameRadius * (0.4f + 0.6f * in) * campfireFlicker(frame) : 1.0f;
+    CircleShape flame(r);
+    flame.setOrigin({r, r});
+    flame.setPosition(villageCenter);
+    flame.setFillColor(in > 0.0f ? lerpColor(campfireEmberColor, campfireFlameColor, in) : campfireAshColor);
+    window.draw(flame);
+}
+
+// Additive glow, drawn after the night overlay so it lifts the darkness around the fire; fades with fuel
+void drawCampfireGlow(RenderWindow& window, const View& worldView, const campfire& f, int frame) {
+    float in = campfireIntensity(f);
+    if (in <= 0.0f) return;
+    window.setView(worldView);
+    CircleShape c;
+    c.setPosition(villageCenter);
+    Color col = campfireGlowColor;
+    col.a = (uint8_t)(campfireGlowLayerAlpha * in * campfireFlicker(frame));
+    c.setFillColor(col);
+    for (int i = 1; i <= campfireGlowLayers; i++) {
+        float r = campfireGlowRadius * i / campfireGlowLayers;
+        c.setRadius(r);
+        c.setOrigin({r, r});
+        c.setPointCount(48);
+        window.draw(c, BlendAdd);
+    }
+}
+
+void buildhouse(vector<barb>& barbs,vector<RectangleShape>& squares, vector<house>& houses, vector<RectangleShape>& houseshapes) {
     bool canclaim = (int)houses.size() < (int)barbs.size();
     for (int i = 0; i < (int)squares.size(); i++) {
         auto& sq = squares[i];
@@ -1282,6 +1375,7 @@ int main() {
     RectangleShape birdShape;
     int frameCount = 0;
     vector<wolf> wolves;
+    campfire fire;
 
     while (window.isOpen()) {
         while (const optional event = window.pollEvent())
@@ -1346,6 +1440,7 @@ int main() {
                 trailTick();
                 birdTick(birds, birdHeading, squares);
                 bushTick(bushes, bushshapes);
+                campfireTick(fire);
             }
         }
 
@@ -1394,6 +1489,8 @@ int main() {
 	}
 	for (auto& hs : houseshapes)
 		window.draw(hs);
+
+	drawCampfire(window, fire, frameCount);
 
 	for (auto& ds : deershape)
 		window.draw(ds);
@@ -1459,6 +1556,7 @@ int main() {
         else                       dncColor = Color(255, 178, 127, 50);  // Evening
         drawOverlay(window, dnc, dncColor);
         if (raining) drawOverlay(window, dnc, rainOverlayColor);
+        if (t >= 21 || t < 6) drawCampfireGlow(window, worldView, fire, frameCount);
 
         optional<hoverHit> hover;
         {
