@@ -52,6 +52,11 @@ const Vector2f traderSize(3.0f, 3.0f);
 const Color traderColor(190, 140, 230);
 const Vector2f villageCenter(400.0f, 400.0f);
 
+const int hungerThreshold = 54000;        // ticks between meals (~quarter in-game hour); deer are the only food for now
+const int hungerWorkSlowdown = 2;         // hungry barbs with no food work and walk this many times slower
+const Color hungryTintColor(140, 100, 60);
+const float hungryTintAmount = 0.45f;     // 0 = pure task colour, 1 = pure tint
+
 mt19937 gen(random_device{}());
 uniform_int_distribution<int> distrib(0, 800);
 uniform_int_distribution<int> wanderChance(0, 149);
@@ -82,6 +87,8 @@ struct barb {
     bool targetIsRock = false;
     bool deertargeting = false;
     int targetDeerId = -1;
+    int hunger = 0;
+    int slowTick = 0;
 };
 
 struct deer {
@@ -256,6 +263,33 @@ bool weatherTick() {
 
 int stepLimit() { return raining ? rainStepInterval : stepInterval; }
 
+bool isHungry(const barb& b) { return b.hunger >= hungerThreshold; }
+
+int stepLimit(const barb& b) { return stepLimit() * (isHungry(b) ? hungerWorkSlowdown : 1); }
+
+// Returns true on ticks where the barb makes work progress; hungry barbs skip some ticks
+bool workTick(barb& b) {
+    if (!isHungry(b)) return true;
+    if (++b.slowTick >= hungerWorkSlowdown) { b.slowTick = 0; return true; }
+    return false;
+}
+
+void hungerTick(vector<barb>& barbs) {
+    for (auto& b : barbs) {
+        if (!isHungry(b)) { b.hunger++; continue; }
+        if (food <= 0) continue;
+        food--;
+        b.hunger = 0;
+        b.slowTick = 0;
+        printf("BARB ATE - Food: %d\n", food);
+    }
+}
+
+Color hungryTint(Color c) {
+    auto mix = [](uint8_t a, uint8_t t) { return (uint8_t)(a + (t - a) * hungryTintAmount); };
+    return Color(mix(c.r, hungryTintColor.r), mix(c.g, hungryTintColor.g), mix(c.b, hungryTintColor.b));
+}
+
 void traderTick(optional<trader>& tr) {
     static int ttimer = 0;
     if (tradeMsgTimer > 0) tradeMsgTimer--;
@@ -343,7 +377,7 @@ void buildhouse(vector<barb>& barbs, vector<RectangleShape>& squares, vector<hou
                     continue;
                 }
                 b.building = true;
-                b.timer++;
+                if (workTick(b)) b.timer++;
                 if (b.timer >= 600) {
                     b.reservedwood = false;
                     house h{b.targetx, b.targety, 100};
@@ -359,7 +393,7 @@ void buildhouse(vector<barb>& barbs, vector<RectangleShape>& squares, vector<hou
 		            printf("---HOUSE BUILT---\n");
                 }
             } else {
-                if (++b.stepTimer >= stepLimit()) {
+                if (++b.stepTimer >= stepLimit(b)) {
                     b.stepTimer = 0;
                     sq.move(diff / sqrt(dSq));
                 }
@@ -405,7 +439,7 @@ void barbmove(vector<RectangleShape>& squares, vector<barb>& barbs) {
             if (dSq < 1.0f) {
                 b.moving    = false;
                 b.stepTimer = 0;
-            } else if (++b.stepTimer >= stepLimit()) {
+            } else if (++b.stepTimer >= stepLimit(b)) {
                 b.stepTimer = 0;
                 sq.move(diff / sqrt(dSq));
 		sq.getGlobalBounds();
@@ -471,7 +505,7 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
             if (dx * dx + dy * dy >= 4.0f) break;
             b.chopping = true;
             trees[i].dying = true;
-            b.timer++;
+            if (workTick(b)) b.timer++;
             if (b.timer >= 180) {
                 wood++;
                 swapRemove(trees,  i);
@@ -499,7 +533,7 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
 			if (dx * dx + dy * dy >= 4.0f) break;
 			b.chopping = true;
 			rocks[i].dying = true;
-			b.timer++;
+			if (workTick(b)) b.timer++;
 			if (b.timer >= 480) {
 				stone++;
 				swapRemove(rocks, i);
@@ -680,6 +714,7 @@ int main() {
                 clockk();
                 weatherTick();
                 traderTick(activeTrader);
+                hungerTick(barbs);
             }
         }
 
@@ -723,7 +758,8 @@ int main() {
         }
 	
         for (int j = 0; j < (int)squares.size(); j++) {
-            squares[j].setFillColor(barbColor(barbs[j]));
+            Color bc = barbColor(barbs[j]);
+            squares[j].setFillColor(isHungry(barbs[j]) ? hungryTint(bc) : bc);
             window.draw(squares[j]);
 	}
 	if (activeTrader) window.draw(activeTrader->shape);
@@ -772,9 +808,11 @@ int main() {
             const char* traderState = !activeTrader ? "Away"
                 : activeTrader->phase == trader::Arriving ? "Arriving"
                 : activeTrader->phase == trader::Trading ? "Trading" : "Leaving";
-            char buf[300];
-            snprintf(buf, sizeof(buf), "Wood: %d\nStone: %d\nFood: %d\nPopulation: %d\nHouses: %d\nTime: %02d:00 (%s)\nSpeed: %dx%s\nWeather: %s\nTrader: %s%s%s",
-                     wood, stone, food, (int)barbs.size(), (int)houses.size(), t < 0 ? 0 : t, phase, simSpeed, paused ? " PAUSED" : "", raining ? "Rain" : "Clear",
+            int hungry = 0;
+            for (auto& b : barbs) if (isHungry(b)) hungry++;
+            char buf[320];
+            snprintf(buf, sizeof(buf), "Wood: %d\nStone: %d\nFood: %d\nHungry: %d\nPopulation: %d\nHouses: %d\nTime: %02d:00 (%s)\nSpeed: %dx%s\nWeather: %s\nTrader: %s%s%s",
+                     wood, stone, food, hungry, (int)barbs.size(), (int)houses.size(), t < 0 ? 0 : t, phase, simSpeed, paused ? " PAUSED" : "", raining ? "Rain" : "Clear",
                      traderState, tradeMsgTimer > 0 ? "\n" : "", tradeMsgTimer > 0 ? tradeMsg : "");
             Text hudText(hudFont, buf, hudFontSize);
             FloatRect tb = hudText.getLocalBounds();
