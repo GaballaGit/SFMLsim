@@ -98,7 +98,7 @@ void deerkilling(vector<deer>& deers, vector<RectangleShape>& deershape, vector<
 			b.targetx = (int)deerpos.x;
 			b.targety = (int)deerpos.y;
 			b.moving = true;
-			if (!d.invincible && sq.getGlobalBounds().intersects(ds.getGlobalBounds())) {
+			if (!d.invincible && sq.getGlobalBounds().findIntersection(ds.getGlobalBounds()).has_value()) {
 				d.health -= 5;
 				d.invincible = true;
 				d.invincibleTimer = 60;
@@ -480,9 +480,8 @@ int main() {
     RectangleShape dnc({800, 800});
 
     while (window.isOpen()) {
-        Event event;
-        while (window.pollEvent(event))
-            if (event.type == Event::Closed) window.close();
+        while (const optional event = window.pollEvent())
+            if (event->is<Event::Closed>()) window.close();
 
         timesincelastupdate += clock.restart();
         while (timesincelastupdate > Timepertick) {
