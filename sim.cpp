@@ -13,7 +13,7 @@ const int numrocks = 100;
 const char* const hudFontPath = "assets/DejaVuSans.ttf";
 const unsigned int hudFontSize = 14;
 const Vector2f hudPos(6.0f, 6.0f);
-const Vector2f hudPanelSize(150.0f, 130.0f);
+const Vector2f hudPanelSize(150.0f, 148.0f);
 const Vector2f hudTextOffset(6.0f, 4.0f);
 const int maxTicksPerFrame = 20;
 const float worldSize = 800.0f;
@@ -32,6 +32,13 @@ int wood = 0;
 int stone = 0;
 int food = 0;
 int game_time = 12;
+
+const int stepInterval = 10;
+const int rainStepInterval = 16;          // slower barb stepping in rain (~0.6x speed)
+const int clearWeatherTicks = 108000;     // ticks of clear weather between rains
+const int rainWeatherTicks = 36000;       // ticks a rain lasts
+const Color rainOverlayColor(70, 90, 120, 70);
+bool raining = false;
 
 mt19937 gen(random_device{}());
 uniform_int_distribution<int> distrib(0, 800);
@@ -214,6 +221,24 @@ int clockk() {
     return game_time;
 }
 
+bool weatherTick() {
+    static int wtimer = 0;
+    if (++wtimer >= (raining ? rainWeatherTicks : clearWeatherTicks)) {
+        raining = !raining;
+        wtimer = 0;
+        printf(raining ? "Rain starts\n" : "Rain stops\n");
+    }
+    return raining;
+}
+
+int stepLimit() { return raining ? rainStepInterval : stepInterval; }
+
+void drawOverlay(RenderWindow& window, RectangleShape& shape, Color c) {
+    shape.setFillColor(c);
+    window.setView(window.getDefaultView());
+    window.draw(shape);
+}
+
 void buildhouse(vector<barb>& barbs, vector<RectangleShape>& squares, vector<house>& houses, vector<RectangleShape>& houseshapes) {
     bool canclaim = (int)houses.size() < (int)barbs.size();
     for (int i = 0; i < (int)squares.size(); i++) {
@@ -259,7 +284,7 @@ void buildhouse(vector<barb>& barbs, vector<RectangleShape>& squares, vector<hou
 		            printf("---HOUSE BUILT---\n");
                 }
             } else {
-                if (++b.stepTimer >= 10) {
+                if (++b.stepTimer >= stepLimit()) {
                     b.stepTimer = 0;
                     sq.move(diff / sqrt(dSq));
                 }
@@ -305,7 +330,7 @@ void barbmove(vector<RectangleShape>& squares, vector<barb>& barbs) {
             if (dSq < 1.0f) {
                 b.moving    = false;
                 b.stepTimer = 0;
-            } else if (++b.stepTimer >= 10) {
+            } else if (++b.stepTimer >= stepLimit()) {
                 b.stepTimer = 0;
                 sq.move(diff / sqrt(dSq));
 		sq.getGlobalBounds();
@@ -577,6 +602,7 @@ int main() {
                 deerwander(deershape, deers);
                 deerkilling(deers, deershape, barbs, squares);
                 clockk();
+                weatherTick();
             }
         }
 
@@ -654,20 +680,21 @@ int main() {
 	}
 
         int t = game_time;
-        if (t >= 21 || t < 6)      {dnc.setFillColor(Color(4, 7, 32, 150));}      // Night
-        else if (t < 12)           {dnc.setFillColor(Color(250, 231, 190, 30));}  // Morning
-        else if (t < 18)           {dnc.setFillColor(Color(233, 255, 253, 30));}  // Midday
-        else                       {dnc.setFillColor(Color(255, 178, 127, 50));}  // Evening
-        window.setView(window.getDefaultView());
-        window.draw(dnc);
+        Color dncColor;
+        if (t >= 21 || t < 6)      dncColor = Color(4, 7, 32, 150);      // Night
+        else if (t < 12)           dncColor = Color(250, 231, 190, 30);  // Morning
+        else if (t < 18)           dncColor = Color(233, 255, 253, 30);  // Midday
+        else                       dncColor = Color(255, 178, 127, 50);  // Evening
+        drawOverlay(window, dnc, dncColor);
+        if (raining) drawOverlay(window, dnc, rainOverlayColor);
 
         if (hudFontOk) {
             window.setView(window.getDefaultView());
             window.draw(hudPanel);
             const char* phase = (t >= 21 || t < 6) ? "Night" : "Day";
             char buf[200];
-            snprintf(buf, sizeof(buf), "Wood: %d\nStone: %d\nFood: %d\nPopulation: %d\nHouses: %d\nTime: %02d:00 (%s)\nSpeed: %dx%s",
-                     wood, stone, food, (int)barbs.size(), (int)houses.size(), t < 0 ? 0 : t, phase, simSpeed, paused ? " PAUSED" : "");
+            snprintf(buf, sizeof(buf), "Wood: %d\nStone: %d\nFood: %d\nPopulation: %d\nHouses: %d\nTime: %02d:00 (%s)\nSpeed: %dx%s\nWeather: %s",
+                     wood, stone, food, (int)barbs.size(), (int)houses.size(), t < 0 ? 0 : t, phase, simSpeed, paused ? " PAUSED" : "", raining ? "Rain" : "Clear");
             Text hudText(hudFont, buf, hudFontSize);
             hudText.setFillColor(Color::White);
             hudText.setPosition(hudPos + hudTextOffset);
