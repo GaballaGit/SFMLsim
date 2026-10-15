@@ -179,6 +179,31 @@ const float campfireGlowRadius = 40.0f;    // outer layer radius (world px)
 const Color campfireGlowColor(255, 150, 60);
 const uint8_t campfireGlowLayerAlpha = 12; // per layer; ~48 at the centre, so the night stays dark
 
+// Blocky polish: draw-only silhouettes and framed progress bars. Logic shapes (tris/octs/bushshapes) are never modified.
+struct palette {
+    Color rock;          // diamond rocks
+    Color barFrame;      // 1px dark rim around every progress bar
+    Color barTrack;      // empty part of a bar
+    Color barChop, barPick, barBuild, barMine; // muted versions of the barb task colours
+};
+const palette pal{
+    Color(128, 126, 118),
+    Color(18, 22, 18),
+    Color(48, 52, 44),
+    Color(95, 170, 85),
+    Color(205, 115, 160),
+    Color(90, 155, 215),
+    Color(215, 145, 55),
+};
+const int treeTiers = 3;                    // stepped pine: three stacked blocks inside the old 16px triangle footprint
+const Vector2f treeTierSize[treeTiers] = {{6.0f, 4.0f}, {10.0f, 4.0f}, {14.0f, 4.0f}};
+const float treeTierTop[treeTiers] = {0.0f, 4.0f, 8.0f}; // canopy ends at y+12, stump (y+12..16) shows below
+const float treeFootprint = 16.0f;          // tiers are centred across this width
+const float treeShadeAmount = 0.78f;        // bottom tier is darkened to this fraction for a little depth
+const int rockPointCount = 4;               // rocks draw as diamonds (logic shape keeps its pentagon)
+const Vector2f barSize(20.0f, 3.0f);        // inner fill area of a progress bar
+const float barFramePx = 1.0f;
+
 mt19937 gen(random_device{}());
 uniform_int_distribution<int> distrib(0, 800);
 uniform_int_distribution<int> wanderChance(0, 149);
@@ -193,6 +218,75 @@ uniform_int_distribution<int> DeerSpawnRL(0, 1);
 uniform_int_distribution<int> DeerSpawnChance(0, 100);
 uniform_int_distribution<int> DeerSpawnXgotoL(20, 100);
 uniform_int_distribution<int> DeerSpawnXgotoR(700, 780);
+
+// Whole-pixel draw positions so shapes don't shimmer between pixels; only ever applied to copies
+Vector2f snapPx(Vector2f p) { return Vector2f(round(p.x), round(p.y)); }
+
+template <class S>
+void drawSnapped(RenderWindow& window, S shape) {
+    shape.setPosition(snapPx(shape.getPosition()));
+    window.draw(shape);
+}
+
+// The one progress-bar helper: dark frame, track, then a whole-pixel fill. pos is the top-left of the fill area.
+void drawBar(RenderWindow& window, Vector2f pos, float frac, Color fill) {
+    pos = snapPx(pos);
+    RectangleShape r(barSize + Vector2f(2 * barFramePx, 2 * barFramePx));
+    r.setPosition(pos - Vector2f(barFramePx, barFramePx));
+    r.setFillColor(pal.barFrame);
+    window.draw(r);
+    r.setSize(barSize);
+    r.setPosition(pos);
+    r.setFillColor(pal.barTrack);
+    window.draw(r);
+    float w = floor(clamp(frac, 0.0f, 1.0f) * barSize.x);
+    if (w <= 0) return;
+    r.setSize(Vector2f(w, barSize.y));
+    r.setFillColor(fill);
+    window.draw(r);
+}
+
+Color shade(Color c, float f) {
+    return Color((uint8_t)(c.r * f), (uint8_t)(c.g * f), (uint8_t)(c.b * f), c.a);
+}
+
+void pushQuad(VertexArray& va, Vector2f p, Vector2f s, Color c) {
+    Vector2f a = p, b = p + Vector2f(s.x, 0), d = p + Vector2f(0, s.y), e = p + s;
+    for (Vector2f v : {a, b, e, a, e, d}) va.append(Vertex{v, c});
+}
+
+// Stepped blocky pines, batched into one vertex array; colour comes from the logic triangle
+void drawTrees(RenderWindow& window, const vector<CircleShape>& tris, VertexArray& va) {
+    va.clear();
+    for (auto& tri : tris) {
+        Vector2f p = snapPx(tri.getPosition());
+        Color c = tri.getFillColor();
+        for (int k = 0; k < treeTiers; k++) {
+            Vector2f s = treeTierSize[k];
+            pushQuad(va, p + Vector2f(floor((treeFootprint - s.x) / 2), treeTierTop[k]), s,
+                     k == treeTiers - 1 ? shade(c, treeShadeAmount) : c);
+        }
+    }
+    if (va.getVertexCount() > 0) window.draw(va);
+}
+
+// Rock as a diamond: copy of the logic pentagon with 4 points, same radius/position
+CircleShape rockDrawShape(const CircleShape& oct) {
+    CircleShape d = oct;
+    d.setPointCount(rockPointCount);
+    d.setFillColor(pal.rock);
+    d.setPosition(snapPx(oct.getPosition()));
+    return d;
+}
+
+// Bush as a square covering the logic circle's 2r box, keeping its ripe/bare colour
+RectangleShape bushDrawShape(const CircleShape& bs) {
+    float r = bs.getRadius();
+    RectangleShape s(Vector2f(2 * r, 2 * r));
+    s.setPosition(snapPx(bs.getPosition()));
+    s.setFillColor(bs.getFillColor());
+    return s;
+}
 
 struct house {int x, y, health; bool hasFoundation = false;};
 
@@ -734,7 +828,7 @@ void drawBarbs(RenderWindow& window, const vector<barb>& barbs, const vector<Rec
         bool working = b.chopping || (b.building && b.timer > 0);
         bool walking = b.moving && !working;
 
-        Vector2f base = squares[i].getPosition();
+        Vector2f base = snapPx(squares[i].getPosition());
         float feet = base.y + squares[i].getSize().y;    // bottom edge of the hitbox
         float bob = (walking && (phase / barbBobFrames) % 2 == 1) ? -barbBobPx : 0.0f;
         float droop = hungry ? barbHungryDroopPx : 0.0f;
@@ -849,9 +943,9 @@ optional<hoverHit> pickHover(Vector2f p, float radius, const vector<barb>& barbs
     for (int i = 0; i < (int)deershape.size() && i < (int)deers.size(); i++)
         if (near(deershape[i])) return hoverHit{"Deer " + to_string(deers[i].health) + "hp", deershape[i], nullopt};
     for (int i = 0; i < (int)octs.size() && i < (int)rocks.size(); i++)
-        if (near(octs[i])) return hoverHit{rocks[i].dying ? "Rock: being mined" : "Rock", nullopt, octs[i]};
+        if (near(octs[i])) return hoverHit{rocks[i].dying ? "Rock: being mined" : "Rock", nullopt, rockDrawShape(octs[i])};
     for (int i = 0; i < (int)bushshapes.size() && i < (int)bushes.size(); i++)
-        if (near(bushshapes[i])) return hoverHit{bushes[i].ripe ? "Bush: ripe" : "Bush: bare", nullopt, bushshapes[i]};
+        if (near(bushshapes[i])) return hoverHit{bushes[i].ripe ? "Bush: ripe" : "Bush: bare", bushDrawShape(bushshapes[i]), nullopt};
     for (auto& hs : houseshapes)
         if (near(hs)) return hoverHit{"House", hs, nullopt};
     return nullopt;
@@ -865,13 +959,13 @@ void drawHoverOutline(RenderWindow& window, const View& worldView, hoverHit& h, 
         h.rect->setFillColor(Color::Transparent);
         h.rect->setOutlineThickness(th);
         h.rect->setOutlineColor(tooltipOutlineColor);
-        window.draw(*h.rect);
+        drawSnapped(window, *h.rect);
     }
     if (h.circle) {
         h.circle->setFillColor(Color::Transparent);
         h.circle->setOutlineThickness(th);
         h.circle->setOutlineColor(tooltipOutlineColor);
-        window.draw(*h.circle);
+        drawSnapped(window, *h.circle);
     }
 }
 
@@ -1402,9 +1496,7 @@ int main() {
     vector<CircleShape> bushshapes;
     spawnBushes(bushes, bushshapes, trees, tris, stumps);
 
-    RectangleShape bgBar({20, 3});
-    bgBar.setFillColor(Color::Black);
-    RectangleShape fgBar;
+    VertexArray treeVerts(PrimitiveType::Triangles);
 
     RectangleShape dnc({800, 800});
 
@@ -1528,10 +1620,10 @@ int main() {
         drawTrails(window, trailVerts);
 	
 	for (auto& oct : octs)
-		window.draw(oct);
+		window.draw(rockDrawShape(oct));
 
 	for (auto& bs : bushshapes)
-		window.draw(bs);
+		window.draw(bushDrawShape(bs));
 
 	{
 		RectangleShape slab(houseSlabSize); // foundations under houses, drawn first so every house sits on top
@@ -1549,54 +1641,29 @@ int main() {
 	drawCampfire(window, fire, frameCount);
 
 	for (auto& ds : deershape)
-		window.draw(ds);
+		drawSnapped(window, ds);
 
 	for (auto& w : wolves)
-		window.draw(w.shape);
+		drawSnapped(window, w.shape);
 
         for (int i = 0; i < (int)tris.size(); i++) {
-        	window.draw(stumps[i]);
+        	drawSnapped(window, stumps[i]);
         }
-	
+
         drawBarbs(window, barbs, squares, frameCount);
-	if (activeTrader) window.draw(activeTrader->shape);
-	for (int k = 0; k < (int)tris.size(); ++k)
-		window.draw(tris[k]);
+	if (activeTrader) drawSnapped(window, activeTrader->shape);
+	drawTrees(window, tris, treeVerts);
 	drawBirds(window, birds, birdShape, frameCount++);
 	for (int q = 0; q < (int)squares.size(); ++q) {
             auto& b = barbs[q];
-            if (b.chopping && b.timer > 0 && !b.targetIsRock && !b.targetIsBush) {
-                bgBar.setPosition(Vector2f(b.targetx - 10, b.targety - 20));
-                window.draw(bgBar);
-                fgBar.setSize(Vector2f(b.timer * 20.0f / 180.0f, 3));
-                fgBar.setFillColor(Color(1, 121, 111));
-                fgBar.setPosition(Vector2f(b.targetx - 10, b.targety - 20));
-                window.draw(fgBar);
-            }
-            if (b.chopping && b.timer > 0 && b.targetIsBush) {
-                bgBar.setPosition(Vector2f(b.targetx - 10, b.targety - 14));
-                window.draw(bgBar);
-                fgBar.setSize(Vector2f(b.timer * 20.0f / bushPickTicks, 3));
-                fgBar.setFillColor(barbPickColor);
-                fgBar.setPosition(Vector2f(b.targetx - 10, b.targety - 14));
-                window.draw(fgBar);
-            }
-            if (b.building &&  b.timer > 0) {
-                bgBar.setPosition(Vector2f(b.targetx - 9, b.targety - 10));
-                window.draw(bgBar);
-                fgBar.setSize(Vector2f(b.timer / 600.0f * 20.0f, 3));
-                fgBar.setFillColor(Color(0, 255, 175));
-                fgBar.setPosition(Vector2f(b.targetx - 9, b.targety - 10));
-                window.draw(fgBar);
-            }
-	    if (b.chopping && b.timer > 0 && b.targetIsRock) {
-                bgBar.setPosition(Vector2f(b.targetx - 10, b.targety - 16));
-                window.draw(bgBar);
-                fgBar.setSize(Vector2f(b.timer * 20.0f / 480.0f, 3));
-                fgBar.setFillColor(Color(255, 165, 0));
-                fgBar.setPosition(Vector2f(b.targetx - 10, b.targety - 16));
-                window.draw(fgBar);
-	    }
+            if (b.chopping && b.timer > 0 && !b.targetIsRock && !b.targetIsBush)
+                drawBar(window, Vector2f(b.targetx - 10, b.targety - 20), b.timer / 180.0f, pal.barChop);
+            if (b.chopping && b.timer > 0 && b.targetIsBush)
+                drawBar(window, Vector2f(b.targetx - 10, b.targety - 14), (float)b.timer / bushPickTicks, pal.barPick);
+            if (b.building &&  b.timer > 0)
+                drawBar(window, Vector2f(b.targetx - 9, b.targety - 10), b.timer / 600.0f, pal.barBuild);
+	    if (b.chopping && b.timer > 0 && b.targetIsRock)
+                drawBar(window, Vector2f(b.targetx - 10, b.targety - 16), b.timer / 480.0f, pal.barMine);
 	}
 	drawBirthRings(window, birthRings);
 
