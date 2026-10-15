@@ -214,6 +214,24 @@ const Vector2f treeTierSize[treeTiers] = {{6.0f, 4.0f}, {10.0f, 4.0f}, {14.0f, 4
 const float treeTierTop[treeTiers] = {0.0f, 4.0f, 8.0f}; // canopy ends at y+12, stump (y+12..16) shows below
 const float treeFootprint = 16.0f;          // tiers are centred across this width
 const float treeShadeAmount = 0.78f;        // bottom tier is darkened to this fraction for a little depth
+// Mixed woodland: three draw-only kinds picked from a position hash (never from the logic colour)
+const Color treeLogicColor(1, 92, 55);      // logic triangle fill; not used for drawing, not read as state
+const float treeCanopyBottom = 12.0f;       // every canopy ends here so it sits on the stump (y+12..16)
+enum treeKind { treeTallDark, treeShortBright, treeAutumn, treeKindCount };
+struct treeKindDef {
+    Color body;          // middle/bottom tiers (bottom is shaded)
+    Color tip;           // top tier
+    float widthFactor;   // scales treeTierSize.x, rounded to even px so tiers stay centred
+    float heightFactor;  // scales treeTierSize.y / treeTierTop
+};
+const treeKindDef treeKinds[treeKindCount] = {
+    {Color(6, 72, 46),   Color(6, 72, 46),   1.0f,  1.25f}, // tall dark pine: 15px canopy
+    {Color(44, 120, 58), Color(58, 136, 66), 0.75f, 0.75f}, // short bright pine: 9px canopy
+    {Color(156, 84, 36), Color(166, 138, 52), 1.0f, 1.0f},  // autumn: muted rust with an ochre tip, 12px canopy
+};
+const unsigned treeKindHashMod = 8;         // hash % 8: 0 = autumn (1 in 8), 1-3 short bright, 4-7 tall dark
+const unsigned treeAutumnSlots = 1;
+const unsigned treeShortSlots = 3;
 const int rockPointCount = 4;               // rocks draw as diamonds (logic shape keeps its pentagon)
 const Vector2f barSize(20.0f, 3.0f);        // inner fill area of a progress bar
 const float barFramePx = 1.0f;
@@ -308,16 +326,29 @@ void pushQuad(VertexArray& va, Vector2f p, Vector2f s, Color c) {
     for (Vector2f v : {a, b, e, a, e, d}) va.append(Vertex{v, c});
 }
 
-// Stepped blocky pines, batched into one vertex array; colour comes from the logic triangle
+// Stable kind for a tree from its integer position (same tree always looks the same)
+treeKind treeKindAt(Vector2f pos) {
+    uint32_t h = (uint32_t)(int)pos.x * 73856093u ^ (uint32_t)(int)pos.y * 19349663u;
+    h ^= h >> 13; h *= 0x5bd1e995u; h ^= h >> 15;
+    unsigned slot = h % treeKindHashMod;
+    if (slot < treeAutumnSlots) return treeAutumn;
+    if (slot < treeAutumnSlots + treeShortSlots) return treeShortBright;
+    return treeTallDark;
+}
+
+// Stepped blocky trees, batched into one vertex array; kind (size + colour) comes from a position hash
 void drawTrees(RenderWindow& window, const vector<CircleShape>& tris, VertexArray& va) {
     va.clear();
     for (auto& tri : tris) {
         Vector2f p = snapPx(tri.getPosition());
-        Color c = tri.getFillColor();
+        const treeKindDef& kd = treeKinds[treeKindAt(tri.getPosition())];
+        const int last = treeTiers - 1;
+        float canopy = round(treeTierTop[last] * kd.heightFactor) + round(treeTierSize[last].y * kd.heightFactor);
+        float offset = treeCanopyBottom - canopy; // anchor the canopy bottom to the stump (12 - canopyHeight)
         for (int k = 0; k < treeTiers; k++) {
-            Vector2f s = treeTierSize[k];
-            pushQuad(va, p + Vector2f(floor((treeFootprint - s.x) / 2), treeTierTop[k]), s,
-                     k == treeTiers - 1 ? shade(c, treeShadeAmount) : c);
+            Vector2f s(2 * round(treeTierSize[k].x * kd.widthFactor / 2), round(treeTierSize[k].y * kd.heightFactor));
+            Color c = k == 0 ? kd.tip : (k == last ? shade(kd.body, treeShadeAmount) : kd.body);
+            pushQuad(va, p + Vector2f(floor((treeFootprint - s.x) / 2), offset + round(treeTierTop[k] * kd.heightFactor)), s, c);
         }
     }
     if (va.getVertexCount() > 0) window.draw(va);
@@ -1502,17 +1533,22 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
 
 
 
+// The one tree logic-shape builder (startup and treespawn); draw kind is derived later in drawTrees
+CircleShape makeTreeTri(int x, int y) {
+    CircleShape tri;
+    tri.setPointCount(3);
+    tri.setPosition(Vector2f(x, y));
+    tri.setRadius(8);
+    tri.setFillColor(treeLogicColor);
+    return tri;
+}
+
 void treespawn(vector<tree>& trees, vector<CircleShape>& tris, vector<RectangleShape>& stumps) {
     if (treespawnChance(gen) != 0) return;
     tree t{distrib(gen), distrib(gen), 100, false};
     trees.push_back(t);
 
-    CircleShape tri;
-    tri.setPointCount(3);
-    tri.setPosition(Vector2f(t.x, t.y));
-    tri.setRadius(8);
-    tri.setFillColor(Color(6, 64, 43));
-    tris.push_back(tri);
+    tris.push_back(makeTreeTri(t.x, t.y));
 
     RectangleShape stump(Vector2f(4, 4));
     stump.setFillColor(Color(128, 26, 0));
@@ -1600,12 +1636,7 @@ int main() {
     tris.reserve(numtrees);
     stumps.reserve(numtrees);
     for (auto& t : trees) {
-        CircleShape tri;
-        tri.setPointCount(3);
-        tri.setPosition(Vector2f(t.x, t.y));
-        tri.setRadius(8);
-        tri.setFillColor(Color(1, 92, 55));
-        tris.push_back(tri);    
+        tris.push_back(makeTreeTri(t.x, t.y));
 
         RectangleShape stump(Vector2f(4, 4));
         stump.setFillColor(Color(115, 30, 2));
