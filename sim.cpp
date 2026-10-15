@@ -34,6 +34,18 @@ const Color barbMineColor(255, 165, 0);
 const Color barbBuildColor(80, 170, 255);
 const Color barbHuntColor(255, 70, 70);
 
+// Barb sprite (drawn over the 2x2 hitbox square; feet line up with the square's bottom edge)
+const Vector2f barbBodySize(2.0f, 3.0f);    // task-coloured body
+const Vector2f barbHeadSize(2.0f, 1.0f);    // skin-tone head on top of the body
+const Vector2f barbToolSize(1.0f, 1.0f);    // tool tick / arm pixel beside the body
+const int barbBobFrames = 5;                // walking bobs 1px up every this many frames
+const float barbBobPx = 1.0f;
+const int barbToolFrames = 6;               // chop/mine/build swing: tool raised then struck
+const int barbPickFrames = 10;              // picking: arm dips to the bush on alternate periods
+const float barbHungryDroopPx = 1.0f;       // hungry barbs slouch: body 1px shorter, head 1px lower
+const Color barbSkinColor(196, 158, 122);   // muted tan, readable on dark green and distinct from task colours
+const Color barbToolColor(170, 165, 150);   // dull steel-grey tool tick
+
 int wood = 0;
 int stone = 0;
 int food = 0;
@@ -709,6 +721,50 @@ void hungerTick(vector<barb>& barbs) {
 Color hungryTint(Color c) {
     auto mix = [](uint8_t a, uint8_t t) { return (uint8_t)(a + (t - a) * hungryTintAmount); };
     return Color(mix(c.r, hungryTintColor.r), mix(c.g, hungryTintColor.g), mix(c.b, hungryTintColor.b));
+}
+
+// Read-only on game state: squares stay the hitbox, the sprite is built from temporary shapes.
+// Pose comes from existing flags only: walking bob, chop/mine/build tool tick, pick arm dip, hungry droop.
+void drawBarbs(RenderWindow& window, const vector<barb>& barbs, const vector<RectangleShape>& squares, int frame) {
+    RectangleShape body(barbBodySize), head(barbHeadSize), tool(barbToolSize);
+    for (int i = 0; i < (int)squares.size() && i < (int)barbs.size(); i++) {
+        const barb& b = barbs[i];
+        bool hungry = isHungry(b);
+        int phase = frame + b.id * 3;   // desync barbs so they don't animate in lockstep
+        bool working = b.chopping || (b.building && b.timer > 0);
+        bool walking = b.moving && !working;
+
+        Vector2f base = squares[i].getPosition();
+        float feet = base.y + squares[i].getSize().y;    // bottom edge of the hitbox
+        float bob = (walking && (phase / barbBobFrames) % 2 == 1) ? -barbBobPx : 0.0f;
+        float droop = hungry ? barbHungryDroopPx : 0.0f;
+
+        float bodyH = barbBodySize.y - droop;
+        float bodyTop = feet - bodyH + bob;
+        float headTop = bodyTop - barbHeadSize.y;
+
+        Color bc = barbColor(b);
+        body.setSize(Vector2f(barbBodySize.x, bodyH));
+        body.setFillColor(hungry ? hungryTint(bc) : bc);
+        body.setPosition(Vector2f(base.x, bodyTop));
+        head.setFillColor(hungry ? hungryTint(barbSkinColor) : barbSkinColor);
+        head.setPosition(Vector2f(base.x, headTop));
+        window.draw(body);
+        window.draw(head);
+
+        float side = base.x + barbBodySize.x;            // tool/arm sits just right of the body
+        if (b.chopping && b.targetIsBush) {
+            bool dip = (phase / barbPickFrames) % 2 == 1;
+            tool.setFillColor(head.getFillColor());
+            tool.setPosition(Vector2f(side, dip ? feet - barbToolSize.y : bodyTop + 1.0f));
+            window.draw(tool);
+        } else if (working && b.timer > 0) {
+            bool raised = (phase / barbToolFrames) % 2 == 0;
+            tool.setFillColor(barbToolColor);
+            tool.setPosition(Vector2f(side, raised ? headTop : bodyTop + 1.0f));
+            window.draw(tool);
+        }
+    }
 }
 
 void traderTick(optional<trader>& tr) {
@@ -1502,11 +1558,7 @@ int main() {
         	window.draw(stumps[i]);
         }
 	
-        for (int j = 0; j < (int)squares.size(); j++) {
-            Color bc = barbColor(barbs[j]);
-            squares[j].setFillColor(isHungry(barbs[j]) ? hungryTint(bc) : bc);
-            window.draw(squares[j]);
-	}
+        drawBarbs(window, barbs, squares, frameCount);
 	if (activeTrader) window.draw(activeTrader->shape);
 	for (int k = 0; k < (int)tris.size(); ++k)
 		window.draw(tris[k]);
