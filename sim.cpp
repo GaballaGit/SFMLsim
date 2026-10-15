@@ -145,6 +145,11 @@ const float birthRingThickness = 1.0f;
 const Color birthRingColor(225, 220, 190); // pale warm cream, matches ticker text
 const uint8_t birthRingMaxAlpha = 70;      // faint at birth, fades linearly to 0
 
+const int houseWoodCost = 30;
+const int houseStoneCost = 2;              // small; with less stone a plain house is built instead
+const Vector2f houseSlabSize(10.0f, 10.0f); // centred under the 4px house (6px with outline): 2px rim shows
+const Color houseSlabColor(50, 56, 52);    // dim grey, low contrast on the dark ground, darker than rocks
+
 mt19937 gen(random_device{}());
 uniform_int_distribution<int> distrib(0, 800);
 uniform_int_distribution<int> wanderChance(0, 149);
@@ -160,7 +165,7 @@ uniform_int_distribution<int> DeerSpawnChance(0, 100);
 uniform_int_distribution<int> DeerSpawnXgotoL(20, 100);
 uniform_int_distribution<int> DeerSpawnXgotoR(700, 780);
 
-struct house {int x, y, health;};
+struct house {int x, y, health; bool hasFoundation = false;};
 
 struct barb {
     int id = -1;                 // stable, unique; assigned only by makeBarb()
@@ -172,6 +177,7 @@ struct barb {
     bool movingbspot = false;
     bool building = false;
     bool reservedwood = false;
+    int reservedstone = 0;       // stone held for a house foundation; refunded with the wood on cancel
     int stepTimer = 0;
     bool targetIsRock = false;
     bool targetIsBush = false;   // chopping + targetIsBush = picking; shares timer/chopping with chop and mine
@@ -839,9 +845,11 @@ void buildhouse(vector<barb>& barbs, vector<RectangleShape>& squares, vector<hou
         auto& b  = barbs[i];
         if (b.chopping || (b.timer > 0 && !b.building)) continue;
         if (!b.movingbspot && !b.moving) {
-            if (!canclaim || wood < 30) continue;
-            wood -= 30;
+            if (!canclaim || wood < houseWoodCost) continue;
+            wood -= houseWoodCost;
             b.reservedwood = true;
+            b.reservedstone = stone >= houseStoneCost ? houseStoneCost : 0; // 0 stone -> plain house
+            stone -= b.reservedstone;
             b.targetx = 400 + buildSpotDX(gen);
             b.targety = 400 + buildSpotDY(gen);
             b.moving = true;
@@ -854,8 +862,10 @@ void buildhouse(vector<barb>& barbs, vector<RectangleShape>& squares, vector<hou
 
             if (dSq < 1.0f) {
                 if (!b.reservedwood || (int)houses.size() >= (int)barbs.size()) {
-                    if (b.reservedwood) wood += 30;
+                    if (b.reservedwood) wood += houseWoodCost;
+                    stone += b.reservedstone;
                     b.reservedwood = false;
+                    b.reservedstone = 0;
                     b.moving = b.movingbspot = b.building = false;
                     b.timer = 0;
                     continue;
@@ -864,7 +874,8 @@ void buildhouse(vector<barb>& barbs, vector<RectangleShape>& squares, vector<hou
                 if (workTick(b)) b.timer++;
                 if (b.timer >= 600) {
                     b.reservedwood = false;
-                    house h{b.targetx, b.targety, 100};
+                    house h{b.targetx, b.targety, 100, b.reservedstone > 0};
+                    b.reservedstone = 0;
                     houses.push_back(h);
                     RectangleShape hs(Vector2f(4, 4));
                     hs.setPosition(Vector2f(h.x, h.y));
@@ -1371,6 +1382,16 @@ int main() {
 	for (auto& bs : bushshapes)
 		window.draw(bs);
 
+	{
+		RectangleShape slab(houseSlabSize); // foundations under houses, drawn first so every house sits on top
+		slab.setFillColor(houseSlabColor);
+		for (int i = 0; i < (int)houses.size(); i++) {
+			if (!houses[i].hasFoundation) continue;
+			Vector2f centre = houseshapes[i].getPosition() + houseshapes[i].getSize() / 2.0f;
+			slab.setPosition(centre - houseSlabSize / 2.0f);
+			window.draw(slab);
+		}
+	}
 	for (auto& hs : houseshapes)
 		window.draw(hs);
 
