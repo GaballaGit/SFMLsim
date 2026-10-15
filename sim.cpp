@@ -8,6 +8,7 @@
 #include <deque>
 #include <string>
 #include <limits>
+#include <unordered_map>
 
 using namespace sf;
 using namespace std;
@@ -1595,8 +1596,37 @@ Vector2f bushWorkSpot(const CircleShape& bs) {
     return Vector2f((float)(int)p.x, (float)(int)p.y);
 }
 
+// Claimed targets: claim[i] = index of the barb headed for / working tree (or rock) i, -1 = free.
+// Rebuilt from barbs' current targets every tick rather than tracked, so death, depletion and
+// abandonment release claims automatically and swapRemove index shifts can't leave stale claims.
+long long workSpotKey(int x, int y) { return ((long long)x << 32) ^ (unsigned int)y; }
+
+void buildWorkClaims(const vector<barb>& barbs, const vector<CircleShape>& tris, const vector<CircleShape>& octs,
+                     vector<int>& treeClaim, vector<int>& rockClaim) {
+    unordered_map<long long, int> treeSpots, rockSpots;
+    for (int j = 0; j < (int)barbs.size(); j++) {
+        const barb& b = barbs[j];
+        if (b.targetx == -1 || b.targetIsBush || b.deertargeting || b.movingbspot || b.building) continue;
+        (b.targetIsRock ? rockSpots : treeSpots).emplace(workSpotKey(b.targetx, b.targety), j); // first claimant kept
+    }
+    treeClaim.assign(tris.size(), -1);
+    for (int i = 0; i < (int)tris.size(); i++) {
+        Vector2f p = tris[i].getPosition() + treeWorkOffset;
+        auto it = treeSpots.find(workSpotKey((int)p.x, (int)p.y));
+        if (it != treeSpots.end()) treeClaim[i] = it->second;
+    }
+    rockClaim.assign(octs.size(), -1);
+    for (int i = 0; i < (int)octs.size(); i++) {
+        Vector2f p = octs[i].getPosition() + rockWorkOffset;
+        auto it = rockSpots.find(workSpotKey((int)p.x, (int)p.y));
+        if (it != rockSpots.end()) rockClaim[i] = it->second;
+    }
+}
+
 void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<CircleShape>& tris, vector<RectangleShape>& stumps, vector<tree>& trees, vector<CircleShape>& octs, vector<rock>& rocks,
                    vector<bush>& bushes, vector<CircleShape>& bushshapes) {
+    vector<int> treeClaim, rockClaim;   // parallel to trees/tris and rocks/octs for this tick
+    buildWorkClaims(barbs, tris, octs, treeClaim, rockClaim);
     for (int j = 0; j < (int)squares.size(); j++) {
         auto& sq = squares[j];
         auto& b  = barbs[j];
@@ -1607,10 +1637,10 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
             float treeDSq, rockDSq, bushDSq;
             int bestTree = findNearest(bpos, barbWorkSearchRadius, (int)trees.size(),
                                        [&](int i) { return tris[i].getPosition() + treeWorkOffset; },
-                                       [&](int i) { return trees[i].dying; }, &treeDSq);
+                                       [&](int i) { return trees[i].dying || (treeClaim[i] != -1 && treeClaim[i] != j); }, &treeDSq);
             int bestRock = findNearest(bpos, barbWorkSearchRadius, (int)rocks.size(),
                                        [&](int k) { return octs[k].getPosition() + rockWorkOffset; },
-                                       [&](int k) { return rocks[k].dying; }, &rockDSq);
+                                       [&](int k) { return rocks[k].dying || (rockClaim[k] != -1 && rockClaim[k] != j); }, &rockDSq);
             int bestBush = findNearest(bpos, barbWorkSearchRadius, (int)bushes.size(),
                                        [&](int k) { return bushWorkSpot(bushshapes[k]); },
                                        [&](int k) { return !bushes[k].ripe || bushes[k].picking; }, &bushDSq);
@@ -1644,6 +1674,7 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
                 b.moving  = true;
                 b.targetIsRock = false;
                 b.targetIsBush = false;
+                treeClaim[best] = j;
             }
 	    if (best != -1 && !bestIsBush && bestIsRock && b.moving==false) {
 		    Vector2f rp = octs[best].getPosition();
@@ -1652,6 +1683,7 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
 		    b.moving = true;
 		    b.targetIsRock = true;
 		    b.targetIsBush = false;
+		    rockClaim[best] = j;
         }
         if (b.targetx == -1) continue;
 	}
@@ -1707,6 +1739,7 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
                 swapRemove(trees,  i);
                 swapRemove(tris,   i);
                 swapRemove(stumps, i);
+                swapRemove(treeClaim, i);
                 b.moving = b.chopping = false;
                 b.timer  = 0;
                 b.targetx = b.targety = -1;
@@ -1734,6 +1767,7 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
 				stone++;
 				swapRemove(rocks, i);
 				swapRemove(octs, i);
+				swapRemove(rockClaim, i);
 				b.moving = b.chopping = false;
 				b.timer = 0;
 				b.targetx = b.targety = -1;
