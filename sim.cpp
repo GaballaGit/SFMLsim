@@ -82,6 +82,16 @@ const float tooltipEdgeMargin = 2.0f;
 const Color tooltipPanelColor(0, 0, 0, 170);
 const Color tooltipTextColor(225, 220, 200);
 
+const float trailCellSize = 8.0f;          // world px per trail grid cell
+const int trailGridN = 100;                // cells per side (800 / 8)
+const int trailDecayIntervalTicks = 120;   // every 2s each cell loses 1 wear, so stray steps fade out
+const int trailMaxWear = 240;              // cap so abandoned roads fade within ~8 min
+const int trailPathThreshold = 48;         // wear for the faint "path" tint (~6 recent crossings)
+const int trailRoadThreshold = 144;        // wear for "road": darker tint and the speed bonus
+const int roadStepBonus = 1;               // ticks shaved off the step limit on road cells (~10% faster)
+const Color trailPathColor(150, 125, 85, 26);
+const Color trailRoadColor(150, 125, 85, 52);
+
 mt19937 gen(random_device{}());
 uniform_int_distribution<int> distrib(0, 800);
 uniform_int_distribution<int> wanderChance(0, 149);
@@ -353,6 +363,64 @@ bool isHungry(const barb& b) { return b.hunger >= hungerThreshold; }
 
 int stepLimit(const barb& b) { return stepLimit() * (isHungry(b) ? hungerWorkSlowdown : 1); }
 
+// Worn trails: per-cell wear from barb steps, decaying over time. Tiers: 0 none, 1 path, 2 road.
+vector<int> trailWear(trailGridN * trailGridN, 0);
+vector<uint8_t> trailTier(trailGridN * trailGridN, 0);
+bool trailDirty = false;
+
+int trailCell(Vector2f p) {
+    int cx = (int)(p.x / trailCellSize), cy = (int)(p.y / trailCellSize);
+    if (p.x < 0 || p.y < 0 || cx >= trailGridN || cy >= trailGridN) return -1;
+    return cy * trailGridN + cx;
+}
+
+void trailSetTier(int c) {
+    uint8_t t = trailWear[c] >= trailRoadThreshold ? 2 : trailWear[c] >= trailPathThreshold ? 1 : 0;
+    if (t != trailTier[c]) { trailTier[c] = t; trailDirty = true; }
+}
+
+void trailStep(Vector2f p) {
+    int c = trailCell(p);
+    if (c < 0 || trailWear[c] >= trailMaxWear) return;
+    trailWear[c]++;
+    trailSetTier(c);
+}
+
+void trailTick() {
+    static int dtimer = 0;
+    if (++dtimer < trailDecayIntervalTicks) return;
+    dtimer = 0;
+    for (int c = 0; c < (int)trailWear.size(); c++) {
+        if (trailWear[c] == 0) continue;
+        trailWear[c]--;
+        trailSetTier(c);
+    }
+}
+
+bool onRoad(Vector2f p) {
+    int c = trailCell(p);
+    return c >= 0 && trailTier[c] == 2;
+}
+
+int stepLimit(const barb& b, Vector2f pos) { return max(1, stepLimit(b) - (onRoad(pos) ? roadStepBonus : 0)); }
+
+// Rebuilds the tinted cell quads only when some cell changed tier
+void drawTrails(RenderWindow& window, VertexArray& va) {
+    if (trailDirty) {
+        va.clear();
+        for (int c = 0; c < (int)trailTier.size(); c++) {
+            if (trailTier[c] == 0) continue;
+            Color col = trailTier[c] == 2 ? trailRoadColor : trailPathColor;
+            float x0 = (c % trailGridN) * trailCellSize, y0 = (c / trailGridN) * trailCellSize;
+            float x1 = x0 + trailCellSize, y1 = y0 + trailCellSize;
+            Vector2f q[6] = {{x0, y0}, {x1, y0}, {x1, y1}, {x0, y0}, {x1, y1}, {x0, y1}};
+            for (auto& v : q) va.append(Vertex{v, col});
+        }
+        trailDirty = false;
+    }
+    if (va.getVertexCount() > 0) window.draw(va);
+}
+
 // Returns true on ticks where the barb makes work progress; hungry barbs skip some ticks
 bool workTick(barb& b) {
     if (!isHungry(b)) return true;
@@ -570,9 +638,10 @@ void buildhouse(vector<barb>& barbs, vector<RectangleShape>& squares, vector<hou
                     logEvent("House built");
                 }
             } else {
-                if (++b.stepTimer >= stepLimit(b)) {
+                if (++b.stepTimer >= stepLimit(b, pos)) {
                     b.stepTimer = 0;
                     sq.move(diff / sqrt(dSq));
+                    trailStep(sq.getPosition());
                 }
             }
         }
@@ -617,9 +686,10 @@ void barbmove(vector<RectangleShape>& squares, vector<barb>& barbs) {
             if (dSq < 1.0f) {
                 b.moving    = false;
                 b.stepTimer = 0;
-            } else if (++b.stepTimer >= stepLimit(b)) {
+            } else if (++b.stepTimer >= stepLimit(b, pos)) {
                 b.stepTimer = 0;
                 sq.move(diff / sqrt(dSq));
+                trailStep(sq.getPosition());
 		sq.getGlobalBounds();
             }
         }
@@ -835,6 +905,7 @@ int main() {
     View worldView(FloatRect({0.0f, 0.0f}, {worldSize, worldSize}));
     optional<trader> activeTrader;
     FloatRect tickerRect;                 // last frame's ticker strip, used to suppress hover over it
+    VertexArray trailVerts(PrimitiveType::Triangles);
 
     while (window.isOpen()) {
         while (const optional event = window.pollEvent())
@@ -894,6 +965,7 @@ int main() {
                 weatherTick();
                 traderTick(activeTrader);
                 hungerTick(barbs);
+                trailTick();
             }
         }
 
@@ -922,6 +994,7 @@ int main() {
 
         window.clear(Color(4, 20, 14)); //bg color
         window.setView(worldView);
+        drawTrails(window, trailVerts);
 	
 	for (auto& oct : octs)
 		window.draw(oct);
