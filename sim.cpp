@@ -5,6 +5,7 @@
 #include <optional>
 #include <deque>
 #include <string>
+#include <limits>
 
 using namespace sf;
 using namespace std;
@@ -116,6 +117,11 @@ const int wolfSpawnChance = 5000;          // 1-in-N per tick while below the ca
 const int wolfStepInterval = 2;            // ticks per 1px step (deer step every 3, so wolves gain slowly)
 const Vector2f wolfSize(5.0f, 3.0f);
 const Color wolfColor(150, 150, 160);      // cool mid grey: lighter than rocks, darker than birds, far from deer tan
+
+const float barbWorkSearchRadius = 25.0f;  // barbs only notice trees/rocks within this many px (findNearest)
+const float noSearchRadius = numeric_limits<float>::infinity(); // findNearest with no distance limit
+const Vector2f treeWorkOffset(8.0f, 15.0f); // where a barb stands to chop a tree, relative to its shape
+const Vector2f rockWorkOffset(6.0f, 10.0f); // where a barb stands to mine a rock, relative to its shape
 
 mt19937 gen(random_device{}());
 uniform_int_distribution<int> distrib(0, 800);
@@ -235,6 +241,23 @@ FloatRect drawEvents(RenderWindow& window, const Font& font) {
 
 struct tree  {int x, y, health; bool dying = false;};
 struct rock  {int x, y, health; bool dying = false;};
+
+// Nearest candidate to pos strictly inside radius: posOf(i) gives candidate i's position and
+// skip(i) == true excludes it. Returns the index or -1; ties keep the lowest index. If outDSq is
+// given it receives the winner's squared distance (radius^2 when nothing was found).
+template<typename PosFn, typename SkipFn>
+int findNearest(Vector2f pos, float radius, int count, PosFn posOf, SkipFn skip, float* outDSq = nullptr) {
+    int best = -1;
+    float bestDSq = radius * radius;
+    for (int i = 0; i < count; i++) {
+        if (skip(i)) continue;
+        Vector2f d = posOf(i) - pos;
+        float dSq = d.x * d.x + d.y * d.y;
+        if (dSq < bestDSq) {bestDSq = dSq; best = i;}
+    }
+    if (outDSq) *outDSq = bestDSq;
+    return best;
+}
 
 template<typename T>
 void swapRemove(vector<T>& v, int i) {
@@ -365,12 +388,9 @@ void wolfTick(vector<wolf>& wolves, vector<deer>& deers, vector<RectangleShape>&
 		Vector2f goal = w.exit;
 		int prey = -1;
 		if (w.phase == wolf::Hunting) {
-			float bestDSq = -1.0f;
-			for (int k = 0; k < (int)deershape.size(); k++) {
-				Vector2f d = deershape[k].getPosition() - pos;
-				float dSq = d.x * d.x + d.y * d.y;
-				if (bestDSq < 0 || dSq < bestDSq) { bestDSq = dSq; prey = k; }
-			}
+			prey = findNearest(pos, noSearchRadius, (int)deershape.size(),
+			                   [&](int k) { return deershape[k].getPosition(); },
+			                   [](int) { return false; });
 			if (prey != -1) goal = deershape[prey].getPosition();
 		}
 		if (prey != -1 && w.shape.getGlobalBounds().findIntersection(deershape[prey].getGlobalBounds()).has_value()) {
@@ -893,24 +913,16 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
         Vector2f bpos = sq.getPosition();
         bool bestIsRock = false;
         if (b.timer == 0 && !b.chopping) {
-            int best = -1;
-            float bestDSq = 625.0f;
-            for (int i = 0; i < (int)trees.size(); i++) {
-                if (trees[i].dying) continue;
-                Vector2f tp = tris[i].getPosition();
-                float dx = tp.x + 8  - bpos.x;
-                float dy = tp.y + 15 - bpos.y;
-                float dSq = dx * dx + dy * dy;
-                if (dSq < bestDSq) {bestDSq = dSq; best = i; bestIsRock = false;}
-            }
-	    for (int k = 0; k < (int)rocks.size(); k++) {
-	    if (rocks[k].dying) continue;
-	    Vector2f rp = octs[k].getPosition();
-	    float dx = rp.x + 6 - bpos.x;
-	    float dy = rp.y + 10 - bpos.y;
-	    float dSq = dx * dx + dy * dy;
-	    if (dSq < bestDSq) {bestDSq = dSq; best = k; bestIsRock = true;}
-	    }
+            float treeDSq, rockDSq;
+            int bestTree = findNearest(bpos, barbWorkSearchRadius, (int)trees.size(),
+                                       [&](int i) { return tris[i].getPosition() + treeWorkOffset; },
+                                       [&](int i) { return trees[i].dying; }, &treeDSq);
+            int bestRock = findNearest(bpos, barbWorkSearchRadius, (int)rocks.size(),
+                                       [&](int k) { return octs[k].getPosition() + rockWorkOffset; },
+                                       [&](int k) { return rocks[k].dying; }, &rockDSq);
+            // a rock wins only when strictly closer, as when trees were scanned first
+            bestIsRock = bestRock != -1 && rockDSq < treeDSq;
+            int best = bestIsRock ? bestRock : bestTree;
             if (best != -1 && !bestIsRock && b.moving==false) {
                 Vector2f tp = tris[best].getPosition();
                 b.targetx = (int)(tp.x + 8);
