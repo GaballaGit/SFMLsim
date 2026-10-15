@@ -8,3 +8,4 @@ feature-reports/run.log
 feature-reports/inbox.json
 feature-reports/board-sync.json
 feature-reports/run.state
+feature-reports/chat.jsonl
