@@ -110,6 +110,13 @@ const Vector2f birdWingsOut(3.0f, 2.0f);
 const Vector2f birdWingsIn(2.0f, 2.0f);
 const Color birdColor(205, 215, 230);      // pale blue-white: readable on dark green, distinct from white idle barbs
 
+const int maxWolves = 2;
+const int wolfMinDeer = 4;                 // wolves only hunt while more deer than this remain, else they leave
+const int wolfSpawnChance = 5000;          // 1-in-N per tick while below the cap and deer are plentiful (~83s)
+const int wolfStepInterval = 2;            // ticks per 1px step (deer step every 3, so wolves gain slowly)
+const Vector2f wolfSize(5.0f, 3.0f);
+const Color wolfColor(150, 150, 160);      // cool mid grey: lighter than rocks, darker than birds, far from deer tan
+
 mt19937 gen(random_device{}());
 uniform_int_distribution<int> distrib(0, 800);
 uniform_int_distribution<int> wanderChance(0, 149);
@@ -162,6 +169,14 @@ struct trader {
     Vector2f exit;
     int stepTimer = 0;
     int timer = 0;
+    RectangleShape shape;
+};
+
+// Wolves own their shape (like the trader), so there is no parallel vector to keep in sync
+struct wolf {
+    enum Phase {Hunting, Leaving} phase = Hunting;
+    Vector2f exit;
+    int stepTimer = 0;
     RectangleShape shape;
 };
 
@@ -319,6 +334,64 @@ void deerkilling(vector<deer>& deers, vector<RectangleShape>& deershape, vector<
 		if (removed) {
 			validateDeerTargets(barbs, deers); // frees every barb that was chasing the dead deer
 			continue;                          // re-check index i: it now holds the swapped-in deer
+		}
+		++i;
+	}
+}
+
+// Wolves enter from an edge, chase the nearest deer and kill it on contact (no food). After one kill,
+// or once deer are scarce (<= wolfMinDeer), they walk back out, so they can never wipe the deer out.
+void wolfTick(vector<wolf>& wolves, vector<deer>& deers, vector<RectangleShape>& deershape, vector<barb>& barbs) {
+	if ((int)wolves.size() < maxWolves && (int)deers.size() > wolfMinDeer
+	    && uniform_int_distribution<int>(0, wolfSpawnChance - 1)(gen) == 0) {
+		wolf w;
+		float along = (float)clamp(distrib(gen), 20, 780);
+		switch (uniform_int_distribution<int>(0, 3)(gen)) {
+			case 0:  w.exit = Vector2f(-10.0f, along); break;
+			case 1:  w.exit = Vector2f(worldSize + 10.0f, along); break;
+			case 2:  w.exit = Vector2f(along, -10.0f); break;
+			default: w.exit = Vector2f(along, worldSize + 10.0f); break;
+		}
+		w.shape.setSize(wolfSize);
+		w.shape.setFillColor(wolfColor);
+		w.shape.setPosition(w.exit);
+		wolves.push_back(w);
+		printf("Wolf arriving\n");
+	}
+	for (int i = 0; i < (int)wolves.size(); ) {
+		wolf& w = wolves[i];
+		Vector2f pos = w.shape.getPosition();
+		if (w.phase == wolf::Hunting && (int)deers.size() <= wolfMinDeer) w.phase = wolf::Leaving;
+		Vector2f goal = w.exit;
+		int prey = -1;
+		if (w.phase == wolf::Hunting) {
+			float bestDSq = -1.0f;
+			for (int k = 0; k < (int)deershape.size(); k++) {
+				Vector2f d = deershape[k].getPosition() - pos;
+				float dSq = d.x * d.x + d.y * d.y;
+				if (bestDSq < 0 || dSq < bestDSq) { bestDSq = dSq; prey = k; }
+			}
+			if (prey != -1) goal = deershape[prey].getPosition();
+		}
+		if (prey != -1 && w.shape.getGlobalBounds().findIntersection(deershape[prey].getGlobalBounds()).has_value()) {
+			swapRemove(deers, prey);
+			swapRemove(deershape, prey);
+			validateDeerTargets(barbs, deers);   // no barb keeps hunting the dead deer
+			w.phase = wolf::Leaving;
+			printf("Wolf killed a deer - deer left: %zu\n", deers.size());
+			logEvent("Wolf killed a deer");
+			++i;
+			continue;
+		}
+		Vector2f diff = goal - pos;
+		float dSq = diff.x * diff.x + diff.y * diff.y;
+		if (w.phase == wolf::Leaving && dSq < 1.0f) {
+			swapRemove(wolves, i);   // re-check index i: it now holds the swapped-in wolf
+			continue;
+		}
+		if (dSq >= 1.0f && ++w.stepTimer >= wolfStepInterval) {
+			w.stepTimer = 0;
+			w.shape.move(diff / sqrt(dSq));
 		}
 		++i;
 	}
@@ -630,9 +703,9 @@ float rectDistSq(const FloatRect& r, Vector2f p) {
     return dx * dx + dy * dy;
 }
 
-// Fresh scan each frame, no stored selection. Returns the first hit: barbs, trader, deer, rocks, houses.
+// Fresh scan each frame, no stored selection. Returns the first hit: barbs, trader, wolves, deer, rocks, houses.
 optional<hoverHit> pickHover(Vector2f p, float radius, const vector<barb>& barbs, const vector<RectangleShape>& squares,
-                             const optional<trader>& tr, const vector<deer>& deers, const vector<RectangleShape>& deershape,
+                             const optional<trader>& tr, const vector<wolf>& wolves, const vector<deer>& deers, const vector<RectangleShape>& deershape,
                              const vector<rock>& rocks, const vector<CircleShape>& octs, const vector<RectangleShape>& houseshapes) {
     float rSq = radius * radius;
     auto near = [&](const Shape& s) { return rectDistSq(s.getGlobalBounds(), p) <= rSq; };
@@ -643,6 +716,8 @@ optional<hoverHit> pickHover(Vector2f p, float radius, const vector<barb>& barbs
         const char* ph = tr->phase == trader::Arriving ? "arriving" : tr->phase == trader::Trading ? "trading" : "leaving";
         return hoverHit{string("Trader: ") + ph, tr->shape, nullopt};
     }
+    for (auto& w : wolves)
+        if (near(w.shape)) return hoverHit{w.phase == wolf::Hunting ? "Wolf: hunting" : "Wolf: leaving", w.shape, nullopt};
     for (int i = 0; i < (int)deershape.size() && i < (int)deers.size(); i++)
         if (near(deershape[i])) return hoverHit{"Deer " + to_string(deers[i].health) + "hp", deershape[i], nullopt};
     for (int i = 0; i < (int)octs.size() && i < (int)rocks.size(); i++)
@@ -1024,6 +1099,7 @@ int main() {
     Vector2f birdHeading(1.0f, 0.0f);
     RectangleShape birdShape;
     int frameCount = 0;
+    vector<wolf> wolves;
 
     while (window.isOpen()) {
         while (const optional event = window.pollEvent())
@@ -1079,6 +1155,7 @@ int main() {
                 deerspawn(deers, deershape);
                 deerwander(deershape, deers);
                 deerkilling(deers, deershape, barbs, squares);
+                wolfTick(wolves, deers, deershape, barbs);
                 clockk();
                 weatherTick();
                 traderTick(activeTrader);
@@ -1123,6 +1200,9 @@ int main() {
 
 	for (auto& ds : deershape)
 		window.draw(ds);
+
+	for (auto& w : wolves)
+		window.draw(w.shape);
 
         for (int i = 0; i < (int)tris.size(); i++) {
         	window.draw(stumps[i]);
@@ -1182,7 +1262,7 @@ int main() {
             bool overUi = (hudFontOk && hudPanel.getGlobalBounds().contains(mscreen)) || tickerRect.contains(mscreen);
             if (window.hasFocus() && !panning && !overUi && mpx.x >= 0 && mpx.y >= 0 && mpx.x < (int)wsz.x && mpx.y < (int)wsz.y) {
                 Vector2f mworld = window.mapPixelToCoords(mpx, worldView);
-                hover = pickHover(mworld, tooltipPickRadius / zoom, barbs, squares, activeTrader, deers, deershape, rocks, octs, houseshapes);
+                hover = pickHover(mworld, tooltipPickRadius / zoom, barbs, squares, activeTrader, wolves, deers, deershape, rocks, octs, houseshapes);
                 if (hover) drawHoverOutline(window, worldView, *hover, zoom);
             }
         }
