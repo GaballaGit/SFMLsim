@@ -34,7 +34,9 @@ const float worldSize = 800.0f;
 const float minZoom = 1.0f;
 const float maxZoom = 4.0f;
 const float zoomStep = 1.1f;
-const int ticksPerGameHour = 216000;        // clockk() advances game_time by one hour after this many ticks
+const int ticksPerMinute = 3600;            // one real minute at 1x (60 ticks/s)
+const int realMinutesPerGameHour = 10;      // the one day-length knob: real minutes (at 1x) per in-game hour (4 real hours per day)
+const int ticksPerGameHour = realMinutesPerGameHour * ticksPerMinute; // clockk() advances game_time by one hour after this many ticks
 const float clearRadiusSq = 50.0f * 50.0f;  // trees/rocks within 50px of the village centre (400,400) are cleared
 const Color stumpColor(115, 30, 2);         // every tree stump, startup and respawned
 
@@ -130,11 +132,18 @@ int wood = 0;
 int stone = 0;
 int food = 0;
 int game_time = 12;
+// Day/night hours (R26-F1): night runs nightStartHour..nightEndHour-1, the day tint switches at the other two
+const int nightStartHour = 21;             // dusk: night overlay, campfire glow and lit windows begin
+const int nightEndHour = 6;                // dawn: night ends (the council also votes at this hour)
+const int middayStartHour = 12;            // morning tint -> midday tint
+const int eveningStartHour = 18;           // midday tint -> evening tint
+const Color duskEventColor(140, 160, 215); // muted moonlight blue for the dusk ticker line; readable on the black strip
+bool isNightHour(int h) { return h >= nightStartHour || h < nightEndHour; }
 
 const int stepInterval = 10;
 const int rainStepInterval = 16;          // slower barb stepping in rain (~0.6x speed)
-const int clearWeatherTicks = 108000;     // ticks of clear weather between rains
-const int rainWeatherTicks = 36000;       // ticks a rain lasts
+const int clearWeatherTicks = 30 * ticksPerMinute; // 30 real min of clear weather between rains
+const int rainWeatherTicks = 10 * ticksPerMinute;  // 10 real min per rain
 const Color rainOverlayColor(70, 90, 120, 70);
 // Falling rain streaks: draw-only, positions hashed from (frame cycle, index) so there is no stored state
 const int rainStreakCount = 150;           // sparse over the 800x800 map
@@ -145,7 +154,7 @@ const float rainStreakDriftPx = 1.0f;      // px drifted left per frame, matches
 const Color rainStreakColor(170, 195, 225, 64); // pale blue, ~25% alpha
 bool raining = false;
 
-const int traderIntervalTicks = 216000;   // one in-game hour between trader visits
+const int traderIntervalTicks = ticksPerGameHour; // one in-game hour between trader visits
 const int traderStepInterval = 6;         // ticks per 1px step while walking
 const int traderTradeTicks = 300;         // ticks spent at the village center
 const int tradeStoneCost = 2;             // stone paid per lot
@@ -156,7 +165,7 @@ const Vector2f traderSize(3.0f, 3.0f);
 const Color traderColor(190, 140, 230);
 const Vector2f villageCenter(400.0f, 400.0f);
 
-const int hungerThreshold = 54000;        // ticks between meals (~quarter in-game hour); deer are the only food for now
+const int hungerThreshold = 15 * ticksPerMinute; // 15 real min between meals; deer are the only food for now
 const int hungerWorkSlowdown = 2;         // hungry barbs with no food work and walk this many times slower
 const Color hungryTintColor(140, 100, 60);
 const float hungryTintAmount = 0.45f;     // 0 = pure task colour, 1 = pure tint
@@ -609,7 +618,7 @@ const speciesDef speciesDefs[speciesCount] = {
 const float rabbitBirthOffsetPx = 5.0f;    // kit appears this far beside its parent
 
 // Campfire at villageCenter: burns wood slowly, glows at night (cosmetic only, no barb behaviour yet)
-const int campfireTicksPerWood = 18000;    // 1 wood per ~5 min at 1x (12 per in-game hour): a sliver of one chopper's output
+const int campfireTicksPerWood = 5 * ticksPerMinute; // 1 wood per 5 real min at 1x: a sliver of one chopper's output
 const int campfireStartFuel = 2 * campfireTicksPerWood; // lit at startup without touching the wood stock
 const float campfireStoneRadius = 5.0f;    // 10px stone ring (plus outline): smaller than a 16px tree
 const Color campfireStoneColor(95, 95, 90);
@@ -997,13 +1006,13 @@ struct wolf {
 char tradeMsg[64] = "";
 int tradeMsgTimer = 0;
 
-struct gameEvent {string text; int age = 0;};
+struct gameEvent {string text; int age = 0; Color tint = Color::Transparent;};   // tint.a == 0: normal ticker colour
 deque<gameEvent> events;
 int foodFlashFrames = 0;   // >0: the newest ticker line (a paid birth) is tinted birthFlashColor
 
-void logEvent(const string& text) {
+void logEvent(const string& text, Color tint = Color::Transparent) {
     foodFlashFrames = 0;   // any newer line ends the flash, so it never lands on the wrong line
-    events.push_back({text, 0});
+    events.push_back({text, 0, tint});
     while ((int)events.size() > eventMaxLines) events.pop_front();
 }
 
@@ -1051,7 +1060,7 @@ FloatRect drawEvents(RenderWindow& window, const Font& font) {
     window.draw(strip);
     for (int i = 0; i < (int)events.size(); i++) {
         Text t(font, events[i].text, eventFontSize);
-        Color c = eventTextColor;
+        Color c = events[i].tint.a > 0 ? events[i].tint : eventTextColor;   // R26-F1: dusk line in night blue
         if (foodFlashFrames > 0 && i == (int)events.size() - 1) {
             float f = (float)foodFlashFrames / birthFlashFrames;   // 1 -> 0: eases back to the normal colour
             c.r = (uint8_t)(c.r + (birthFlashColor.r - c.r) * f);
@@ -1389,6 +1398,9 @@ int clockk() {
         game_time = (game_time + 1) % 24;   // 0..23: midnight follows 23:00
         printf("The time is now: %d:00\n", game_time);
         timer = 0;
+        // R26-F1: only inside this hour-change edge, so each fires once per day
+        if (game_time == nightStartHour) logEvent("Dusk falls - " + to_string(game_time) + ":00", duskEventColor);
+        if (game_time == nightEndHour)   logEvent("Dawn breaks - " + to_string(game_time) + ":00");
     }
     return game_time;
 }
@@ -3975,14 +3987,14 @@ int main() {
 
         int t = game_time;
         Color dncColor;
-        if (t >= 21 || t < 6)      dncColor = Color(4, 7, 32, 150);      // Night
-        else if (t < 12)           dncColor = Color(250, 231, 190, 30);  // Morning
-        else if (t < 18)           dncColor = Color(233, 255, 253, 30);  // Midday
-        else                       dncColor = Color(255, 178, 127, 50);  // Evening
+        if (isNightHour(t))             dncColor = Color(4, 7, 32, 150);      // Night
+        else if (t < middayStartHour)   dncColor = Color(250, 231, 190, 30);  // Morning
+        else if (t < eveningStartHour)  dncColor = Color(233, 255, 253, 30);  // Midday
+        else                            dncColor = Color(255, 178, 127, 50);  // Evening
         drawOverlay(window, dnc, dncColor);
         if (raining) drawOverlay(window, dnc, rainOverlayColor);
-        if (t >= 21 || t < 6) drawCampfireGlow(window, worldView, fire, frameCount);
-        if (t >= 21 || t < 6) drawHouseLights(window, worldView, houseshapes);
+        if (isNightHour(t)) drawCampfireGlow(window, worldView, fire, frameCount);
+        if (isNightHour(t)) drawHouseLights(window, worldView, houseshapes);
         drawBallots(window, worldView, zoom, barbs, squares); // above the overlays so the pips read true; under hover marks
         if (ballotFramesLeft > 0 && !paused) ballotFramesLeft--;
         for (int k = 0; k < techCount; k++)
@@ -4014,7 +4026,7 @@ int main() {
             hv.houses = (int)houses.size();
             hv.hour = t;
             hv.speed = simSpeed;
-            hv.night = (t >= 21 || t < 6);
+            hv.night = isNightHour(t);
             hv.paused = paused;
             hv.raining = raining;
             hv.trader = !activeTrader ? "Away"
