@@ -168,7 +168,7 @@ const Vector2f wolfSize(5.0f, 3.0f);
 const Color wolfColor(150, 150, 160);      // cool mid grey: lighter than rocks, darker than birds, far from deer tan
 
 // Skittish deer: bolt away from a nearby barb for a short, capped time, then a cooldown so hunts can still land
-const int deerStepInterval = 3;            // ticks per 1px step while wandering
+const int deerStepInterval = 3;            // ticks per 1px step while wandering (deer row of speciesDefs)
 const int deerFleeStepInterval = 1;        // ticks per 1px step while fleeing (3x wander speed; barbs step every 10)
 const float deerFleeRadius = 20.0f;        // barb this close starts a flee (inside the 25px hunt pickup range)
 const float deerFleeRadiusSq = deerFleeRadius * deerFleeRadius;
@@ -252,20 +252,53 @@ const Color houseWindowDayColor(52, 54, 50);   // dark glass by day
 const Color houseWindowNightColor(240, 190, 95); // warm lamp, drawn after the night overlay
 const float houseWindowGlowPx = 1.0f;      // faint additive halo this far around a lit window
 const Color houseWindowGlowColor(90, 60, 20, 255); // additive, so this is a gentle warm lift
-// Deer sprite, offsets relative to the 6x3 logic shape (hitbox unchanged), written for a deer facing right
-const Vector2f deerHeadPos(5.0f, -1.0f);   // 2x2 head overhangs the front-top corner
-const Vector2f deerHeadSize(2.0f, 2.0f);
-const int deerAntlerPixels = 2;            // tiny swept-back tine above the back of the head
-const Vector2f deerAntlerPos[deerAntlerPixels] = {{5.0f, -2.0f}, {4.0f, -3.0f}};
-const int deerLegCount = 4;
-const float deerLegX[deerLegCount] = {0.0f, 1.0f, 4.0f, 5.0f}; // back pair, front pair
-const float deerLegPx = 2.0f;              // planted leg length below the body
-const float deerLegLiftedPx = 1.0f;        // lifted leg while walking
-const int deerLegFrames = 6;               // diagonal leg pairs swap every this many frames when moving
-const Color deerBodyColor(192, 133, 82);
-const Color deerHeadColor(176, 120, 74);   // a shade darker so the head reads against the body
-const Color deerLegColor(112, 78, 48);
-const Color deerAntlerColor(178, 162, 132); // dull bone
+// Game animals share the deer code (deers/deershape vectors); per-species numbers live in speciesDefs below.
+// Sprite offsets are relative to the logic shape (body = hitbox), written for an animal facing right.
+enum animalSpecies {speciesDeer, speciesRabbit, speciesCount};
+enum animalGait {gaitWalk, gaitHop};       // walk: diagonal leg pairs alternate; hop: whole sprite bobs up, back leg pushes off
+const int animalMaxLegs = 4;
+const int animalMaxAccent = 2;
+const int animalHitDamage = 5;             // health lost per barb hit (unchanged from deer-only hunting)
+const int animalHitInvincibleTicks = 60;   // ticks of invulnerability after a hit
+const int animalHitFlashTicks = 10;        // red flash for the first this-many invincible ticks
+struct speciesDef {
+    const char* name;          // tooltip, logs
+    Vector2f bodySize;         // logic hitbox and drawn body
+    int maxHealth;
+    int foodYield;             // food added when barbs kill one (wolf kills give none)
+    int cap;                   // max alive of this species
+    int arriveOneIn;           // 1-in-N per tick one walks in from a side edge
+    int breedOneIn;            // 1-in-N per tick (with 2+ alive) a new one is born beside a random adult; 0 = never
+    int stepInterval;          // ticks per 1px step while wandering
+    int fleeStepInterval;      // ticks per 1px step while fleeing
+    animalGait gait;
+    int legFrames;             // frames per gait half cycle
+    int legCount;
+    float legX[animalMaxLegs]; // back legs first
+    float legPx;               // planted leg length below the body
+    float legLiftedPx;         // walk gait: lifted leg length
+    float hopPx;               // hop gait: how far the sprite rises mid-hop
+    Vector2f headPos, headSize;
+    int accentPixels;          // deer antler tine / rabbit ear, 1x1 pixels
+    Vector2f accentPos[animalMaxAccent];
+    int tailPixels;            // 0 or 1
+    Vector2f tailPos;
+    Color body, head, leg, accent, tail;
+};
+const speciesDef speciesDefs[speciesCount] = {
+    // Deer: 6x3, 2x2 head overhangs the front-top corner, tiny swept-back tine above the back of the head
+    {"Deer", {6.0f, 3.0f}, 100, 2, 10, 101, 0, deerStepInterval, deerFleeStepInterval,
+     gaitWalk, 6, 4, {0.0f, 1.0f, 4.0f, 5.0f}, 2.0f, 1.0f, 0.0f,
+     {5.0f, -1.0f}, {2.0f, 2.0f}, 2, {{5.0f, -2.0f}, {4.0f, -3.0f}}, 0, {0.0f, 0.0f},
+     Color(192, 133, 82), Color(176, 120, 74), Color(112, 78, 48), Color(178, 162, 132), Color(0, 0, 0)},
+    // Rabbit: 4x2 pale sandy body (much lighter than deer so it pops on dark green), 1x2 ear, white scut.
+    // Fragile (3 hits) and only 1 food, but breeds fast up to a larger cap.
+    {"Rabbit", {4.0f, 2.0f}, 15, 1, 12, 1800, 1200, 2, 1,
+     gaitHop, 8, 2, {0.0f, 3.0f, 0.0f, 0.0f}, 1.0f, 1.0f, 1.0f,
+     {3.0f, -1.0f}, {2.0f, 2.0f}, 2, {{3.0f, -2.0f}, {3.0f, -3.0f}}, 1, {-1.0f, 0.0f},
+     Color(216, 194, 150), Color(200, 178, 136), Color(138, 112, 80), Color(176, 136, 118), Color(244, 242, 234)},
+};
+const float rabbitBirthOffsetPx = 5.0f;    // kit appears this far beside its parent
 
 // Campfire at villageCenter: burns wood slowly, glows at night (cosmetic only, no barb behaviour yet)
 const int campfireTicksPerWood = 18000;    // 1 wood per ~5 min at 1x (12 per in-game hour): a sliver of one chopper's output
@@ -385,7 +418,6 @@ uniform_int_distribution<int> buildSpotDX(-250, 250); //-25, 25
 uniform_int_distribution<int> buildSpotDY(-250, 250); //-25, 25
 uniform_int_distribution<int> DeerSpawnY(20, 780); 
 uniform_int_distribution<int> DeerSpawnRL(0, 1);
-uniform_int_distribution<int> DeerSpawnChance(0, 100);
 uniform_int_distribution<int> DeerSpawnXgotoL(20, 100);
 uniform_int_distribution<int> DeerSpawnXgotoR(700, 780);
 
@@ -500,7 +532,8 @@ struct barb {
 const raceDef& raceOf(const barb& b) { return raceDefs[b.race]; }
 int mineTicks(const barb& b) { return (int)(rockMineTicks / raceOf(b).mineSpeed); }
 
-struct deer {
+struct deer {            // any game animal; species picks its row in speciesDefs
+animalSpecies species = speciesDeer;
 int x, y;
 int id = -1;
 int health = 100;
@@ -514,6 +547,14 @@ int fleeCooldown = 0;
 };
 
 int nextDeerId = 0;
+
+const speciesDef& speciesOf(const deer& d) { return speciesDefs[d.species]; }
+
+int countSpecies(const vector<deer>& deers, animalSpecies s) {
+	int n = 0;
+	for (auto& d : deers) if (d.species == s) n++;
+	return n;
+}
 
 struct trader {
     enum Phase {Arriving, Trading, Leaving} phase = Arriving;
@@ -661,11 +702,12 @@ void deerkilling(vector<deer>& deers, vector<RectangleShape>& deershape, vector<
 		auto& ds = deershape[i];
 		auto& d = deers[i];
 		Vector2f deerpos = ds.getPosition();
+		const speciesDef& sp = speciesOf(d);
 		if (d.invincible) {
-			ds.setFillColor(d.invincibleTimer > 50 ? Color::Red : Color(192, 133, 82));
+			ds.setFillColor(d.invincibleTimer > animalHitInvincibleTicks - animalHitFlashTicks ? Color::Red : sp.body);
 			if (--d.invincibleTimer <= 0) {
 				d.invincible = false;
-				ds.setFillColor(Color(192, 133, 82));
+				ds.setFillColor(sp.body);
 			}
 		}
 		bool removed = false;
@@ -686,18 +728,20 @@ void deerkilling(vector<deer>& deers, vector<RectangleShape>& deershape, vector<
 			b.targety = (int)deerpos.y;
 			b.moving = true;
 			if (!d.invincible && sq.getGlobalBounds().findIntersection(ds.getGlobalBounds()).has_value()) {
-				d.health -= 5;
+				d.health -= animalHitDamage;
 				d.invincible = true;
-				d.invincibleTimer = 60;
+				d.invincibleTimer = animalHitInvincibleTicks;
 				ds.setFillColor(Color::Red);
-				printf("Deer Health: %d\n", d.health);
+				printf("%s Health: %d\n", sp.name, d.health);
 				if (d.health <= 0) {
+					const char* name = sp.name;   // sp stays valid (table row); d and ds do not
+					int yield = sp.foodYield;
 					swapRemove(deers, i);      // d and ds are invalid from here on
 					swapRemove(deershape, i);
 					removed = true;
-					food++;
-					printf("DEER KILLED - Food: %d\n", food);
-					logEvent("Deer killed (food " + to_string(food) + ")");
+					food += yield;
+					printf("%s KILLED - Food: %d (+%d)\n", name, food, yield);
+					logEvent(string(name) + " killed (+" + to_string(yield) + " food, " + to_string(food) + ")");
 					break;
 				}
 			}
@@ -713,7 +757,8 @@ void deerkilling(vector<deer>& deers, vector<RectangleShape>& deershape, vector<
 // Wolves enter from an edge, chase the nearest deer and kill it on contact (no food). After one kill,
 // or once deer are scarce (<= wolfMinDeer), they walk back out, so they can never wipe the deer out.
 void wolfTick(vector<wolf>& wolves, vector<deer>& deers, vector<RectangleShape>& deershape, vector<barb>& barbs) {
-	if ((int)wolves.size() < maxWolves && (int)deers.size() > wolfMinDeer
+	int deerCount = countSpecies(deers, speciesDeer);   // only deer count: rabbits are never wolf prey
+	if ((int)wolves.size() < maxWolves && deerCount > wolfMinDeer
 	    && uniform_int_distribution<int>(0, wolfSpawnChance - 1)(gen) == 0) {
 		wolf w;
 		float along = (float)clamp(distrib(gen), 20, 780);
@@ -732,21 +777,22 @@ void wolfTick(vector<wolf>& wolves, vector<deer>& deers, vector<RectangleShape>&
 	for (int i = 0; i < (int)wolves.size(); ) {
 		wolf& w = wolves[i];
 		Vector2f pos = w.shape.getPosition();
-		if (w.phase == wolf::Hunting && (int)deers.size() <= wolfMinDeer) w.phase = wolf::Leaving;
+		if (w.phase == wolf::Hunting && deerCount <= wolfMinDeer) w.phase = wolf::Leaving;
 		Vector2f goal = w.exit;
 		int prey = -1;
 		if (w.phase == wolf::Hunting) {
 			prey = findNearest(pos, noSearchRadius, (int)deershape.size(),
 			                   [&](int k) { return deershape[k].getPosition(); },
-			                   [](int) { return false; });
+			                   [&](int k) { return deers[k].species != speciesDeer; });
 			if (prey != -1) goal = deershape[prey].getPosition();
 		}
 		if (prey != -1 && w.shape.getGlobalBounds().findIntersection(deershape[prey].getGlobalBounds()).has_value()) {
 			swapRemove(deers, prey);
 			swapRemove(deershape, prey);
 			validateDeerTargets(barbs, deers);   // no barb keeps hunting the dead deer
+			deerCount--;
 			w.phase = wolf::Leaving;
-			printf("Wolf killed a deer - deer left: %zu\n", deers.size());
+			printf("Wolf killed a deer - deer left: %d\n", deerCount);
 			logEvent("Wolf killed a deer");
 			++i;
 			continue;
@@ -765,29 +811,53 @@ void wolfTick(vector<wolf>& wolves, vector<deer>& deers, vector<RectangleShape>&
 	}
 }
 
-void deerspawn(vector<deer>& deers, vector<RectangleShape>& deershape) {
-	if (deers.size() >= 10) return;
-	deer d;
-	if (DeerSpawnChance(gen) != 0) return;
+// Pushes one animal onto deers and its shape onto deershape together (same index)
+void addAnimal(vector<deer>& deers, vector<RectangleShape>& deershape, deer d) {
+	const speciesDef& sp = speciesOf(d);
 	d.id = nextDeerId++;
-	if (DeerSpawnRL(gen) == 0) {
-		d.x = -20;
-		d.targetx = DeerSpawnXgotoL(gen); 
-	} else {
-		d.x = 820;
-		d.targetx = DeerSpawnXgotoR(gen);
-	}
-	d.y = DeerSpawnY(gen);
-	d.targety = d.y;
-	d.moving  = true;
+	d.health = sp.maxHealth;
 	deers.push_back(d);
 	RectangleShape ds;
 	ds.setPosition(Vector2f(d.x, d.y));
-	ds.setSize(Vector2f(6, 3));
-	FloatRect deerHitbox = ds.getGlobalBounds();
-	ds.setFillColor(Color(192, 133, 82));
+	ds.setSize(sp.bodySize);
+	ds.setFillColor(sp.body);
 	deershape.push_back(ds);
-	printf("%zu\n", deers.size());
+}
+
+// Each species walks in from a side edge under its own cap; species with a breed rate also multiply in place
+void deerspawn(vector<deer>& deers, vector<RectangleShape>& deershape) {
+	for (int s = 0; s < speciesCount; s++) {
+		const speciesDef& sp = speciesDefs[s];
+		int n = countSpecies(deers, (animalSpecies)s);
+		if (n >= sp.cap) continue;
+		deer d;
+		d.species = (animalSpecies)s;
+		if (uniform_int_distribution<int>(0, sp.arriveOneIn - 1)(gen) == 0) {
+			if (DeerSpawnRL(gen) == 0) {
+				d.x = -20;
+				d.targetx = DeerSpawnXgotoL(gen);
+			} else {
+				d.x = 820;
+				d.targetx = DeerSpawnXgotoR(gen);
+			}
+			d.y = DeerSpawnY(gen);
+			d.targety = d.y;
+			d.moving  = true;
+			addAnimal(deers, deershape, d);
+			printf("%s arrived - %d now\n", sp.name, n + 1);
+		} else if (sp.breedOneIn > 0 && n >= 2 && uniform_int_distribution<int>(0, sp.breedOneIn - 1)(gen) == 0) {
+			int pick = uniform_int_distribution<int>(0, n - 1)(gen);
+			int parent = -1;
+			for (int k = 0; k < (int)deers.size(); k++)
+				if (deers[k].species == s && pick-- == 0) { parent = k; break; }
+			Vector2f p = deershape[parent].getPosition();
+			float side = uniform_int_distribution<int>(0, 1)(gen) == 0 ? -rabbitBirthOffsetPx : rabbitBirthOffsetPx;
+			d.x = (int)clamp(p.x + side, 0.0f, worldSize - sp.bodySize.x);
+			d.y = (int)p.y;
+			addAnimal(deers, deershape, d);
+			printf("%s born - %d now\n", sp.name, n + 1);
+		}
+	}
 }
 
 // Ends a flee and starts its cooldown; the deer goes back to normal wandering from where it stopped
@@ -826,13 +896,13 @@ void deerwander(vector<RectangleShape>& deershape, vector<deer>& deers, const ve
                 Vector2f size = ds.getSize();
                 Vector2f goal = pos + dir * deerFleeDistance;
                 goal.x = clamp(goal.x, deerFleeEdgeMargin, worldSize - size.x - deerFleeEdgeMargin);
-                goal.y = clamp(goal.y, hudBarHeight + deerFleeEdgeMargin, worldSize - size.y - deerLegPx - deerFleeEdgeMargin);
+                goal.y = clamp(goal.y, hudBarHeight + deerFleeEdgeMargin, worldSize - size.y - speciesOf(d).legPx - deerFleeEdgeMargin);
                 d.targetx = (int)goal.x;
                 d.targety = (int)goal.y;
                 d.moving = true;
                 d.stepTimer = 0;
                 d.fleeTimer = deerFleeTicks;
-                printf("Deer %d fleeing\n", d.id);
+                printf("%s %d fleeing\n", speciesOf(d).name, d.id);
             }
         }
         if (!d.moving) {
@@ -851,7 +921,7 @@ void deerwander(vector<RectangleShape>& deershape, vector<deer>& deers, const ve
                 if (d.fleeTimer > 0) endFlee(d);   // reached safety early: flee over, cooldown starts
                 d.moving    = false;
                 d.stepTimer = 0;
-            } else if (++d.stepTimer >= (d.fleeTimer > 0 ? deerFleeStepInterval : deerStepInterval)) {
+            } else if (++d.stepTimer >= (d.fleeTimer > 0 ? speciesOf(d).fleeStepInterval : speciesOf(d).stepInterval)) {
                 d.stepTimer = 0;
                 ds.move(diff / sqrt(dSq));
 		ds.getGlobalBounds();
@@ -1174,40 +1244,51 @@ void drawHouseLights(RenderWindow& window, const View& worldView, const vector<R
     }
 }
 
-// Deer with head, antler and legs over the unchanged 6x3 hitbox. Facing and leg swap come from existing state + frame.
+// Game animals (deer, rabbit) from speciesDefs: legs, tail, body = hitbox, head, accent pixels. Facing and gait come from state + frame.
 void drawDeer(RenderWindow& window, const vector<deer>& deers, const vector<RectangleShape>& deershape, int frame) {
     RectangleShape r;
     for (int i = 0; i < (int)deershape.size() && i < (int)deers.size(); i++) {
         const deer& d = deers[i];
+        const speciesDef& sp = speciesOf(d);
         const RectangleShape& ds = deershape[i];
         Vector2f o = snapPx(ds.getPosition());
         float bw = ds.getSize().x, bh = ds.getSize().y;
         bool left = d.moving ? d.targetx < ds.getPosition().x : d.id % 2 == 1;
+        Color body = ds.getFillColor();                  // keeps the red hit flash from deerkilling
+        bool flashing = body != sp.body;
+
+        int legPhase = ((frame + d.id * 4) / sp.legFrames) % 2;
+        float rise = (sp.gait == gaitHop && d.moving && legPhase == 1) ? sp.hopPx : 0.0f; // mid-hop: sprite lifts
+        o.y -= rise;
         // mirror a right-facing x offset (and width) across the body
         auto at = [&](Vector2f p, float w) { return o + Vector2f(left ? bw - p.x - w : p.x, p.y); };
-        Color body = ds.getFillColor();                  // keeps the red hit flash from deerkilling
-        bool flashing = body != deerBodyColor;
-
-        int legPhase = ((frame + d.id * 4) / deerLegFrames) % 2;
-        r.setFillColor(deerLegColor);
-        for (int k = 0; k < deerLegCount; k++) {
-            bool lifted = d.moving && (k % 2) == legPhase; // diagonal pairs (0+2, 1+3) alternate
-            r.setSize(Vector2f(1.0f, lifted ? deerLegLiftedPx : deerLegPx));
-            r.setPosition(at(Vector2f(deerLegX[k], bh), 1.0f));
+        r.setFillColor(sp.leg);
+        for (int k = 0; k < sp.legCount; k++) {
+            float len = sp.legPx;
+            if (sp.gait == gaitWalk && d.moving && (k % 2) == legPhase) len = sp.legLiftedPx; // diagonal pairs (0+2, 1+3) alternate
+            if (sp.gait == gaitHop && k == 0) len += rise;  // back leg stays on the ground pushing off; front leg tucks
+            r.setSize(Vector2f(1.0f, len));
+            r.setPosition(at(Vector2f(sp.legX[k], bh), 1.0f));
+            window.draw(r);
+        }
+        r.setSize(Vector2f(1.0f, 1.0f));
+        r.setFillColor(sp.tail);
+        for (int k = 0; k < sp.tailPixels; k++) {
+            r.setPosition(at(sp.tailPos, 1.0f));
             window.draw(r);
         }
         r.setSize(Vector2f(bw, bh));
         r.setPosition(o);
         r.setFillColor(body);
         window.draw(r);
-        r.setSize(deerHeadSize);
-        r.setPosition(at(deerHeadPos, deerHeadSize.x));
-        r.setFillColor(flashing ? body : deerHeadColor);
+        r.setSize(sp.headSize);
+        r.setPosition(at(sp.headPos, sp.headSize.x));
+        r.setFillColor(flashing ? body : sp.head);
         window.draw(r);
         r.setSize(Vector2f(1.0f, 1.0f));
-        r.setFillColor(deerAntlerColor);
-        for (int k = 0; k < deerAntlerPixels; k++) {
-            r.setPosition(at(deerAntlerPos[k], 1.0f));
+        r.setFillColor(sp.accent);
+        for (int k = 0; k < sp.accentPixels; k++) {
+            r.setPosition(at(sp.accentPos[k], 1.0f));
             window.draw(r);
         }
     }
@@ -1306,7 +1387,7 @@ optional<hoverHit> pickHover(Vector2f p, float radius, const vector<barb>& barbs
     for (auto& w : wolves)
         if (near(w.shape)) return hoverHit{w.phase == wolf::Hunting ? "Wolf: hunting" : "Wolf: leaving", w.shape, nullopt};
     for (int i = 0; i < (int)deershape.size() && i < (int)deers.size(); i++)
-        if (near(deershape[i])) return hoverHit{"Deer " + to_string(deers[i].health) + "hp", deershape[i], nullopt};
+        if (near(deershape[i])) return hoverHit{string(speciesOf(deers[i]).name) + " " + to_string(deers[i].health) + "hp", deershape[i], nullopt};
     for (int i = 0; i < (int)octs.size() && i < (int)rocks.size(); i++)
         if (near(octs[i])) return hoverHit{rocks[i].dying ? "Rock: being mined" : "Rock", nullopt, rockDrawShape(octs[i])};
     for (int i = 0; i < (int)bushshapes.size() && i < (int)bushes.size(); i++)
