@@ -418,9 +418,40 @@ const float fishRingThickness = 1.0f;
 const Color fishRingColor(190, 235, 235);  // pale cyan ripple on the water
 const uint8_t fishRingMaxAlpha = 150;      // fades linearly to 0
 
+// Single-plot farming (R19-F3): one 8x8 wheat plot near the campfire, sown once by an idle barb, then regrows forever.
+// Ripe is derived from growth (no stored flag); no scarecrow. The harvest shares harvestTick() with berry picking.
+const Vector2f fieldSize(8.0f, 8.0f);
+const float fieldBorderPx = 1.0f;          // gold frame drawn outside the soil (10x10 overall)
+const int fieldWoodCost = 6;               // cheap: fences and a hoe
+const int fieldMinHouses = 1;              // the first home comes before the field
+const int fieldBuildTicks = 600;           // same work as a house
+const int fieldGrowTicks = 10800;          // ~3 min from sowing to ripe at 1x (3 growing stages of ~1 min each)
+const int fieldGrowStages = 3;
+const int fieldHarvestTicks = 240;         // ~4s to reap
+const int fieldFoodYield = 2;
+const float fieldSearchRadius = 60.0f;     // like angling: one plot, so idle barbs look a bit farther for it
+const float fieldMinRadius = 20.0f;        // plot centre ring around the campfire, inside the 50px tree clearing
+const float fieldMaxRadius = 36.0f;
+const int fieldPlaceTries = 20;            // per tick until a spot is found
+const float fieldClearPx = 3.0f;           // houses, shrines and trees keep this far from the plot and its stand spot
+const Vector2f fieldStandOffset(3.0f, 10.0f); // builder/harvester hitbox top-left relative to the soil: just below the frame
+const float fieldZoneBelowPx = 6.0f;       // reserved below the stand spot's top: the tallest barb body (5) + 1
+const Color fieldSoilColor(110, 80, 45);
+const Color fieldBorderColor(178, 148, 62);   // muted straw gold: darker than the ripe heads and the hover outline
+const Color fieldSproutColor(104, 150, 66);   // yellow-green, lighter and warmer than every pine
+const Color fieldStalkColor(118, 156, 70);
+const Color fieldHeadColor(196, 178, 84);     // yellowing heads (stage 3)
+const Color fieldRipeColor(236, 192, 60);     // bright gold heads
+const float fieldRipeStalkShade = 0.72f;      // ripe stalk rows: darker gold so the rows still read apart
+const Color fieldBobColor(250, 226, 130);     // single pale-gold ear bobbing above a ripe plot
+const int fieldBobFrames = 30;                // 1px up/down every ~0.5s
+const Color barbHarvestColor(235, 205, 85);   // harvest stripe: gold, clear of mine orange and the other task colours
+const Color fieldBarColor(200, 165, 70);      // muted gold harvest progress bar
+const int bushFoodYield = 1;                  // food per picked bush (shared harvest path)
+
 // Build jobs: which structure a barb's movingbspot/building belongs to. jobNone = no job, or a house (buildhouse()).
-enum buildJob {jobNone, jobShrine, jobSmoke, jobStall, jobForge, buildJobCount};
-const int buildJobTicks[buildJobCount] = {houseBuildTicks, shrineBuildTicks, smokehouseBuildTicks, stallBuildTicks, forgeBuildTicks};
+enum buildJob {jobNone, jobShrine, jobSmoke, jobStall, jobForge, jobField, buildJobCount};
+const int buildJobTicks[buildJobCount] = {houseBuildTicks, shrineBuildTicks, smokehouseBuildTicks, stallBuildTicks, forgeBuildTicks, fieldBuildTicks};
 // Game animals share the deer code (deers/deershape vectors); per-species numbers live in speciesDefs below.
 // Sprite offsets are relative to the logic shape (body = hitbox), written for an animal facing right.
 enum animalSpecies {speciesDeer, speciesRabbit, speciesCount};
@@ -689,7 +720,36 @@ bool forgeClear(const FloatRect& r) {
     return !r.findIntersection(zone).has_value();
 }
 
-vector<FloatRect> lakes;          // water rects, fixed after spawnLakes()
+// The one wheat plot (R19-F3). rect/shape are set once the spot is chosen; growth counts up to fieldGrowTicks once sown.
+struct plot {
+    bool placed = false;    // spot chosen and reserved (houses/shrines/trees avoid it from then on)
+    bool claimed = false;   // a barb holds jobField (sowing)
+    bool built = false;     // sown: wheat grows
+    FloatRect rect;         // soil, 8x8
+    RectangleShape shape;   // soil fill + gold outline frame
+    int growth = 0;
+};
+
+bool fieldRipe(const plot& fp) { return fp.built && fp.growth >= fieldGrowTicks; }
+
+// 0..2 growing stages, fieldGrowStages = ripe
+int fieldStage(const plot& fp) { return fieldRipe(fp) ? fieldGrowStages : fp.growth * fieldGrowStages / fieldGrowTicks; }
+
+Vector2f fieldWorkSpot(const plot& fp) { return fp.rect.position + fieldStandOffset; }
+
+// Soil + frame + the stand spot below it, padded by fieldClearPx
+FloatRect fieldZone(Vector2f pos) {
+    float pad = fieldBorderPx + fieldClearPx;
+    return FloatRect(pos - Vector2f(pad, pad),
+                     Vector2f(fieldSize.x + 2 * pad, fieldStandOffset.y + fieldZoneBelowPx + fieldClearPx + pad));
+}
+
+// False if r touches the reserved plot zone (always true before a spot is chosen)
+bool fieldClear(const plot& fp, const FloatRect& r) {
+    return !fp.placed || !r.findIntersection(fieldZone(fp.rect.position)).has_value();
+}
+
+vector<FloatRect> lakes;         // water rects, fixed after spawnLakes()
 vector<Vector2f> shorePoints;     // 1px spots just outside each lake's rim at its edge midpoints (cached for angling, R19-F1)
 
 // True if segment a->b touches box (slab test). Pure geometry, used only by lakeClear().
@@ -724,7 +784,7 @@ bool lakeClear(const FloatRect& r, const Vector2f* pathFrom = nullptr) {
 }
 
 // Work target of a barb. targetNone with a set targetx is a tree (or a hunt/wander/build spot, which own their flags).
-enum targetKind {targetNone, targetBush, targetRock, targetLake};
+enum targetKind {targetNone, targetBush, targetRock, targetLake, targetField};
 
 struct barb {
     int id = -1;                // stable, unique; assigned only by makeBarb()
@@ -883,11 +943,12 @@ void swapRemove(vector<T>& v, int i) {
     v.pop_back();
 }
 
-// Priority when flags overlap: hunting > building > picking > fishing > mining > chopping > idle
+// Priority when flags overlap: hunting > building > picking > harvesting > fishing > mining > chopping > idle
 Color barbColor(const barb& b) {
     if (b.deertargeting) return barbHuntColor;
     if (b.building) return barbBuildColor;
     if (b.chopping && b.target == targetBush) return barbPickColor;
+    if (b.chopping && b.target == targetField) return barbHarvestColor;
     if (b.chopping && b.target == targetLake) return barbFishColor;
     if (b.chopping && b.target == targetRock) return barbMineColor;
     if (b.chopping) return barbChopColor;
@@ -899,6 +960,7 @@ const char* barbTaskName(const barb& b) {
     if (b.deertargeting) return "hunting";
     if (b.building) return "building";
     if (b.chopping && b.target == targetBush) return "picking";
+    if (b.chopping && b.target == targetField) return "harvesting";
     if (b.chopping && b.target == targetLake) return "fishing";
     if (b.chopping && b.target == targetRock) return "mining";
     if (b.chopping) return "chopping";
@@ -1471,7 +1533,7 @@ void drawBarbs(RenderWindow& window, const vector<barb>& barbs, const vector<Rec
                 tool.setPosition(f.hand + f.step * (float)k);
                 window.draw(tool);
             }
-        } else if (b.chopping && b.target == targetBush) {
+        } else if (b.chopping && (b.target == targetBush || b.target == targetField)) {   // pick / reap: same arm dip
             bool dip = (phase / barbPickFrames) % 2 == 1;
             tool.setPosition(Vector2f(side, dip ? feet - barbToolSize.y : bodyTop + 1.0f));
             window.draw(tool);
@@ -1950,18 +2012,19 @@ void drawCampfireGlow(RenderWindow& window, const View& worldView, const campfir
     }
 }
 
-void buildhouse(vector<barb>& barbs,vector<RectangleShape>& squares, vector<house>& houses, vector<RectangleShape>& houseshapes) {
+void buildhouse(vector<barb>& barbs,vector<RectangleShape>& squares, vector<house>& houses, vector<RectangleShape>& houseshapes, const plot& fp) {
     bool canclaim = (int)houses.size() < (int)barbs.size();
     for (int i = 0; i < (int)squares.size(); i++) {
         auto& sq = squares[i];
         auto& b  = barbs[i];
-        if (b.jobKind != jobNone) continue;   // buildshrine() / buildsmokehouse() / buildstall() / buildforge() own this barb
+        if (b.jobKind != jobNone) continue;   // buildshrine() / buildsmokehouse() / buildstall() / buildforge() / buildfield() own this barb
         if (b.chopping || (b.timer > 0 && !b.building)) continue;
         if (!b.movingbspot && !b.moving) {
             if (!canclaim || wood < houseWoodCost) continue;
             int tx = 400 + buildSpotDX(gen), ty = 400 + buildSpotDY(gen);
             if (!forgeClear(FloatRect(Vector2f(tx - 3.0f, ty - 3.0f), houseSlabSize))) continue; // house + roof + slab; reroll next tick
             if (!lakeClear(FloatRect(Vector2f(tx - 3.0f, ty - 3.0f), houseSlabSize))) continue;  // same footprint, no houses in the water
+            if (!fieldClear(fp, FloatRect(Vector2f(tx - 3.0f, ty - 3.0f), houseSlabSize))) continue; // nor on the wheat plot
             wood -= houseWoodCost;
             b.reservedwood = true;
             b.reservedstone = stone >= houseStoneCost ? houseStoneCost : 0; // 0 stone -> plain house
@@ -2028,7 +2091,7 @@ int findShrineById(const vector<shrine>& shrines, int id) {
 
 // Runs after buildhouse(), so a barb free for a house this tick takes the house first.
 // Only spends stone above a house foundation's worth, and only once housing is ahead of the shrine count.
-void buildshrine(vector<barb>& barbs, vector<RectangleShape>& squares, const vector<house>& houses, vector<shrine>& shrines) {
+void buildshrine(vector<barb>& barbs, vector<RectangleShape>& squares, const vector<house>& houses, vector<shrine>& shrines, const plot& fp) {
     int pending = 0;
     for (auto& b : barbs) if (b.jobKind == jobShrine) pending++;
     int planned = (int)shrines.size() + pending;
@@ -2061,6 +2124,7 @@ void buildshrine(vector<barb>& barbs, vector<RectangleShape>& squares, const vec
                 if (stoneRect.findIntersection(hutClear).has_value()) found = false; // keep the smokehouse spot free
                 if (!forgeClear(stoneRect)) found = false;                          // and the forge spot
                 if (!lakeClear(stoneRect)) found = false;
+                if (!fieldClear(fp, stoneRect)) found = false;
                 for (auto& o : barbs) {
                     if (o.jobKind != jobShrine) continue;
                     Vector2f d = p - shrineSlabPos(o.targetx, o.targety);
@@ -2339,6 +2403,125 @@ void drawStall(RenderWindow& window, const optional<trader>& tr) {
     }
 }
 
+// Picks the plot spot once, in a ring around the campfire: clear of the forge, lakes, campfire, smokehouse, stall,
+// houses and shrines (standing or claimed), and startup trees/rocks. Reserved from then on via fieldClear().
+bool placeField(plot& fp, const vector<barb>& barbs, const vector<house>& houses, const vector<shrine>& shrines,
+                const vector<CircleShape>& tris, const vector<CircleShape>& octs) {
+    uniform_real_distribution<float> ang(0.0f, 6.2831853f), rad(fieldMinRadius, fieldMaxRadius);
+    float fireR = campfireStoneRadius + 1.0f;
+    FloatRect fire(villageCenter - Vector2f(fireR, fireR), Vector2f(2 * fireR, 2 * fireR));
+    FloatRect hut(smokehousePos + smokehouseChimneyPos - Vector2f(smokehouseClearPx, smokehouseClearPx),
+                  Vector2f(smokehouseSize.x, smokehouseSize.y - smokehouseChimneyPos.y) + Vector2f(2 * smokehouseClearPx, 2 * smokehouseClearPx));
+    FloatRect stall(stallPos + Vector2f(stallStandOffset.x, 0.0f), stallSize + Vector2f(-stallStandOffset.x, fieldZoneBelowPx)); // incl. stand spot
+    for (int k = 0; k < fieldPlaceTries; k++) {
+        float a = ang(gen), r = rad(gen);
+        Vector2f pos(round(villageCenter.x + cos(a) * r - fieldSize.x / 2), round(villageCenter.y + sin(a) * r - fieldSize.y / 2));
+        FloatRect zone = fieldZone(pos);
+        if (!forgeClear(zone) || !lakeClear(zone)) continue;
+        bool ok = !zone.findIntersection(fire) && !zone.findIntersection(hut) && !zone.findIntersection(stall);
+        for (int i = 0; ok && i < (int)houses.size(); i++)
+            if (zone.findIntersection(FloatRect(Vector2f(houses[i].x - 3.0f, houses[i].y - 3.0f), houseSlabSize))) ok = false;
+        for (auto& b : barbs) {   // houses and shrines still being walked to / built
+            if (!ok) break;
+            if (b.movingbspot && b.jobKind == jobNone
+                && zone.findIntersection(FloatRect(Vector2f(b.targetx - 3.0f, b.targety - 3.0f), houseSlabSize))) ok = false;
+            if (b.jobKind == jobShrine
+                && zone.findIntersection(FloatRect(shrineSlabPos(b.targetx, b.targety) - Vector2f(0.0f, shrineCapH), shrineSlabSize + Vector2f(0.0f, shrineCapH)))) ok = false;
+        }
+        for (auto& s : shrines)
+            if (ok && zone.findIntersection(FloatRect(Vector2f((float)s.x, (float)s.y - shrineCapH), shrineSlabSize + Vector2f(0.0f, shrineCapH)))) ok = false;
+        for (int i = 0; ok && i < (int)tris.size(); i++)
+            if (zone.findIntersection(FloatRect(tris[i].getPosition(), Vector2f(treeFootprint, treeFootprint)))) ok = false;
+        for (int i = 0; ok && i < (int)octs.size(); i++)
+            if (zone.findIntersection(octs[i].getGlobalBounds())) ok = false;
+        if (!ok) continue;
+        fp.placed = true;
+        fp.rect = FloatRect(pos, fieldSize);
+        fp.shape.setSize(fieldSize);
+        fp.shape.setPosition(pos);
+        fp.shape.setFillColor(fieldSoilColor);
+        fp.shape.setOutlineColor(fieldBorderColor);
+        fp.shape.setOutlineThickness(fieldBorderPx);
+        printf("FIELD SPOT chosen at %d,%d\n", (int)pos.x, (int)pos.y);
+        return true;
+    }
+    return false;
+}
+
+// Runs after buildforge(). One sowing ever: an idle barb takes jobField through buildOneOff(), which clears it on completion.
+// If the sower is lost before finishing (no barb holds jobField), the claim is released so another idle barb can take it.
+void buildfield(vector<barb>& barbs, vector<RectangleShape>& squares, const vector<house>& houses, const vector<shrine>& shrines,
+                const vector<CircleShape>& tris, const vector<CircleShape>& octs, plot& fp) {
+    if (fp.built) return;
+    if (fp.claimed) {
+        bool held = false;
+        for (auto& b : barbs) if (b.jobKind == jobField) held = true;
+        if (!held) fp.claimed = false;
+    }
+    if (!fp.placed) {
+        if ((int)houses.size() < fieldMinHouses || wood < fieldWoodCost) return;
+        if (!placeField(fp, barbs, houses, shrines, tris, octs)) return;
+    }
+    bool done = buildOneOff(barbs, squares, fp.claimed, jobField, fieldWorkSpot(fp), "FIELD",
+        [&](const barb&) {
+            if ((int)houses.size() < fieldMinHouses || wood < fieldWoodCost) return -1;
+            wood -= fieldWoodCost;
+            return 1;
+        });
+    if (!done) return;
+    fp.built = true;
+    fp.claimed = false;
+    fp.growth = 0;
+    printf("---FIELD SOWN--- ripe in %d ticks, +%d food per harvest\n", fieldGrowTicks, fieldFoodYield);
+    logEvent("Wheat field sown");
+}
+
+void fieldTick(plot& fp) {
+    if (fp.built && fp.growth < fieldGrowTicks) {
+        fp.growth++;
+        if (fp.growth == fieldGrowTicks) printf("WHEAT RIPE\n");
+    }
+}
+
+// Soil with a 1px gold frame; inside, three 6px crop rows (1px soil margin all round). Stalks sit on y = 2/4/6,
+// heads on y = 1/3/5. Sprouts -> green rows -> yellowing heads -> ripe gold with one ear bobbing above the frame.
+// Drawn with the village structures, under barbs and trees.
+void drawField(RenderWindow& window, const plot& fp, int frame) {
+    if (!fp.built) return;
+    drawSnapped(window, fp.shape);
+    Vector2f o = snapPx(fp.rect.position);
+    int stage = fieldStage(fp);
+    const float rowW = fieldSize.x - 2.0f;
+    RectangleShape r;
+    for (int row = 0; row < 3; row++) {
+        float stalkY = 2.0f + 2.0f * row, headY = stalkY - 1.0f;
+        if (stage == 0) {                           // staggered 1px sprouts
+            r.setSize(Vector2f(1.0f, 1.0f));
+            r.setFillColor(fieldSproutColor);
+            for (float x = 1.0f + (row % 2); x < 1.0f + rowW; x += 2.0f) {
+                r.setPosition(o + Vector2f(x, stalkY));
+                window.draw(r);
+            }
+            continue;
+        }
+        bool ripe = stage == fieldGrowStages;
+        r.setSize(Vector2f(rowW, 1.0f));
+        r.setFillColor(ripe ? shade(fieldRipeColor, fieldRipeStalkShade) : fieldStalkColor);
+        r.setPosition(o + Vector2f(1.0f, stalkY));
+        window.draw(r);
+        if (stage == 1) continue;
+        r.setFillColor(ripe ? fieldRipeColor : fieldHeadColor);
+        r.setPosition(o + Vector2f(1.0f, headY));
+        window.draw(r);
+    }
+    if (stage != fieldGrowStages) return;
+    bool up = (frame / fieldBobFrames) % 2 == 0;    // derived from the frame and ripe state only
+    r.setSize(Vector2f(1.0f, 1.0f));
+    r.setFillColor(fieldBobColor);
+    r.setPosition(o + Vector2f(floor(fieldSize.x / 2), -fieldBorderPx - (up ? 3.0f : 2.0f)));
+    window.draw(r);
+}
+
 struct birthRing {Vector2f pos; int age = 0;};
 
 int nextBarbId = 0;
@@ -2560,7 +2743,7 @@ void buildWorkClaims(const vector<barb>& barbs, const vector<CircleShape>& tris,
     unordered_map<long long, int> treeSpots, rockSpots;
     for (int j = 0; j < (int)barbs.size(); j++) {
         const barb& b = barbs[j];
-        if (b.targetx == -1 || b.target == targetBush || b.target == targetLake || b.deertargeting || b.movingbspot || b.building) continue;
+        if (b.targetx == -1 || b.target == targetBush || b.target == targetLake || b.target == targetField || b.deertargeting || b.movingbspot || b.building) continue;
         (b.target == targetRock ? rockSpots : treeSpots).emplace(workSpotKey(b.targetx, b.targety), j); // first claimant kept
     }
     treeClaim.assign(tris.size(), -1);
@@ -2577,8 +2760,30 @@ void buildWorkClaims(const vector<barb>& barbs, const vector<CircleShape>& tris,
     }
 }
 
+// Every way out of a crop harvest (berry bush or wheat field) clears the same barb fields
+void clearHarvest(barb& b) {
+    b.moving = b.chopping = false;
+    b.timer = 0;
+    b.targetx = b.targety = -1;
+    b.target = targetNone;
+    b.targetBush = -1;
+}
+
+// Shared crop gathering for bushes and the field: once the barb stands within 2px of spot it works the crop.
+// On the finishing tick it adds yield food, clears the barb and returns true; the caller resets its own crop.
+bool harvestTick(barb& b, Vector2f spot, Vector2f bpos, int ticks, int yield) {
+    float dx = spot.x - bpos.x, dy = spot.y - bpos.y;
+    if (dx * dx + dy * dy >= 4.0f) return false;
+    b.chopping = true;
+    if (workTick(b)) b.timer++;
+    if (b.timer < ticks) return false;
+    food += yield;
+    clearHarvest(b);
+    return true;
+}
+
 void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<CircleShape>& tris, vector<RectangleShape>& stumps, vector<tree>& trees, vector<CircleShape>& octs, vector<rock>& rocks,
-                   vector<bush>& bushes, vector<CircleShape>& bushshapes, vector<birthRing>& catchRings) {
+                   vector<bush>& bushes, vector<CircleShape>& bushshapes, vector<birthRing>& catchRings, plot& fp) {
     vector<int> treeClaim, rockClaim;   // parallel to trees/tris and rocks/octs for this tick
     buildWorkClaims(barbs, tris, octs, treeClaim, rockClaim);
     vector<int> shoreClaim(shorePoints.size(), -1);   // rebuilt every tick like the tree/rock claims, so no stale anglers
@@ -2586,6 +2791,8 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
         int k = barbs[j].targetShore;
         if (barbs[j].target == targetLake && k >= 0 && k < (int)shoreClaim.size() && shoreClaim[k] == -1) shoreClaim[k] = j;
     }
+    bool fieldTaken = false;   // one reaper at a time, derived from targets every tick (no stored claim)
+    for (auto& o : barbs) if (o.target == targetField) fieldTaken = true;
     for (int j = 0; j < (int)squares.size(); j++) {
         auto& sq = squares[j];
         auto& b  = barbs[j];
@@ -2620,6 +2827,21 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
             bestIsRock = bestRock != -1 && rockScore < treeScore;
             bool bestIsBush = bestBush != -1 && bushScore < (bestIsRock ? rockScore : treeScore);
             int best = bestIsRock ? bestRock : bestTree;
+            // ripe wheat: weighted like berries (same food decree), wins only when strictly better than everything else
+            float fieldScore = notFound;
+            if (fieldRipe(fp) && !fieldTaken) {
+                Vector2f d = fieldWorkSpot(fp) - bpos;
+                float dSq = d.x * d.x + d.y * d.y;
+                if (dSq < fieldSearchRadius * fieldSearchRadius) fieldScore = dSq / (bushW * bushW);
+            }
+            if (fieldScore < min(min(treeScore, rockScore), bushScore) && b.moving==false) {
+                Vector2f wp = fieldWorkSpot(fp);
+                b.targetx = (int)wp.x;
+                b.targety = (int)wp.y;
+                b.moving  = true;   // later branches all need !moving, so nothing else claims this barb this tick
+                b.target = targetField;
+                fieldTaken = true;
+            }
             if (bestIsBush && b.moving==false) {
                 Vector2f wp = bushWorkSpot(bushshapes[bestBush]);
                 b.targetx = (int)wp.x;
@@ -2686,33 +2908,34 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
             }
             continue;
 	}
+	if (b.target == targetField) {
+            Vector2f wp = fieldWorkSpot(fp);
+            if (!fp.built || b.targetx != (int)wp.x || b.targety != (int)wp.y || (!fieldRipe(fp) && !b.chopping)) {
+                clearHarvest(b);   // retargeted or nothing to reap
+                continue;
+            }
+            if (harvestTick(b, wp, bpos, fieldHarvestTicks, fieldFoodYield)) {
+                fp.growth = 0;     // replanted at once
+                printf("WHEAT HARVESTED - food: %d\n", food);
+                logEvent("Wheat harvested (+" + to_string(fieldFoodYield) + " food, " + to_string(food) + ")");
+            }
+            continue;
+	}
 	if (b.target == targetBush) {
             int i = b.targetBush;
             if (i < 0 || i >= (int)bushes.size()) continue;
             Vector2f wp = bushWorkSpot(bushshapes[i]);
             if (b.targetx != (int)wp.x || b.targety != (int)wp.y) continue; // retargeted (e.g. a hunt)
             if ((!bushes[i].ripe || bushes[i].picking) && !b.chopping) {   // someone else got there first
-                b.moving = false;
-                b.targetx = b.targety = -1;
-                b.target = targetNone;
-                b.targetBush = -1;
+                clearHarvest(b);
                 continue;
             }
-            float dx = wp.x - bpos.x, dy = wp.y - bpos.y;
-            if (dx * dx + dy * dy >= 4.0f) continue;
-            b.chopping = true;
-            bushes[i].picking = true;
-            if (workTick(b)) b.timer++;
-            if (b.timer >= bushPickTicks) {
-                food++;
+            bool done = harvestTick(b, wp, bpos, bushPickTicks, bushFoodYield);
+            if (b.chopping) bushes[i].picking = true;
+            if (done) {
                 bushes[i].ripe = bushes[i].picking = false;
                 bushes[i].regrow = 0;
                 bushshapes[i].setFillColor(bushBareColor);
-                b.moving = b.chopping = false;
-                b.timer = 0;
-                b.targetx = b.targety = -1;
-                b.target = targetNone;
-                b.targetBush = -1;
                 printf("BERRIES PICKED - food: %d\n", food);
             }
             continue;
@@ -2790,10 +3013,11 @@ CircleShape makeTreeTri(int x, int y) {
     return tri;
 }
 
-void treespawn(vector<tree>& trees, vector<CircleShape>& tris, vector<RectangleShape>& stumps) {
+void treespawn(vector<tree>& trees, vector<CircleShape>& tris, vector<RectangleShape>& stumps, const plot& fp) {
     if (treespawnChance(gen) != 0) return;
     tree t{distrib(gen), distrib(gen), 100, false};
     if (!lakeClear(FloatRect(Vector2f(t.x, t.y), Vector2f(treeFootprint, treeFootprint)))) return; // no trees in the water
+    if (!fieldClear(fp, FloatRect(Vector2f(t.x, t.y), Vector2f(treeFootprint, treeFootprint)))) return; // nor on the wheat plot
     trees.push_back(t);
 
     tris.push_back(makeTreeTri(t.x, t.y));
@@ -2939,6 +3163,7 @@ int main() {
     shrines.reserve(maxShrines);
     smokehouse smoke;
     forge dwarfForge;
+    plot field;   // the one wheat plot (R19-F3)
 
     vector<deer> deers;
     vector<RectangleShape> deershape;
@@ -3047,14 +3272,15 @@ int main() {
             if (ticksThisFrame >= maxTicksPerFrame) { timesincelastupdate = Time::Zero; break; }
             ticksThisFrame++;
             for (int rep = 0; rep < simSpeed; rep++) {
-                buildhouse(barbs, squares, houses, houseshapes);
-                buildshrine(barbs, squares, houses, shrines);
+                buildhouse(barbs, squares, houses, houseshapes, field);
+                buildshrine(barbs, squares, houses, shrines, field);
                 buildsmokehouse(barbs, squares, houses, smoke);
                 buildstall(barbs, squares);
                 buildforge(barbs, squares, houses, dwarfForge);
-                minematerials(squares, barbs, tris, stumps, trees, octs, rocks, bushes, bushshapes, catchRings);
+                buildfield(barbs, squares, houses, shrines, tris, octs, field);
+                minematerials(squares, barbs, tris, stumps, trees, octs, rocks, bushes, bushshapes, catchRings, field);
                 barbmove(squares, barbs);
-                treespawn(trees, tris, stumps);
+                treespawn(trees, tris, stumps, field);
                 barbspawner(squares, barbs, houses, houseshapes, birthRings);
                 birthRingTick(birthRings);
                 catchRingTick(catchRings);
@@ -3069,6 +3295,7 @@ int main() {
                 trailTick();
                 birdTick(birds, birdHeading, squares);
                 bushTick(bushes, bushshapes);
+                fieldTick(field);
                 campfireTick(fire);
                 eraTick(barbs, houses);
                 councilTick(barbs);
@@ -3125,6 +3352,7 @@ int main() {
 	drawStall(window, activeTrader);
 	drawForge(window, dwarfForge, frameCount);
 	if (forgeEmberFrames > 0 && !paused) forgeEmberFrames--;
+	drawField(window, field, frameCount);
 
 	drawCampfire(window, fire, frameCount);
 
@@ -3149,6 +3377,9 @@ int main() {
                 drawBar(window, Vector2f(b.targetx - 10, b.targety - 20), b.timer / 180.0f, pal.barChop);
             if (b.chopping && b.timer > 0 && b.target == targetBush)
                 drawBar(window, Vector2f(b.targetx - 10, b.targety - 14), (float)b.timer / bushPickTicks, pal.barPick);
+            if (b.chopping && b.timer > 0 && b.target == targetField)   // centred over the plot, above the bobbing ear
+                drawBar(window, Vector2f(b.targetx - fieldStandOffset.x + fieldSize.x / 2 - barSize.x / 2, b.targety - fieldStandOffset.y - 11),
+                        (float)b.timer / fieldHarvestTicks, fieldBarColor);
             if (b.building &&  b.timer > 0)
                 drawBar(window, Vector2f(b.targetx - 9, b.targety - 10), b.timer / (float)buildJobTicks[b.jobKind], pal.barBuild);
 	    if (b.chopping && b.timer > 0 && b.target == targetRock)
