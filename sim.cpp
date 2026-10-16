@@ -466,9 +466,24 @@ const float knowPipRimPx = 1.0f;              // unlearned pips: hollow 1px outl
 const Color knowPipEmptyColor(78, 86, 74);    // dim grey-green rim, same family as the HUD rim
 const Color steelToolColor(178, 186, 198);    // Hand Axe head: cool pale steel, clear of chop green and bird blue-white
 
+// Flint spears (R20-F3): an idle barb walks to the campfire and knaps a spear; spear holders hit game animals harder
+const int spearWoodCost = 2;                  // paid on completion, not on claim
+const int spearStoneCost = 1;
+const int spearCraftTicks = 300;              // ~5s at 1x; counted in barb.spearTimer, never barb.timer
+const int spearBarbsPerSpear = 3;             // at most 1 spear (held or being made) per this many barbs
+const int spearHitDamage = 15;                // replaces animalHitDamage (5) for a barb holding a spear
+const Vector2f spearStandOffset(-1.0f, 9.0f); // crafter hitbox top-left relative to the campfire centre: just below the stone ring
+const int spearShaftPx = 5;                   // diagonal shaft pixels beside the body, leaning right 1px every 2 rows
+const float spearShaftBottom = 3.0f;          // lowest shaft pixel, rows below the head top (bodyTop)
+const Vector2f spearTipSize(2.0f, 1.0f);      // flint head on top of the shaft: top edge 2px above the head
+const Color spearShaftColor(156, 120, 76);    // light ash wood: much lighter than campfire logs so it reads on dark ground
+const Color spearTipColor(214, 208, 192);     // pale flint
+const int spearKnapFrames = 8;                // crafter's knapping hand ticks up/down every this many frames
+
 // Build jobs: which structure a barb's movingbspot/building belongs to. jobNone = no job, or a house (buildhouse()).
-enum buildJob {jobNone, jobShrine, jobSmoke, jobStall, jobForge, jobField, buildJobCount};
-const int buildJobTicks[buildJobCount] = {houseBuildTicks, shrineBuildTicks, smokehouseBuildTicks, stallBuildTicks, forgeBuildTicks, fieldBuildTicks};
+// jobSpear is a craft, not a structure: it uses movingbspot (so no other system grabs the barb) but never building/timer.
+enum buildJob {jobNone, jobShrine, jobSmoke, jobStall, jobForge, jobField, jobSpear, buildJobCount};
+const int buildJobTicks[buildJobCount] = {houseBuildTicks, shrineBuildTicks, smokehouseBuildTicks, stallBuildTicks, forgeBuildTicks, fieldBuildTicks, spearCraftTicks};
 // Game animals share the deer code (deers/deershape vectors); per-species numbers live in speciesDefs below.
 // Sprite offsets are relative to the logic shape (body = hitbox), written for an animal facing right.
 enum animalSpecies {speciesDeer, speciesRabbit, speciesCount};
@@ -845,6 +860,8 @@ struct barb {
     barbRace race = raceHuman;   // rolled once in makeBarb()
     int homeHouse = -1;          // house.id of the birth house (stable id, not an index); -1 = founder
     councilDecree lastVote = decreeNone; // ballot from the latest dawn; lives in the struct so it is dropped with the barb
+    bool hasSpear = false;       // R20-F3: kept for life; cleared only in makeBarb()
+    int spearTimer = 0;          // R20-F3: craft progress while jobKind == jobSpear; separate from timer; cleared by clearSpearCraft()
 };
 
 const raceDef& raceOf(const barb& b) { return raceDefs[b.race]; }
@@ -1003,7 +1020,7 @@ Color barbColor(const barb& b) {
 
 // Same priority as barbColor() so the tooltip always matches the colour on screen
 const char* barbTaskName(const barb& b) {
-    if (b.deertargeting) return "hunting";
+    if (b.deertargeting) return b.hasSpear ? "hunting (spear)" : "hunting";
     if (b.building) return "building";
     if (b.chopping && b.target == targetBush) return "picking";
     if (b.chopping && b.target == targetField) return "harvesting";
@@ -1071,7 +1088,8 @@ void deerkilling(vector<deer>& deers, vector<RectangleShape>& deershape, vector<
 			b.targety = (int)deerpos.y;
 			b.moving = true;
 			if (!d.invincible && sq.getGlobalBounds().findIntersection(ds.getGlobalBounds()).has_value()) {
-				d.health -= animalHitDamage;
+				bool speared = b.hasSpear;
+				d.health -= speared ? spearHitDamage : animalHitDamage;
 				d.invincible = true;
 				d.invincibleTimer = animalHitInvincibleTicks;
 				ds.setFillColor(Color::Red);
@@ -1085,8 +1103,8 @@ void deerkilling(vector<deer>& deers, vector<RectangleShape>& deershape, vector<
 					int smoked = sh.built ? smokehouseFoodBonus : 0;
 					food += yield + smoked;
 					if (smoked > 0) sh.boostTicks = smokeBoostTicks;   // puff burst over the hut
-					printf("%s KILLED - Food: %d (+%d, +%d smoked)\n", name, food, yield, smoked);
-					logEvent(string(name) + " killed (+" + to_string(yield) + " food"
+					printf("%s KILLED%s - Food: %d (+%d, +%d smoked)\n", name, speared ? " (spear)" : "", food, yield, smoked);
+					logEvent(string(name) + (speared ? " speared (+" : " killed (+") + to_string(yield) + " food"
 					         + (smoked > 0 ? ", +" + to_string(smoked) + " smoked" : string()) + ", " + to_string(food) + ")");
 					break;
 				}
@@ -1588,6 +1606,25 @@ void drawBarbs(RenderWindow& window, const vector<barb>& barbs, const vector<Rec
             if (b.chopping && b.target == targetNone && know.learned[techHandAxe]) tool.setFillColor(steelToolColor); // R20-F1: 1px axe head
             tool.setPosition(Vector2f(side, raised ? bodyTop - barbToolSize.y : bodyTop + 1.0f));
             window.draw(tool);
+        } else if (b.jobKind == jobSpear && b.spearTimer > 0) {   // R20-F3: knapping flint at the fire, hand taps the stone
+            bool raised = (phase / spearKnapFrames) % 2 == 0;
+            tool.setFillColor(spearTipColor);
+            tool.setPosition(Vector2f(side, raised ? bodyTop + 1.0f : bodyTop + 2.0f));
+            window.draw(tool);
+        }
+        if (b.hasSpear && !b.chopping && !b.building) {   // R20-F3: spear carried upright-ish; stowed while working
+            tool.setFillColor(spearShaftColor);
+            Vector2f top;
+            for (int k = 0; k < spearShaftPx; k++) {
+                top = Vector2f(side + (float)(k / 2), bodyTop + spearShaftBottom - (float)k);
+                tool.setPosition(top);
+                window.draw(tool);
+            }
+            tool.setSize(spearTipSize);
+            tool.setFillColor(spearTipColor);
+            tool.setPosition(top - Vector2f(0.0f, spearTipSize.y));   // top edge = bodyTop - 2
+            window.draw(tool);
+            tool.setSize(barbToolSize);
         }
     }
 }
@@ -2564,6 +2601,72 @@ void buildfield(vector<barb>& barbs, vector<RectangleShape>& squares, const vect
     logEvent("Wheat field sown");
 }
 
+// R20-F3: every way out of a spear craft (finished, unaffordable, interrupted) clears the same barb fields
+void clearSpearCraft(barb& b) {
+    b.jobKind = jobNone;
+    b.moving = b.movingbspot = b.building = false;
+    b.spearTimer = 0;
+    b.stepTimer = 0;
+    b.targetx = b.targety = -1;
+}
+
+// Runs after buildfield(). One crafter at a time: an idle barb without a spear walks to the campfire and knaps for
+// spearCraftTicks (in spearTimer, never timer). Wood and stone are checked on claim but paid only on completion;
+// if they ran out meanwhile the craft is dropped. Spears (held + in progress) are capped at 1 per spearBarbsPerSpear barbs.
+void craftspear(vector<barb>& barbs, vector<RectangleShape>& squares) {
+    int spears = 0, crafter = -1;
+    for (int i = 0; i < (int)barbs.size(); i++) {
+        if (barbs[i].hasSpear) spears++;
+        if (barbs[i].jobKind == jobSpear) crafter = i;
+    }
+    Vector2f stand = villageCenter + spearStandOffset;
+    if (crafter < 0) {
+        if ((spears + 1) * spearBarbsPerSpear > (int)barbs.size()) return;
+        if (wood < spearWoodCost || stone < spearStoneCost) return;
+        for (auto& b : barbs) {
+            if (b.hasSpear || b.jobKind != jobNone || b.deertargeting || b.chopping || b.timer > 0
+                || b.moving || b.movingbspot || b.building) continue;
+            b.jobKind = jobSpear;
+            b.target = targetNone;
+            b.targetx = (int)stand.x;
+            b.targety = (int)stand.y;
+            b.moving = b.movingbspot = true;
+            b.spearTimer = 0;
+            printf("SPEAR CLAIMED - barb %d (%d/%d spears)\n", b.id, spears, (int)barbs.size() / spearBarbsPerSpear);
+            return;
+        }
+        return;
+    }
+    barb& b = barbs[crafter];
+    auto& sq = squares[crafter];
+    if (!b.movingbspot) { clearSpearCraft(b); return; }   // something else took the barb: release the job
+    Vector2f pos  = sq.getPosition();
+    Vector2f diff = Vector2f(b.targetx, b.targety) - pos;
+    float dSq = diff.x * diff.x + diff.y * diff.y;
+    if (dSq >= 1.0f) {
+        if (++b.stepTimer >= stepLimit(b, pos)) {
+            b.stepTimer = 0;
+            sq.move(diff / sqrt(dSq));
+            trailStep(sq.getPosition());
+        }
+        return;
+    }
+    b.moving = false;   // standing at the fire: no walking bob while knapping
+    if (workTick(b)) b.spearTimer++;
+    if (b.spearTimer < spearCraftTicks) return;
+    if (wood < spearWoodCost || stone < spearStoneCost) {
+        printf("SPEAR ABANDONED - barb %d, no materials (wood: %d stone: %d)\n", b.id, wood, stone);
+        clearSpearCraft(b);
+        return;
+    }
+    wood -= spearWoodCost;
+    stone -= spearStoneCost;
+    b.hasSpear = true;
+    clearSpearCraft(b);
+    printf("---SPEAR MADE--- barb %d (%d wood, %d stone)\n", b.id, spearWoodCost, spearStoneCost);
+    logEvent("Flint spear made");
+}
+
 void fieldTick(plot& fp) {
     if (fp.built && fp.growth < wheatGrowTicks()) {
         fp.growth++;
@@ -2622,6 +2725,8 @@ void makeBarb(Vector2i pos, vector<barb>& barbs, vector<RectangleShape>& squares
     b.x = pos.x;
     b.y = pos.y;
     b.race = (barbRace)uniform_int_distribution<int>(0, raceCount - 1)(gen);
+    b.hasSpear = false;   // R20-F3: every new barb starts unarmed with no craft in progress
+    b.spearTimer = 0;
     barbs.push_back(b);
     Vector2f bodySize = raceOf(b).bodySize;   // hitbox = drawn body, so hover/collision match what you see
     RectangleShape sq;
@@ -3370,6 +3475,7 @@ int main() {
                 buildstall(barbs, squares);
                 buildforge(barbs, squares, houses, dwarfForge);
                 buildfield(barbs, squares, houses, shrines, tris, octs, field);
+                craftspear(barbs, squares);
                 minematerials(squares, barbs, tris, stumps, trees, octs, rocks, bushes, bushshapes, catchRings, field);
                 barbmove(squares, barbs);
                 treespawn(trees, tris, stumps, field);
