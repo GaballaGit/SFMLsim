@@ -277,6 +277,35 @@ const float shrineCapH = 2.0f;             // gold cap sits on top of the slab (
 const Vector2f shrineStandOffset(3.0f, -6.0f); // slab top-left relative to the builder's spot: barb stands at its left foot
 const Color shrineSlabColor(138, 136, 128); // warm stone grey: lighter than rocks (125), clear of wolf blue-grey
 const Color shrineCapColor(214, 192, 118); // pale gold: not mine orange, lamp amber, hover gold or hungry tan
+
+// Smokehouse: at most one; once standing, every barb kill of a deer or rabbit yields extra food
+const int smokehouseWoodCost = 20;
+const int smokehouseStoneCost = 4;
+const int smokehouseFoodBonus = 1;         // extra food per deer/rabbit kill (wolf kills still give none)
+const int smokehouseMinHouses = 1;         // the first home comes before the smokehouse
+const int smokehouseBuildTicks = 600;      // same work as a house
+const Vector2f smokehousePos(384.0f, 406.0f); // hut top-left: fixed spot just south-west of the campfire, inside the clearing
+const Vector2f smokehouseSize(6.0f, 5.0f);
+const float smokehouseRoofH = 2.0f;        // top 2 rows are roof, bottom 3 are wall
+const Vector2f smokehouseDoorPos(1.0f, 3.0f);  // 1x2 door, relative to hut top-left
+const Vector2f smokehouseDoorSize(1.0f, 2.0f);
+const Vector2f smokehouseChimneyPos(4.0f, -2.0f); // 1x2 chimney poking up from the right of the roof
+const Vector2f smokehouseChimneySize(1.0f, 2.0f);
+const Vector2f smokehouseStandOffset(-3.0f, 1.0f); // builder's spot relative to the hut: stands at its left wall
+const float smokehouseClearPx = 4.0f;      // shrines keep this far from the hut (and its smoke)
+const Color smokehouseWallColor(88, 70, 54);   // dark smoked timber: darker than house tan, still clear of the ground
+const Color smokehouseRoofColor(58, 44, 36);
+const Color smokehouseDoorColor(30, 22, 16);
+const Color smokehouseChimneyColor(110, 106, 100);
+const Color smokeColor(176, 174, 168);     // pale grey puffs
+const uint8_t smokeAlpha = 150;            // starting alpha; each puff fades to 0 as it rises
+const int smokeCycleFrames = 180;          // one puff in flight per cycle normally (~3s): sparse
+const int smokePuffsIdle = 1;
+const int smokePuffsBoost = 3;             // a burst right after a bonus kill so the effect reads on screen
+const int smokeBoostTicks = 360;           // sim ticks the burst lasts after a bonus kill
+const float smokeRisePx = 12.0f;
+const float smokeDriftPx = 3.0f;           // leans east as it rises
+const float smokePuffPx = 2.0f;            // 2x2 puff, shrinks to 1x1 in the upper half
 // Game animals share the deer code (deers/deershape vectors); per-species numbers live in speciesDefs below.
 // Sprite offsets are relative to the logic shape (body = hitbox), written for an animal facing right.
 enum animalSpecies {speciesDeer, speciesRabbit, speciesCount};
@@ -532,6 +561,7 @@ struct house {int x, y, health; bool hasFoundation = false; int id = -1;}; // id
 int nextHouseId = 0;   // assigned only in buildhouse(); never reused, so ids survive any swapRemove
 struct shrine {int x, y; int id = -1;};  // x,y = slab top-left; id: stable, from nextShrineId (refer to shrines by id, never index)
 int nextShrineId = 0;  // assigned only in buildshrine(); at most maxShrines are ever standing
+struct smokehouse {bool built = false; bool claimed = false; int boostTicks = 0;}; // the one smokehouse; claimed = a builder is on it
 
 struct barb {
     int id = -1;                 // stable, unique; assigned only by makeBarb()
@@ -545,6 +575,7 @@ struct barb {
     bool reservedwood = false;
     int reservedstone = 0;       // stone held for a house foundation (or a shrine); refunded with the wood on cancel
     bool shrineJob = false;      // movingbspot/building belong to a shrine, not a house; buildhouse() skips these
+    bool smokeJob = false;       // movingbspot/building belong to the smokehouse; buildhouse() and buildshrine() skip these
     int stepTimer = 0;
     bool targetIsRock = false;
     bool targetIsBush = false;   // chopping + targetIsBush = picking; shares timer/chopping with chop and mine
@@ -724,7 +755,7 @@ void validateDeerTargets(vector<barb>& barbs, const vector<deer>& deers) {
 		if (b.deertargeting && findDeerById(deers, b.targetDeerId) == -1) clearHunt(b);
 }
 
-void deerkilling(vector<deer>& deers, vector<RectangleShape>& deershape, vector<barb>& barbs, vector<RectangleShape>& squares) {
+void deerkilling(vector<deer>& deers, vector<RectangleShape>& deershape, vector<barb>& barbs, vector<RectangleShape>& squares, smokehouse& sh) {
 	const float deerInfluenceDSq = 625.0f;
 	validateDeerTargets(barbs, deers);
 	for (int i = 0; i < (int)deers.size(); ) {
@@ -768,9 +799,12 @@ void deerkilling(vector<deer>& deers, vector<RectangleShape>& deershape, vector<
 					swapRemove(deers, i);      // d and ds are invalid from here on
 					swapRemove(deershape, i);
 					removed = true;
-					food += yield;
-					printf("%s KILLED - Food: %d (+%d)\n", name, food, yield);
-					logEvent(string(name) + " killed (+" + to_string(yield) + " food, " + to_string(food) + ")");
+					int smoked = sh.built ? smokehouseFoodBonus : 0;
+					food += yield + smoked;
+					if (smoked > 0) sh.boostTicks = smokeBoostTicks;   // puff burst over the hut
+					printf("%s KILLED - Food: %d (+%d, +%d smoked)\n", name, food, yield, smoked);
+					logEvent(string(name) + " killed (+" + to_string(yield) + " food"
+					         + (smoked > 0 ? ", +" + to_string(smoked) + " smoked" : string()) + ", " + to_string(food) + ")");
 					break;
 				}
 			}
@@ -1689,7 +1723,7 @@ void buildhouse(vector<barb>& barbs,vector<RectangleShape>& squares, vector<hous
     for (int i = 0; i < (int)squares.size(); i++) {
         auto& sq = squares[i];
         auto& b  = barbs[i];
-        if (b.shrineJob) continue;   // buildshrine() owns this barb
+        if (b.shrineJob || b.smokeJob) continue;   // buildshrine() / buildsmokehouse() own this barb
         if (b.chopping || (b.timer > 0 && !b.building)) continue;
         if (!b.movingbspot && !b.moving) {
             if (!canclaim || wood < houseWoodCost) continue;
@@ -1769,6 +1803,7 @@ void buildshrine(vector<barb>& barbs, vector<RectangleShape>& squares, const vec
     for (int i = 0; i < (int)squares.size() && i < (int)barbs.size(); i++) {
         auto& sq = squares[i];
         auto& b  = barbs[i];
+        if (b.smokeJob) continue;    // buildsmokehouse() owns this barb
         if (b.chopping || (b.timer > 0 && !b.building)) continue;
         if (!b.movingbspot && !b.moving) {
             if (!canclaim) continue;
@@ -1785,6 +1820,9 @@ void buildshrine(vector<barb>& barbs, vector<RectangleShape>& squares, const vec
                     Vector2f d = p - Vector2f((float)s.x, (float)s.y);
                     if (d.x * d.x + d.y * d.y < shrineMinSpacing * shrineMinSpacing) found = false;
                 }
+                FloatRect hutClear(smokehousePos + smokehouseChimneyPos - Vector2f(smokehouseClearPx, smokehouseClearPx),
+                                   Vector2f(smokehouseSize.x, smokehouseSize.y - smokehouseChimneyPos.y) + Vector2f(2 * smokehouseClearPx, 2 * smokehouseClearPx));
+                if (FloatRect(p - Vector2f(0.0f, shrineCapH), shrineSlabSize + Vector2f(0.0f, shrineCapH)).findIntersection(hutClear).has_value()) found = false; // keep the smokehouse spot free
                 for (auto& o : barbs) {
                     if (!o.shrineJob) continue;
                     Vector2f d = p - shrineSlabPos(o.targetx, o.targety);
@@ -1849,6 +1887,94 @@ void drawShrines(RenderWindow& window, const vector<shrine>& shrines) {
         cap.setPosition(o - Vector2f(0.0f, shrineCapH));
         window.draw(slab);
         window.draw(cap);
+    }
+}
+
+// Runs after buildshrine(). One builder ever: claimed is set on the claim and cleared only once the hut stands.
+// Houses keep first call on stone; wood is whatever buildhouse() left this tick.
+void buildsmokehouse(vector<barb>& barbs, vector<RectangleShape>& squares, const vector<house>& houses, smokehouse& sh) {
+    if (sh.boostTicks > 0) sh.boostTicks--;
+    if (sh.built) return;
+    for (int i = 0; i < (int)squares.size() && i < (int)barbs.size(); i++) {
+        auto& sq = squares[i];
+        auto& b  = barbs[i];
+        if (!sh.claimed) {
+            if (b.shrineJob || b.chopping || b.timer > 0 || b.moving || b.movingbspot || b.building) continue;
+            if ((int)houses.size() < smokehouseMinHouses || wood < smokehouseWoodCost
+                || stone < smokehouseStoneCost + houseStoneCost) return;
+            wood -= smokehouseWoodCost;
+            stone -= smokehouseStoneCost;
+            sh.claimed = true;
+            b.smokeJob = true;
+            Vector2f stand = smokehousePos + smokehouseStandOffset;
+            b.targetx = (int)stand.x;
+            b.targety = (int)stand.y;
+            b.moving = true;
+            b.movingbspot = true;
+            printf("SMOKEHOUSE CLAIMED - wood: %d stone: %d\n", wood, stone);
+            return;
+        }
+        if (!b.smokeJob || !b.movingbspot) continue;
+        Vector2f pos  = sq.getPosition();
+        Vector2f diff = Vector2f(b.targetx, b.targety) - pos;
+        float dSq = diff.x * diff.x + diff.y * diff.y;
+        if (dSq < 1.0f) {
+            b.building = true;
+            if (workTick(b)) b.timer++;
+            if (b.timer >= smokehouseBuildTicks) {
+                sh.built = true;
+                b.smokeJob = false;
+                b.building = b.moving = b.movingbspot = false;
+                b.timer = 0;
+                printf("---SMOKEHOUSE BUILT--- +%d food per deer/rabbit kill\n", smokehouseFoodBonus);
+                logEvent("Smokehouse built (+" + to_string(smokehouseFoodBonus) + " food per kill)");
+            }
+        } else if (++b.stepTimer >= stepLimit(b, pos)) {
+            b.stepTimer = 0;
+            sq.move(diff / sqrt(dSq));
+            trailStep(sq.getPosition());
+        }
+        return;
+    }
+}
+
+// Dark 6x5 hut: 2 roof rows over 3 wall rows, a 1x2 door and a grey 1x2 chimney. Drawn with the shrines.
+void drawSmokehouse(RenderWindow& window, const smokehouse& sh) {
+    if (!sh.built) return;
+    RectangleShape r(smokehouseSize);
+    r.setPosition(smokehousePos);
+    r.setFillColor(smokehouseWallColor);
+    window.draw(r);
+    r.setSize(Vector2f(smokehouseSize.x, smokehouseRoofH));
+    r.setFillColor(smokehouseRoofColor);
+    window.draw(r);
+    r.setSize(smokehouseDoorSize);
+    r.setPosition(smokehousePos + smokehouseDoorPos);
+    r.setFillColor(smokehouseDoorColor);
+    window.draw(r);
+    r.setSize(smokehouseChimneySize);
+    r.setPosition(smokehousePos + smokehouseChimneyPos);
+    r.setFillColor(smokehouseChimneyColor);
+    window.draw(r);
+}
+
+// Sparse puffs rising from the chimney and fading out; a short burst of extra puffs after a bonus kill.
+// Drawn above the trees and under the day/night overlay.
+void drawSmoke(RenderWindow& window, const smokehouse& sh, int frame) {
+    if (!sh.built) return;
+    int puffs = sh.boostTicks > 0 ? smokePuffsBoost : smokePuffsIdle;
+    Vector2f top = smokehousePos + smokehouseChimneyPos;   // chimney top-left
+    RectangleShape p;
+    for (int k = 0; k < puffs; k++) {
+        float t = (float)((frame + k * smokeCycleFrames / puffs) % smokeCycleFrames) / smokeCycleFrames;
+        float sz = t < 0.5f ? smokePuffPx : 1.0f;
+        Vector2f at(top.x - (sz - 1.0f) * 0.5f + smokeDriftPx * t, top.y - sz - smokeRisePx * t);
+        p.setSize(Vector2f(sz, sz));
+        p.setPosition(Vector2f(floor(at.x), floor(at.y)));
+        Color c = smokeColor;
+        c.a = (uint8_t)(smokeAlpha * (1.0f - t));
+        p.setFillColor(c);
+        window.draw(p);
     }
 }
 
@@ -2302,6 +2428,7 @@ int main() {
     vector<RectangleShape> houseshapes;
     vector<shrine> shrines;
     shrines.reserve(maxShrines);
+    smokehouse smoke;
 
     vector<deer> deers;
     vector<RectangleShape> deershape;
@@ -2410,6 +2537,7 @@ int main() {
             for (int rep = 0; rep < simSpeed; rep++) {
                 buildhouse(barbs, squares, houses, houseshapes);
                 buildshrine(barbs, squares, houses, shrines);
+                buildsmokehouse(barbs, squares, houses, smoke);
                 minematerials(squares, barbs, tris, stumps, trees, octs, rocks, bushes, bushshapes);
                 barbmove(squares, barbs);
                 treespawn(trees, tris, stumps);
@@ -2417,7 +2545,7 @@ int main() {
                 birthRingTick(birthRings);
                 deerspawn(deers, deershape);
                 deerwander(deershape, deers, squares);
-                deerkilling(deers, deershape, barbs, squares);
+                deerkilling(deers, deershape, barbs, squares, smoke);
                 wolfTick(wolves, deers, deershape, barbs);
                 clockk();
                 weatherTick();
@@ -2477,6 +2605,7 @@ int main() {
 	}
 	drawHouses(window, houseshapes);
 	drawShrines(window, shrines);
+	drawSmokehouse(window, smoke);
 
 	drawCampfire(window, fire, frameCount);
 
@@ -2492,6 +2621,7 @@ int main() {
         drawBarbs(window, barbs, squares, frameCount);
 	if (activeTrader) drawSnapped(window, activeTrader->shape);
 	drawTrees(window, tris, treeVerts);
+	drawSmoke(window, smoke, frameCount);
 	drawBirds(window, birds, birdShape, frameCount++);
 	if (raining) drawRain(window, rainVerts, frameCount);
 	for (int q = 0; q < (int)squares.size(); ++q) {
@@ -2501,7 +2631,7 @@ int main() {
             if (b.chopping && b.timer > 0 && b.targetIsBush)
                 drawBar(window, Vector2f(b.targetx - 10, b.targety - 14), (float)b.timer / bushPickTicks, pal.barPick);
             if (b.building &&  b.timer > 0)
-                drawBar(window, Vector2f(b.targetx - 9, b.targety - 10), b.timer / (b.shrineJob ? (float)shrineBuildTicks : 600.0f), pal.barBuild);
+                drawBar(window, Vector2f(b.targetx - 9, b.targety - 10), b.timer / (b.shrineJob ? (float)shrineBuildTicks : b.smokeJob ? (float)smokehouseBuildTicks : 600.0f), pal.barBuild);
 	    if (b.chopping && b.timer > 0 && b.targetIsRock)
                 drawBar(window, Vector2f(b.targetx - 10, b.targety - 16), (float)b.timer / mineTicks(b), pal.barMine);
 	}
