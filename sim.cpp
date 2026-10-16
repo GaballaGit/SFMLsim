@@ -262,6 +262,29 @@ const Color houseWindowDayColor(52, 54, 50);   // dark glass by day
 const Color houseWindowNightColor(240, 190, 95); // warm lamp, drawn after the night overlay
 const float houseWindowGlowPx = 1.0f;      // faint additive halo this far around a lit window
 const Color houseWindowGlowColor(90, 60, 20, 255); // additive, so this is a gentle warm lift
+// Kin quarters: each house is drawn in its builder's race style. Walls, door and window stay shared;
+// only the roof changes (rows end on y = 0, directly above the walls at houseWallPos.y = 1).
+const Color houseRoofDwarfColor(108, 106, 98);   // muted stone grey
+const Color houseChimneyDwarfColor(70, 68, 64);  // darker stone stack
+const Color houseRoofElfColor(146, 172, 128);    // pale sage green, a shade darker than the elf hat
+const int houseStyleMaxRows = 4;
+struct houseStyle {
+    int rows;
+    float left[houseStyleMaxRows];   // x offset of each roof row, top row first
+    float width[houseStyleMaxRows];
+    float top;                       // y of the first roof row
+    Color roof;
+    Vector2f chimneyPos, chimneySize; // 0x0 = no chimney
+};
+const houseStyle houseStyles[raceCount] = {
+    // Human: the original 3-row stepped brick roof
+    {houseRoofRows, {houseRoofLeft[0], houseRoofLeft[1], houseRoofLeft[2]}, {houseRoofWidth[0], houseRoofWidth[1], houseRoofWidth[2]},
+     houseRoofTop, houseRoofColor, {0.0f, 0.0f}, {0.0f, 0.0f}},
+    // Dwarf: squat 2-row flat roof with a 1x2 chimney on the right
+    {2, {-1.0f, -2.0f}, {6.0f, 8.0f}, -1.0f, houseRoofDwarfColor, {3.0f, -3.0f}, {1.0f, 2.0f}},
+    // Elf: tall 4-row pointed roof
+    {4, {1.0f, 0.0f, -1.0f, -2.0f}, {2.0f, 4.0f, 6.0f, 8.0f}, -3.0f, houseRoofElfColor, {0.0f, 0.0f}, {0.0f, 0.0f}},
+};
 
 // Shrine stones: build and placement only (no prayer yet). Houses always get first call on stone.
 const int maxShrines = 3;                  // hard cap on standing stones in the village
@@ -572,7 +595,7 @@ RectangleShape bushDrawShape(const CircleShape& bs) {
     return s;
 }
 
-struct house {int x, y, health; bool hasFoundation = false; int id = -1;}; // id: stable, from nextHouseId
+struct house {int x, y, health; bool hasFoundation = false; int id = -1; barbRace race = raceHuman;}; // id: stable, from nextHouseId; race: builder's, picks the roof style
 int nextHouseId = 0;   // assigned only in buildhouse(); never reused, so ids survive any swapRemove
 struct shrine {int x, y; int id = -1;};  // x,y = slab top-left; id: stable, from nextShrineId (refer to shrines by id, never index)
 int nextShrineId = 0;  // assigned only in buildshrine(); at most maxShrines are ever standing
@@ -1285,14 +1308,22 @@ void drawBarbs(RenderWindow& window, const vector<barb>& barbs, const vector<Rec
 }
 
 // Roofed houses: slab is drawn separately underneath. Window is dark glass here; drawHouseLights lights it at night.
-void drawHouses(RenderWindow& window, const vector<RectangleShape>& houseshapes) {
+void drawHouses(RenderWindow& window, const vector<house>& houses, const vector<RectangleShape>& houseshapes) {
     RectangleShape r;
-    for (auto& hs : houseshapes) {
+    for (int i = 0; i < (int)houseshapes.size() && i < (int)houses.size(); i++) {
+        auto& hs = houseshapes[i];
+        const houseStyle& st = houseStyles[houses[i].race];
         Vector2f o = snapPx(hs.getPosition());
-        r.setFillColor(houseRoofColor);
-        for (int k = 0; k < houseRoofRows; k++) {
-            r.setSize(Vector2f(houseRoofWidth[k], 1.0f));
-            r.setPosition(o + Vector2f(houseRoofLeft[k], houseRoofTop + k));
+        if (st.chimneySize.x > 0.0f) {                  // behind the roof so its base tucks in
+            r.setSize(st.chimneySize);
+            r.setPosition(o + st.chimneyPos);
+            r.setFillColor(houseChimneyDwarfColor);
+            window.draw(r);
+        }
+        r.setFillColor(st.roof);
+        for (int k = 0; k < st.rows; k++) {
+            r.setSize(Vector2f(st.width[k], 1.0f));
+            r.setPosition(o + Vector2f(st.left[k], st.top + k));
             window.draw(r);
         }
         r.setSize(houseWallSize);
@@ -1507,8 +1538,11 @@ void drawHousehold(RenderWindow& window, const View& worldView, const hoverHit& 
             if (houses[i].id != h.homeOfBarb) continue;
             // outline the whole drawn sprite (stepped roof down to the walls), not just the 4x4 logic shape
             Vector2f o = snapPx(houseshapes[i].getPosition());
-            Vector2f tl(o.x + houseRoofLeft[houseRoofRows - 1], o.y + houseRoofTop);
-            Vector2f br(o.x + houseRoofLeft[houseRoofRows - 1] + houseRoofWidth[houseRoofRows - 1], o.y + houseWallPos.y + houseWallSize.y);
+            const houseStyle& st = houseStyles[houses[i].race];
+            float top = st.top;
+            if (st.chimneySize.x > 0.0f) top = min(top, st.chimneyPos.y);
+            Vector2f tl(o.x + st.left[st.rows - 1], o.y + top);
+            Vector2f br(o.x + st.left[st.rows - 1] + st.width[st.rows - 1], o.y + houseWallPos.y + houseWallSize.y);
             RectangleShape r(br - tl);
             r.setPosition(tl);
             r.setFillColor(Color::Transparent);
@@ -1777,7 +1811,7 @@ void buildhouse(vector<barb>& barbs,vector<RectangleShape>& squares, vector<hous
                 if (workTick(b)) b.timer++;
                 if (b.timer >= 600) {
                     b.reservedwood = false;
-                    house h{b.targetx, b.targety, 100, b.reservedstone > 0, nextHouseId++};
+                    house h{b.targetx, b.targety, 100, b.reservedstone > 0, nextHouseId++, b.race};
                     b.reservedstone = 0;
                     houses.push_back(h);
                     RectangleShape hs(Vector2f(4, 4));
@@ -2705,7 +2739,7 @@ int main() {
 			window.draw(slab);
 		}
 	}
-	drawHouses(window, houseshapes);
+	drawHouses(window, houses, houseshapes);
 	drawShrines(window, shrines);
 	drawSmokehouse(window, smoke);
 	drawStall(window, activeTrader);
