@@ -127,6 +127,10 @@ const float raceTraitLike[raceCount][traitCount] = {
 const float crownMinZoom = 1.0f;          // the crown shows at every zoom (minZoom is 1)
 const Vector2f crownSize(2.0f, 1.0f);     // 2x1 band sitting on the head (or on top of the hat)
 const Color crownColor(250, 208, 64);     // bright gold: off the body, so it never meets a task stripe or the sash
+// Leader shortage weights (R30-F2): at dawn a race's leader names its top shortage; that race's matching job weight tilts
+enum leaderNeed { needWood, needStone, needFood, needCount, needNone = needCount };
+const char* const leaderNeedNames[needCount] = {"wood", "stone", "food"};
+const float leaderNeedMult = 1.25f;       // matching weight multiplier, re-clamped to [needWeightMin, needWeightMax]
 
 // Sasuke the Shinobi (R25-F2): the first founder; fast, and blinks a few px when idle
 const char* const shinobiName = "Sasuke";      // not in barbNames, so nobody else can roll it
@@ -1114,6 +1118,7 @@ bool isGentry(const barb& b) { return b.homeHouse < 0; }   // R24-F1: founders; 
 // R28-F2: leaders are held by barb id (never index); a missing id means the race has no leader
 int raceLeaderId[raceCount] = {-1, -1, -1};
 bool raceElected[raceCount] = {false, false, false};
+leaderNeed raceNeed[raceCount] = {needNone, needNone, needNone};   // R30-F2: set at dawn by the leader; needNone = global weights
 int findBarbById(const vector<barb>& barbs, int id) {
     if (id < 0) return -1;
     for (int i = 0; i < (int)barbs.size(); i++) if (barbs[i].id == id) return i;
@@ -2188,6 +2193,7 @@ optional<hoverHit> pickHover(Vector2f p, float radius, const vector<barb>& barbs
                 for (auto& o : barbs) if (o.id != b.id && o.homeHouse == b.homeHouse) kin++;
                 label += ", of house " + to_string(b.homeHouse + 1) + ", " + to_string(kin) + " kin";
             }
+            if (isLeader(b) && raceNeed[b.race] != needNone) label += string("\nNeeds: ") + leaderNeedNames[raceNeed[b.race]];   // R30-F2
             hoverHit h{label, squares[i], nullopt};
             h.homeOfBarb = b.homeHouse;
             return h;
@@ -3491,14 +3497,40 @@ void drawBallots(RenderWindow& window, const View& worldView, float zoom,
 
 // R28-F2: dawn elections. Each leaderless race with enough members puts up its best-liked member;
 // every other member approves with raceTraitLike odds. More than half wins the crown, else retry next dawn.
+// R30-F2: the only place a leader is cleared, so the race drops back to global weights the same tick
+void loseLeader(int r) {
+    printf("LEADER LOST - %s leader id %d is gone, %s back to global weights\n", racePlurals[r], raceLeaderId[r], racePlurals[r]);
+    logEvent(string(racePlurals[r]) + " lost their leader");
+    raceElected[r] = false;
+    raceLeaderId[r] = -1;
+    raceNeed[r] = needNone;
+}
+
+// R30-F2: every tick, so a dead leader's need never outlives them
+void leaderWatchTick(const vector<barb>& barbs) {
+    for (int r = 0; r < raceCount; r++)
+        if (raceElected[r] && findBarbById(barbs, raceLeaderId[r]) < 0) loseLeader(r);
+}
+
+// R30-F2: leader ranks the colony's wood/stone/food shortage (0..1 each); worst wins, none if nothing is short
+void rankRaceNeed(const vector<barb>& barbs, int r) {
+    int members = 0;
+    for (auto& b : barbs) members += b.race == r ? 1 : 0;
+    float s[needCount];
+    s[needWood]  = clamp((float)(houseWoodCost - wood) / (float)houseWoodCost, 0.0f, 1.0f);
+    s[needStone] = clamp((float)(houseStoneCost - stone) / (float)houseStoneCost, 0.0f, 1.0f);
+    s[needFood]  = clamp((float)(members - food) / (float)max(1, members), 0.0f, 1.0f);   // one food per member
+    int best = needNone;
+    for (int n = 0; n < needCount; n++) if (s[n] > 0.0f && (best == needNone || s[n] > s[best])) best = n;
+    raceNeed[r] = (leaderNeed)best;
+    printf("LEADER NEED - %s: wood %.2f, stone %.2f, food %.2f -> %s\n", racePlurals[r], s[needWood], s[needStone], s[needFood],
+           best == needNone ? "none" : leaderNeedNames[best]);
+}
+
 void leaderTick(vector<barb>& barbs) {
     for (int r = 0; r < raceCount; r++) {
-        if (raceElected[r] && findBarbById(barbs, raceLeaderId[r]) < 0) {   // leader gone: no leader, may elect again
-            printf("LEADER LOST - %s leader id %d is gone\n", racePlurals[r], raceLeaderId[r]);
-            raceElected[r] = false;
-            raceLeaderId[r] = -1;
-        }
-        if (raceElected[r]) continue;
+        if (raceElected[r] && findBarbById(barbs, raceLeaderId[r]) < 0) loseLeader(r);   // leader gone: no leader, may elect again
+        if (raceElected[r]) { rankRaceNeed(barbs, r); continue; }
         vector<int> members;
         for (int i = 0; i < (int)barbs.size(); i++) if (barbs[i].race == r) members.push_back(i);
         if ((int)members.size() < electionThreshold) continue;
@@ -3521,6 +3553,7 @@ void leaderTick(vector<barb>& barbs) {
             raceLeaderId[r] = cand.id;
             printf("ELECTION - %s crown %s, barb %d (%s approve)\n", racePlurals[r], who.c_str(), cand.id, tally.c_str());
             logEvent(string(racePlurals[r]) + " crown " + who + " (" + tally + " approve)");
+            rankRaceNeed(barbs, r);   // R30-F2: the new leader names a need this same dawn
         } else {
             printf("ELECTION - %s: no consensus on %s, barb %d (%s approve)\n", racePlurals[r], who.c_str(), cand.id, tally.c_str());
             logEvent(string(racePlurals[r]) + ": no consensus (" + tally + ")");
@@ -3733,6 +3766,8 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
     }
     bool fieldTaken = false;   // one reaper at a time, derived from targets every tick (no stored claim)
     for (auto& o : barbs) if (o.target == targetField) fieldTaken = true;
+    leaderNeed liveNeed[raceCount];   // R30-F2: a race's need counts only while its leader is alive (checked once per tick)
+    for (int r = 0; r < raceCount; r++) liveNeed[r] = findBarbById(barbs, raceLeaderId[r]) >= 0 ? raceNeed[r] : needNone;
     for (int j = 0; j < (int)squares.size(); j++) {
         auto& sq = squares[j];
         auto& b  = barbs[j];
@@ -3760,6 +3795,10 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
             float treeW = clamp(1.0f + treeNeedBoost * woodShort, needWeightMin, needWeightMax);
             float rockW = clamp(1.0f, needWeightMin, needWeightMax);
             float bushW = clamp(1.0f, needWeightMin, needWeightMax);
+            leaderNeed ln = (b.race >= 0 && b.race < raceCount) ? liveNeed[b.race] : needNone;   // R30-F2: re-clamped so no job starves
+            if (ln == needWood)  treeW = clamp(treeW * leaderNeedMult, needWeightMin, needWeightMax);
+            if (ln == needStone) rockW = clamp(rockW * leaderNeedMult, needWeightMin, needWeightMax);
+            if (ln == needFood)  bushW = clamp(bushW * leaderNeedMult, needWeightMin, needWeightMax);
             if (currentDecree == decreeTimber)  treeW *= councilDecreeMult;
             if (currentDecree == decreeStone)   rockW *= councilDecreeMult;
             if (currentDecree == decreeBerries) bushW *= councilDecreeMult;
@@ -4367,6 +4406,7 @@ int main() {
                 campfireTick(fire);
                 eraTick(barbs, houses);
                 paveTick(barbs, squares);
+                leaderWatchTick(barbs);   // R30-F2: leader death -> global weights + ticker line, same tick
                 councilTick(barbs);
             }
         }
