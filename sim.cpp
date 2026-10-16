@@ -55,6 +55,12 @@ const float barbBobPx = 1.0f;
 const int barbToolFrames = 6;               // chop/mine/build swing: tool raised then struck
 const int barbPickFrames = 10;              // picking: arm dips to the bush on alternate periods
 const float barbHungryDroopPx = 1.0f;       // hungry barbs slouch: body 1px shorter
+// Founders' line (R24-F1): founders (homeHouse < 0) are Gentry, everyone born in a house is a Commoner
+const float gentrySashTop = 2.0f;           // sash row from the top of the body, one below the task stripe
+const float gentrySashH = 1.0f;             // 2x1 band, body-wide
+const Color gentrySashColor(224, 194, 96);  // pale gold: not hungry tan, not mine orange, never hunger-tinted
+const int gentryVoteWeight = 2;             // a Gentry ballot counts this many times at the dawn council
+const int gentryFoodReserve = 1;            // while any Commoner is hungry, Gentry eating first leave this much food for them
 const Color barbSkinColor(196, 158, 122);   // muted tan (HUD people icon)
 
 // Kin lines: every barb rolls a race at birth. Body colour stays shared so task stripes read the same;
@@ -254,6 +260,7 @@ const int ballotShowFrames = 480;          // ~8s on screen (frames, so it reads
 const int ballotFadeFrames = 120;          // last ~2s fade out
 const float ballotMinZoom = 2.0f;          // hidden below this zoom: a 2x2 pip is only 2 screen px at 1x
 const Vector2f ballotPipSize(2.0f, 2.0f);  // same footprint as the household pips, same spot above the head
+const Vector2f gentryBallotPipSize(2.0f, 4.0f); // R24-F1: Gentry pip is twice as tall (double vote), grows upward
 const Color ballotPipColors[decreeCount] = {
     Color(70, 190, 170),   // Timber: teal, clear of chop green and build blue
     Color(170, 176, 186),  // Stone: pale slate, darker than the off-white body and idle white
@@ -891,6 +898,7 @@ struct barb {
 };
 
 const raceDef& raceOf(const barb& b) { return raceDefs[b.race]; }
+bool isGentry(const barb& b) { return b.homeHouse < 0; }   // R24-F1: founders; derived, no stored flag
 int mineTicks(const barb& b) { return (int)(rockMineTicks / raceOf(b).mineSpeed / (know.learned[techPickwork] ? pickworkMineSpeed : 1.0f)); }
 
 struct deer {            // any game animal; species picks its row in speciesDefs
@@ -1542,6 +1550,8 @@ bool workTick(barb& b) {
 void hungerTick(vector<barb>& barbs) {
     static int hungryLogCooldown = 0;
     if (hungryLogCooldown > 0) hungryLogCooldown--;
+    // Pass 1: hunger grows (once per barb per tick); the "no food" line is logged at most once per tick
+    int hungryCommoners = 0;
     for (auto& b : barbs) {
         if (!isHungry(b)) {
             b.hunger++;
@@ -1549,14 +1559,21 @@ void hungerTick(vector<barb>& barbs) {
                 logEvent("A barb is hungry - no food");
                 hungryLogCooldown = eventHungryCooldownTicks;
             }
-            continue;
         }
-        if (food <= 0) continue;
+        if (isHungry(b) && !isGentry(b)) hungryCommoners++;
+    }
+    // Pass 2 (R24-F1): eating, Gentry first. While a Commoner is hungry, Gentry leave gentryFoodReserve
+    // so the Commoners are never shut out of the larder entirely.
+    auto eat = [](barb& b) {
         food--;
         b.hunger = 0;
         b.slowTick = 0;
-        printf("BARB ATE - Food: %d\n", food);
-    }
+        printf("BARB ATE (%s) - Food: %d\n", isGentry(b) ? "Gentry" : "Commoner", food);
+    };
+    for (auto& b : barbs)
+        if (isGentry(b) && isHungry(b) && food > (hungryCommoners > 0 ? gentryFoodReserve : 0)) eat(b);
+    for (auto& b : barbs)
+        if (!isGentry(b) && isHungry(b) && food > 0) eat(b);
 }
 
 Color hungryTint(Color c) {
@@ -1626,6 +1643,13 @@ void drawBarbs(RenderWindow& window, const vector<barb>& barbs, const vector<Rec
             stripe.setSize(Vector2f(bodySize.x, barbStripeH));
             stripe.setFillColor(tc);
             stripe.setPosition(Vector2f(base.x, bodyTop + barbStripeTop));
+            window.draw(stripe);
+        }
+        if (isGentry(b)) {   // R24-F1: sash on its own row; a slouching dwarf (2 rows) wears it on row 0 so it never hits the stripe
+            float sashTop = gentrySashTop + gentrySashH <= bodyH ? gentrySashTop : 0.0f;
+            stripe.setSize(Vector2f(bodySize.x, gentrySashH));
+            stripe.setFillColor(gentrySashColor);
+            stripe.setPosition(Vector2f(base.x, bodyTop + sashTop));
             window.draw(stripe);
         }
         if (rd.hatSize.x > 0.0f) {                       // race mark above the head, never on the body
@@ -1985,6 +2009,7 @@ void drawTooltip(RenderWindow& window, const Font& font, const string& label, Ve
 // Everything the HUD shows, gathered once per frame in main
 struct hudValues {
     int wood, stone, food, hungry, people, houses, hour, speed;
+    int gentry, commoners;   // R24-F1: founders vs house-born
     bool night, paused, raining;
     const char* trader;      // Away / Arriving / Trading / Leaving
     const char* tradeLine;   // last trade message, "" when expired
@@ -2009,9 +2034,9 @@ void drawIcon(RenderWindow& window, hudIconId id, Vector2f pos) {
 
 // The old full text block, now shown as a tooltip while hovering the strip
 string hudDetailText(const hudValues& v) {
-    char buf[340];
-    snprintf(buf, sizeof(buf), "Settlement: %s\nWood: %d\nStone: %d\nFood: %d\nHungry: %d\nPopulation: %d\nHouses: %d\nTime: %02d:00 (%s)\nSpeed: %dx%s\nWeather: %s\nTrader: %s%s%s",
-             v.era, v.wood, v.stone, v.food, v.hungry, v.people, v.houses, v.hour, v.night ? "Night" : "Day", v.speed, v.paused ? " PAUSED" : "",
+    char buf[380];
+    snprintf(buf, sizeof(buf), "Settlement: %s\nWood: %d\nStone: %d\nFood: %d\nHungry: %d\nPopulation: %d (Gentry %d, Commoners %d)\nHouses: %d\nTime: %02d:00 (%s)\nSpeed: %dx%s\nWeather: %s\nTrader: %s%s%s",
+             v.era, v.wood, v.stone, v.food, v.hungry, v.people, v.gentry, v.commoners, v.houses, v.hour, v.night ? "Night" : "Day", v.speed, v.paused ? " PAUSED" : "",
              v.raining ? "Rain" : "Clear", v.trader, v.tradeLine[0] ? "\n" : "", v.tradeLine);
     string s = buf;
     s += "\nKnow-how:";
@@ -2988,9 +3013,11 @@ void drawBallots(RenderWindow& window, const View& worldView, float zoom,
         Color c = ballotPipColors[barbs[i].lastVote];
         c.a = (uint8_t)(255 * a);
         pip.setFillColor(c);
+        Vector2f ps = isGentry(barbs[i]) ? gentryBallotPipSize : ballotPipSize;   // R24-F1: double vote, taller pip
+        pip.setSize(ps);
         Vector2f top = snapPx(squares[i].getPosition());
-        float cx = top.x + round((squares[i].getSize().x - ballotPipSize.x) / 2.0f);
-        pip.setPosition(Vector2f(cx, top.y - householdPipGap - ballotPipSize.y));
+        float cx = top.x + round((squares[i].getSize().x - ps.x) / 2.0f);
+        pip.setPosition(Vector2f(cx, top.y - householdPipGap - ps.y));
         window.draw(pip);
     }
 }
@@ -3001,15 +3028,24 @@ void councilTick(vector<barb>& barbs) {
     lastHour = game_time;
     if (game_time != councilDawnHour || barbs.empty()) return;
     int votes[decreeCount] = {0, 0, 0};
-    for (auto& b : barbs) votes[castBallot(b)]++;
+    int gentry = 0;
+    for (auto& b : barbs) {
+        bool g = isGentry(b);
+        votes[castBallot(b)] += g ? gentryVoteWeight : 1;   // R24-F1: founders' ballots count double
+        gentry += g ? 1 : 0;
+    }
     ballotFramesLeft = ballotShowFrames;
     int top = *max_element(votes, votes + decreeCount);
     vector<int> tied;
     for (int d = 0; d < decreeCount; d++) if (votes[d] == top) tied.push_back(d);
     currentDecree = (councilDecree)tied[uniform_int_distribution<int>(0, (int)tied.size() - 1)(gen)];
-    printf("DAWN COUNCIL - Timber %d, Stone %d, Berries %d -> %s\n", votes[decreeTimber], votes[decreeStone], votes[decreeBerries], decreeNames[currentDecree]);
+    printf("DAWN COUNCIL - Timber %d, Stone %d, Berries %d -> %s (Gentry %d x%d, Commoners %d)\n", votes[decreeTimber], votes[decreeStone],
+           votes[decreeBerries], decreeNames[currentDecree], gentry, gentryVoteWeight, (int)barbs.size() - gentry);
     logEvent(string("Council decrees ") + decreeNames[currentDecree] + " (" + to_string(votes[decreeTimber]) + "-" +
              to_string(votes[decreeStone]) + "-" + to_string(votes[decreeBerries]) + ")");
+    if (gentry > 0)   // R24-F1 ticker line: who carried the weight this dawn
+        logEvent(to_string(gentry) + " Gentry cast " + to_string(gentry * gentryVoteWeight) + " of " +
+                 to_string(gentry * gentryVoteWeight + (int)barbs.size() - gentry) + " votes");
 }
 
 int popCap(const vector<house>& houses) {
@@ -3816,6 +3852,7 @@ int main() {
             hudValues hv{};
             hv.wood = wood; hv.stone = stone; hv.food = food;
             for (auto& b : barbs) if (isHungry(b)) hv.hungry++;
+            for (auto& b : barbs) (isGentry(b) ? hv.gentry : hv.commoners)++;
             hv.people = (int)barbs.size();
             hv.houses = (int)houses.size();
             hv.hour = t;
