@@ -11,3 +11,4 @@ feature-reports/run.state
 feature-reports/chat.jsonl
 feature-reports/board-progress.json
 feature-reports/.progress-seen.json
+feature-reports/usage.json
