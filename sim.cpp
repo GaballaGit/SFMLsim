@@ -344,6 +344,41 @@ const Color stallPostColor(80, 56, 36);
 const Color stallCounterColor(128, 92, 58);
 const Color stallGoodsWoodColor(214, 160, 90); // 1px crates on the counter while a bonus trade is under way
 const Color stallGoodsStoneColor(170, 170, 160);
+
+// Smokehouse roof takes the colour of the village's majority race (by house builders); tie or no houses = default brown
+const Color smokehouseRoofRaceColors[raceCount] = {   // human, dwarf, elf (indexed by barbRace)
+    smokehouseRoofColor,
+    Color(72, 70, 66),                         // dark stone grey
+    Color(66, 82, 62),                         // dark sage
+};
+
+// Dwarf forge: at most one, built by an idle dwarf once dwarves have built enough houses
+const int forgeWoodCost = 10;
+const int forgeStoneCost = 8;              // the forge is where stone goes; houses keep houseStoneCost in reserve
+const int forgeMinDwarfHouses = 2;
+const int forgeBuildTicks = 600;           // same work as a house
+const int houseBuildTicks = 600;
+const Vector2f forgePos(375.0f, 393.0f);   // forge top-left: west of the campfire, clear of the smokehouse smoke column
+const Vector2f forgeStandOffset(-3.0f, 1.0f); // builder's spot relative to the forge: stands at its left wall
+const float forgeClearPx = 3.0f;           // houses, shrines and the smokehouse keep this far from the forge footprint
+struct forgePart {Vector2f pos, size; Color color;};
+const int forgePartCount = 4;
+const forgePart forgeParts[forgePartCount] = {   // drawn in order, offsets from forgePos
+    {{0.0f, 0.0f}, {7.0f, 5.0f}, Color(84, 90, 98)},   // slate body
+    {{0.0f, 0.0f}, {7.0f, 1.0f}, Color(58, 62, 70)},   // darker slate roof row
+    {{1.0f, 2.0f}, {2.0f, 2.0f}, Color(28, 28, 32)},   // hearth mouth
+    {{4.0f, 3.0f}, {2.0f, 2.0f}, Color(44, 46, 52)},   // 2x2 iron anvil
+};
+const Vector2f forgeEmberPos(2.0f, 3.0f);  // 1px ember at the back of the hearth mouth
+const Color forgeEmberDim(96, 46, 30);     // breathing range: low contrast against the dark mouth
+const Color forgeEmberLit(132, 64, 36);
+const Color forgeEmberHot(176, 90, 44);    // brief glow after a dwarf mines a rock
+const int forgeEmberBreathFrames = 150;    // one slow breath every ~2.5s
+const int forgeEmberBoostFrames = 120;     // ~2s brighter after a dwarf mines (frames, so it reads the same at any speed)
+
+// Build jobs: which structure a barb's movingbspot/building belongs to. jobNone = no job, or a house (buildhouse()).
+enum buildJob {jobNone, jobShrine, jobSmoke, jobStall, jobForge, buildJobCount};
+const int buildJobTicks[buildJobCount] = {houseBuildTicks, shrineBuildTicks, smokehouseBuildTicks, stallBuildTicks, forgeBuildTicks};
 // Game animals share the deer code (deers/deershape vectors); per-species numbers live in speciesDefs below.
 // Sprite offsets are relative to the logic shape (body = hitbox), written for an animal facing right.
 enum animalSpecies {speciesDeer, speciesRabbit, speciesCount};
@@ -603,6 +638,14 @@ struct smokehouse {bool built = false; bool claimed = false; int boostTicks = 0;
 bool hasStall = false;      // market stall standing: traderTick() allows stallExtraLots more lots
 bool stallClaimed = false;  // a builder is on the stall
 int stallBonusLots = 0;     // extra lots the stall added to the current visit; drawn as crates while the trader is Trading
+struct forge {bool built = false; bool claimed = false;}; // the one dwarf forge; claimed = a builder is on it
+int forgeEmberFrames = 0;   // >0 = ember glows hot; set when a dwarf mines a rock, counted down per drawn frame
+
+// False if r comes within forgeClearPx of the forge footprint (reserved from the start, built or not)
+bool forgeClear(const FloatRect& r) {
+    FloatRect zone(forgePos - Vector2f(forgeClearPx, forgeClearPx), forgeParts[0].size + Vector2f(2 * forgeClearPx, 2 * forgeClearPx));
+    return !r.findIntersection(zone).has_value();
+}
 
 struct barb {
     int id = -1;                 // stable, unique; assigned only by makeBarb()
@@ -615,9 +658,7 @@ struct barb {
     bool building = false;
     bool reservedwood = false;
     int reservedstone = 0;       // stone held for a house foundation (or a shrine); refunded with the wood on cancel
-    bool shrineJob = false;      // movingbspot/building belong to a shrine, not a house; buildhouse() skips these
-    bool smokeJob = false;       // movingbspot/building belong to the smokehouse; buildhouse() and buildshrine() skip these
-    bool stallJob = false;       // movingbspot/building belong to the market stall; the other builders skip these
+    buildJob jobKind = jobNone;  // structure the movingbspot/building belongs to; each builder skips the others' jobs
     int stepTimer = 0;
     bool targetIsRock = false;
     bool targetIsBush = false;   // chopping + targetIsBush = picking; shares timer/chopping with chop and mine
@@ -1779,16 +1820,18 @@ void buildhouse(vector<barb>& barbs,vector<RectangleShape>& squares, vector<hous
     for (int i = 0; i < (int)squares.size(); i++) {
         auto& sq = squares[i];
         auto& b  = barbs[i];
-        if (b.shrineJob || b.smokeJob || b.stallJob) continue;   // buildshrine() / buildsmokehouse() / buildstall() own this barb
+        if (b.jobKind != jobNone) continue;   // buildshrine() / buildsmokehouse() / buildstall() / buildforge() own this barb
         if (b.chopping || (b.timer > 0 && !b.building)) continue;
         if (!b.movingbspot && !b.moving) {
             if (!canclaim || wood < houseWoodCost) continue;
+            int tx = 400 + buildSpotDX(gen), ty = 400 + buildSpotDY(gen);
+            if (!forgeClear(FloatRect(Vector2f(tx - 3.0f, ty - 3.0f), houseSlabSize))) continue; // house + roof + slab; reroll next tick
             wood -= houseWoodCost;
             b.reservedwood = true;
             b.reservedstone = stone >= houseStoneCost ? houseStoneCost : 0; // 0 stone -> plain house
             stone -= b.reservedstone;
-            b.targetx = 400 + buildSpotDX(gen);
-            b.targety = 400 + buildSpotDY(gen);
+            b.targetx = tx;
+            b.targety = ty;
             b.moving = true;
             b.movingbspot = true;
             break;
@@ -1809,7 +1852,7 @@ void buildhouse(vector<barb>& barbs,vector<RectangleShape>& squares, vector<hous
                 }
                 b.building = true;
                 if (workTick(b)) b.timer++;
-                if (b.timer >= 600) {
+                if (b.timer >= houseBuildTicks) {
                     b.reservedwood = false;
                     house h{b.targetx, b.targety, 100, b.reservedstone > 0, nextHouseId++, b.race};
                     b.reservedstone = 0;
@@ -1851,7 +1894,7 @@ int findShrineById(const vector<shrine>& shrines, int id) {
 // Only spends stone above a house foundation's worth, and only once housing is ahead of the shrine count.
 void buildshrine(vector<barb>& barbs, vector<RectangleShape>& squares, const vector<house>& houses, vector<shrine>& shrines) {
     int pending = 0;
-    for (auto& b : barbs) if (b.shrineJob) pending++;
+    for (auto& b : barbs) if (b.jobKind == jobShrine) pending++;
     int planned = (int)shrines.size() + pending;
     bool canclaim = planned < maxShrines
                  && (int)houses.size() >= (planned + 1) * shrineHousesPerShrine
@@ -1859,7 +1902,7 @@ void buildshrine(vector<barb>& barbs, vector<RectangleShape>& squares, const vec
     for (int i = 0; i < (int)squares.size() && i < (int)barbs.size(); i++) {
         auto& sq = squares[i];
         auto& b  = barbs[i];
-        if (b.smokeJob || b.stallJob) continue;    // buildsmokehouse() / buildstall() own this barb
+        if (b.jobKind != jobNone && b.jobKind != jobShrine) continue; // buildsmokehouse() / buildstall() / buildforge() own this barb
         if (b.chopping || (b.timer > 0 && !b.building)) continue;
         if (!b.movingbspot && !b.moving) {
             if (!canclaim) continue;
@@ -1878,9 +1921,11 @@ void buildshrine(vector<barb>& barbs, vector<RectangleShape>& squares, const vec
                 }
                 FloatRect hutClear(smokehousePos + smokehouseChimneyPos - Vector2f(smokehouseClearPx, smokehouseClearPx),
                                    Vector2f(smokehouseSize.x, smokehouseSize.y - smokehouseChimneyPos.y) + Vector2f(2 * smokehouseClearPx, 2 * smokehouseClearPx));
-                if (FloatRect(p - Vector2f(0.0f, shrineCapH), shrineSlabSize + Vector2f(0.0f, shrineCapH)).findIntersection(hutClear).has_value()) found = false; // keep the smokehouse spot free
+                FloatRect stoneRect(p - Vector2f(0.0f, shrineCapH), shrineSlabSize + Vector2f(0.0f, shrineCapH));
+                if (stoneRect.findIntersection(hutClear).has_value()) found = false; // keep the smokehouse spot free
+                if (!forgeClear(stoneRect)) found = false;                          // and the forge spot
                 for (auto& o : barbs) {
-                    if (!o.shrineJob) continue;
+                    if (o.jobKind != jobShrine) continue;
                     Vector2f d = p - shrineSlabPos(o.targetx, o.targety);
                     if (d.x * d.x + d.y * d.y < shrineMinSpacing * shrineMinSpacing) found = false;
                 }
@@ -1889,12 +1934,12 @@ void buildshrine(vector<barb>& barbs, vector<RectangleShape>& squares, const vec
             if (!found) continue;
             stone -= shrineStoneCost;
             b.reservedstone = shrineStoneCost;
-            b.shrineJob = true;
+            b.jobKind = jobShrine;
             b.targetx = tx;
             b.targety = ty;
             b.moving = true;
             b.movingbspot = true;
-        } else if (b.movingbspot && b.shrineJob) {
+        } else if (b.movingbspot && b.jobKind == jobShrine) {
             Vector2f pos  = sq.getPosition();
             Vector2f diff = Vector2f(b.targetx, b.targety) - pos;
             float dSq = diff.x * diff.x + diff.y * diff.y;
@@ -1903,7 +1948,7 @@ void buildshrine(vector<barb>& barbs, vector<RectangleShape>& squares, const vec
                 if ((int)shrines.size() >= maxShrines) {   // cap reached while walking: refund
                     stone += b.reservedstone;
                     b.reservedstone = 0;
-                    b.shrineJob = false;
+                    b.jobKind = jobNone;
                     b.moving = b.movingbspot = b.building = false;
                     b.timer = 0;
                     continue;
@@ -1915,7 +1960,7 @@ void buildshrine(vector<barb>& barbs, vector<RectangleShape>& squares, const vec
                     shrine s{(int)p.x, (int)p.y, nextShrineId++};
                     shrines.push_back(s);
                     b.reservedstone = 0;
-                    b.shrineJob = false;
+                    b.jobKind = jobNone;
                     b.building = b.moving = b.movingbspot = false;
                     b.timer = 0;
                     printf("---SHRINE BUILT--- id %d (%d/%d)\n", s.id, (int)shrines.size(), maxShrines);
@@ -1946,63 +1991,98 @@ void drawShrines(RenderWindow& window, const vector<shrine>& shrines) {
     }
 }
 
-// Runs after buildshrine(). One builder ever: claimed is set on the claim and cleared only once the hut stands.
-// Houses keep first call on stone; wood is whatever buildhouse() left this tick.
-void buildsmokehouse(vector<barb>& barbs, vector<RectangleShape>& squares, const vector<house>& houses, smokehouse& sh) {
-    if (sh.boostTicks > 0) sh.boostTicks--;
-    if (sh.built) return;
+// Shared plumbing for the one-off village structures (smokehouse, stall, forge): one builder each, fixed spot.
+// While !claimed, the first free barb that ready() accepts is sent to `stand`. ready(b) returns -1 to stop looking
+// this tick (colony-wide condition unmet), 0 to skip this barb, 1 to claim (ready() spends any cost before returning 1).
+// Once claimed, only the builder holding `kind` is advanced. Returns true on the tick the structure is finished;
+// the builder's jobKind and build flags are reset on that path.
+template <class ReadyFn>
+bool buildOneOff(vector<barb>& barbs, vector<RectangleShape>& squares, bool& claimed, buildJob kind,
+                 Vector2f stand, const char* name, ReadyFn ready) {
     for (int i = 0; i < (int)squares.size() && i < (int)barbs.size(); i++) {
         auto& sq = squares[i];
         auto& b  = barbs[i];
-        if (!sh.claimed) {
-            if (b.shrineJob || b.stallJob || b.chopping || b.timer > 0 || b.moving || b.movingbspot || b.building) continue;
-            if ((int)houses.size() < smokehouseMinHouses || wood < smokehouseWoodCost
-                || stone < smokehouseStoneCost + houseStoneCost) return;
-            wood -= smokehouseWoodCost;
-            stone -= smokehouseStoneCost;
-            sh.claimed = true;
-            b.smokeJob = true;
-            Vector2f stand = smokehousePos + smokehouseStandOffset;
+        if (!claimed) {
+            if (b.jobKind != jobNone || b.chopping || b.timer > 0 || b.moving || b.movingbspot || b.building) continue;
+            int r = ready(b);
+            if (r < 0) return false;
+            if (r == 0) continue;
+            claimed = true;
+            b.jobKind = kind;
             b.targetx = (int)stand.x;
             b.targety = (int)stand.y;
             b.moving = true;
             b.movingbspot = true;
-            printf("SMOKEHOUSE CLAIMED - wood: %d stone: %d\n", wood, stone);
-            return;
+            printf("%s CLAIMED - barb %d wood: %d stone: %d\n", name, b.id, wood, stone);
+            return false;
         }
-        if (!b.smokeJob || !b.movingbspot) continue;
+        if (b.jobKind != kind || !b.movingbspot) continue;
         Vector2f pos  = sq.getPosition();
         Vector2f diff = Vector2f(b.targetx, b.targety) - pos;
         float dSq = diff.x * diff.x + diff.y * diff.y;
         if (dSq < 1.0f) {
             b.building = true;
             if (workTick(b)) b.timer++;
-            if (b.timer >= smokehouseBuildTicks) {
-                sh.built = true;
-                b.smokeJob = false;
+            if (b.timer >= buildJobTicks[kind]) {
+                b.jobKind = jobNone;
                 b.building = b.moving = b.movingbspot = false;
                 b.timer = 0;
-                printf("---SMOKEHOUSE BUILT--- +%d food per deer/rabbit kill\n", smokehouseFoodBonus);
-                logEvent("Smokehouse built (+" + to_string(smokehouseFoodBonus) + " food per kill)");
+                return true;
             }
         } else if (++b.stepTimer >= stepLimit(b, pos)) {
             b.stepTimer = 0;
             sq.move(diff / sqrt(dSq));
             trailStep(sq.getPosition());
         }
-        return;
+        return false;
     }
+    return false;
+}
+
+// Runs after buildshrine(). One builder ever: claimed is set on the claim and stays set once the hut stands.
+// Houses keep first call on stone; wood is whatever buildhouse() left this tick.
+void buildsmokehouse(vector<barb>& barbs, vector<RectangleShape>& squares, const vector<house>& houses, smokehouse& sh) {
+    if (sh.boostTicks > 0) sh.boostTicks--;
+    if (sh.built) return;
+    bool done = buildOneOff(barbs, squares, sh.claimed, jobSmoke, smokehousePos + smokehouseStandOffset, "SMOKEHOUSE",
+        [&](const barb&) {
+            if ((int)houses.size() < smokehouseMinHouses || wood < smokehouseWoodCost
+                || stone < smokehouseStoneCost + houseStoneCost) return -1;
+            if (!forgeClear(FloatRect(smokehousePos + smokehouseChimneyPos, Vector2f(smokehouseSize.x, smokehouseSize.y - smokehouseChimneyPos.y))))
+                return -1;   // fixed spots: only trips if the layout constants are moved onto the forge
+            wood -= smokehouseWoodCost;
+            stone -= smokehouseStoneCost;
+            return 1;
+        });
+    if (!done) return;
+    sh.built = true;
+    printf("---SMOKEHOUSE BUILT--- +%d food per deer/rabbit kill\n", smokehouseFoodBonus);
+    logEvent("Smokehouse built (+" + to_string(smokehouseFoodBonus) + " food per kill)");
+}
+
+// Race with strictly the most houses; a tie for first (or no houses) gives raceHuman, the default style
+barbRace majorityRace(const vector<house>& houses) {
+    int n[raceCount] = {};
+    for (auto& h : houses) n[h.race]++;
+    int best = -1, bestN = 0;
+    bool tie = false;
+    for (int r = 0; r < raceCount; r++) {
+        if (n[r] > bestN) { best = r; bestN = n[r]; tie = false; }
+        else if (n[r] == bestN && bestN > 0) tie = true;
+    }
+    return (best < 0 || tie) ? raceHuman : (barbRace)best;
 }
 
 // Dark 6x5 hut: 2 roof rows over 3 wall rows, a 1x2 door and a grey 1x2 chimney. Drawn with the shrines.
-void drawSmokehouse(RenderWindow& window, const smokehouse& sh) {
+// Only the roof is tinted to the majority race's colour.
+void drawSmokehouse(RenderWindow& window, const smokehouse& sh, const vector<house>& houses) {
     if (!sh.built) return;
     RectangleShape r(smokehouseSize);
     r.setPosition(smokehousePos);
     r.setFillColor(smokehouseWallColor);
     window.draw(r);
     r.setSize(Vector2f(smokehouseSize.x, smokehouseRoofH));
-    r.setFillColor(smokehouseRoofColor);
+    r.setFillColor(smokehouseRoofRaceColors[majorityRace(houses)]);
     window.draw(r);
     r.setSize(smokehouseDoorSize);
     r.setPosition(smokehousePos + smokehouseDoorPos);
@@ -2035,52 +2115,61 @@ void drawSmoke(RenderWindow& window, const smokehouse& sh, int frame) {
 }
 
 // Runs after buildsmokehouse(). One builder ever; costs nothing but the builder's time.
-// If the builder is lost before finishing (no barb holds stallJob), the claim is released so another idle barb can take it.
+// If the builder is lost before finishing (no barb holds jobStall), the claim is released so another idle barb can take it.
 void buildstall(vector<barb>& barbs, vector<RectangleShape>& squares) {
     if (hasStall) return;
     if (stallClaimed) {
         bool held = false;
-        for (auto& b : barbs) if (b.stallJob) held = true;
+        for (auto& b : barbs) if (b.jobKind == jobStall) held = true;
         if (!held) stallClaimed = false;
     }
-    for (int i = 0; i < (int)squares.size() && i < (int)barbs.size(); i++) {
-        auto& sq = squares[i];
-        auto& b  = barbs[i];
-        if (!stallClaimed) {
-            if (b.shrineJob || b.smokeJob || b.chopping || b.timer > 0 || b.moving || b.movingbspot || b.building) continue;
-            stallClaimed = true;
-            b.stallJob = true;
-            Vector2f stand = stallPos + stallStandOffset;
-            b.targetx = (int)stand.x;
-            b.targety = (int)stand.y;
-            b.moving = true;
-            b.movingbspot = true;
-            printf("MARKET STALL CLAIMED - barb %d\n", b.id);
-            return;
-        }
-        if (!b.stallJob || !b.movingbspot) continue;
-        Vector2f pos  = sq.getPosition();
-        Vector2f diff = Vector2f(b.targetx, b.targety) - pos;
-        float dSq = diff.x * diff.x + diff.y * diff.y;
-        if (dSq < 1.0f) {
-            b.building = true;
-            if (workTick(b)) b.timer++;
-            if (b.timer >= stallBuildTicks) {
-                hasStall = true;
-                stallClaimed = false;
-                b.stallJob = false;
-                b.building = b.moving = b.movingbspot = false;
-                b.timer = 0;
-                printf("---MARKET STALL BUILT--- traders take +%d lots\n", stallExtraLots);
-                logEvent("Market stall built (+" + to_string(stallExtraLots) + " trade lots)");
-            }
-        } else if (++b.stepTimer >= stepLimit(b, pos)) {
-            b.stepTimer = 0;
-            sq.move(diff / sqrt(dSq));
-            trailStep(sq.getPosition());
-        }
-        return;
+    if (!buildOneOff(barbs, squares, stallClaimed, jobStall, stallPos + stallStandOffset, "MARKET STALL",
+                     [](const barb&) { return 1; })) return;
+    hasStall = true;
+    stallClaimed = false;
+    printf("---MARKET STALL BUILT--- traders take +%d lots\n", stallExtraLots);
+    logEvent("Market stall built (+" + to_string(stallExtraLots) + " trade lots)");
+}
+
+// Runs after buildstall(). One builder ever, and it must be a dwarf; only once dwarves have built
+// forgeMinDwarfHouses houses. Costs wood and stone, with houseStoneCost kept back for the next house.
+void buildforge(vector<barb>& barbs, vector<RectangleShape>& squares, const vector<house>& houses, forge& fg) {
+    if (fg.built) return;
+    bool done = buildOneOff(barbs, squares, fg.claimed, jobForge, forgePos + forgeStandOffset, "FORGE",
+        [&](const barb& b) {
+            int dwarfHouses = 0;
+            for (auto& h : houses) if (h.race == raceDwarf) dwarfHouses++;
+            if (dwarfHouses < forgeMinDwarfHouses || wood < forgeWoodCost || stone < forgeStoneCost + houseStoneCost) return -1;
+            if (b.race != raceDwarf) return 0;
+            wood -= forgeWoodCost;
+            stone -= forgeStoneCost;
+            return 1;
+        });
+    if (!done) return;
+    fg.built = true;
+    printf("---FORGE BUILT--- (%d wood, %d stone)\n", forgeWoodCost, forgeStoneCost);
+    logEvent("Dwarves light a forge");
+}
+
+// 7x5 slate forge: darker roof row, hearth mouth with a 1px breathing ember, 2x2 iron anvil.
+// The ember glows hotter for ~2s after a dwarf mines a rock. Drawn with the shrines, under barbs and trees.
+void drawForge(RenderWindow& window, const forge& fg, int frame) {
+    if (!fg.built) return;
+    RectangleShape r;
+    for (auto& p : forgeParts) {
+        r.setSize(p.size);
+        r.setPosition(forgePos + p.pos);
+        r.setFillColor(p.color);
+        window.draw(r);
     }
+    float t = 0.5f + 0.5f * sin(frame * 6.2831853f / forgeEmberBreathFrames);
+    Color lo = forgeEmberDim, hi = forgeEmberLit;
+    if (forgeEmberFrames > 0) { lo = forgeEmberLit; hi = forgeEmberHot; }
+    auto mix = [t](uint8_t a, uint8_t c) { return (uint8_t)(a + (c - a) * t); };
+    r.setSize(Vector2f(1.0f, 1.0f));
+    r.setPosition(forgePos + forgeEmberPos);
+    r.setFillColor(Color(mix(lo.r, hi.r), mix(lo.g, hi.g), mix(lo.b, hi.b)));
+    window.draw(r);
 }
 
 // 7x6 stall: striped 2-row awning on two 1px posts over a 2-row counter. While a trader is Trading on a visit
@@ -2450,6 +2539,7 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
 			if (workTick(b)) b.timer++;
 			if (b.timer >= mineTicks(b)) {           // dwarves finish rocks faster
 				stone++;
+				if (b.race == raceDwarf) forgeEmberFrames = forgeEmberBoostFrames; // forge ember flares (drawn only once built)
 				swapRemove(rocks, i);
 				swapRemove(octs, i);
 				swapRemove(rockClaim, i);
@@ -2564,6 +2654,7 @@ int main() {
     vector<shrine> shrines;
     shrines.reserve(maxShrines);
     smokehouse smoke;
+    forge dwarfForge;
 
     vector<deer> deers;
     vector<RectangleShape> deershape;
@@ -2674,6 +2765,7 @@ int main() {
                 buildshrine(barbs, squares, houses, shrines);
                 buildsmokehouse(barbs, squares, houses, smoke);
                 buildstall(barbs, squares);
+                buildforge(barbs, squares, houses, dwarfForge);
                 minematerials(squares, barbs, tris, stumps, trees, octs, rocks, bushes, bushshapes);
                 barbmove(squares, barbs);
                 treespawn(trees, tris, stumps);
@@ -2741,8 +2833,10 @@ int main() {
 	}
 	drawHouses(window, houses, houseshapes);
 	drawShrines(window, shrines);
-	drawSmokehouse(window, smoke);
+	drawSmokehouse(window, smoke, houses);
 	drawStall(window, activeTrader);
+	drawForge(window, dwarfForge, frameCount);
+	if (forgeEmberFrames > 0 && !paused) forgeEmberFrames--;
 
 	drawCampfire(window, fire, frameCount);
 
@@ -2768,7 +2862,7 @@ int main() {
             if (b.chopping && b.timer > 0 && b.targetIsBush)
                 drawBar(window, Vector2f(b.targetx - 10, b.targety - 14), (float)b.timer / bushPickTicks, pal.barPick);
             if (b.building &&  b.timer > 0)
-                drawBar(window, Vector2f(b.targetx - 9, b.targety - 10), b.timer / (b.shrineJob ? (float)shrineBuildTicks : b.smokeJob ? (float)smokehouseBuildTicks : b.stallJob ? (float)stallBuildTicks : 600.0f), pal.barBuild);
+                drawBar(window, Vector2f(b.targetx - 9, b.targety - 10), b.timer / (float)buildJobTicks[b.jobKind], pal.barBuild);
 	    if (b.chopping && b.timer > 0 && b.targetIsRock)
                 drawBar(window, Vector2f(b.targetx - 10, b.targety - 16), (float)b.timer / mineTicks(b), pal.barMine);
 	}
