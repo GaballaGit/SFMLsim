@@ -252,6 +252,21 @@ const Color houseWindowDayColor(52, 54, 50);   // dark glass by day
 const Color houseWindowNightColor(240, 190, 95); // warm lamp, drawn after the night overlay
 const float houseWindowGlowPx = 1.0f;      // faint additive halo this far around a lit window
 const Color houseWindowGlowColor(90, 60, 20, 255); // additive, so this is a gentle warm lift
+
+// Shrine stones: build and placement only (no prayer yet). Houses always get first call on stone.
+const int maxShrines = 3;                  // hard cap on standing stones in the village
+const int shrineStoneCost = 10;            // small: ~10 rocks mined; only spent with houseStoneCost left over
+const int shrineHousesPerShrine = 3;       // one shrine per this many houses, so shrines trail the housing
+const int shrineBuildTicks = 600;          // same work as a house
+const float shrineMinRadius = 18.0f;       // placed in a ring around the campfire, inside the 50px clearing
+const float shrineMaxRadius = 40.0f;
+const float shrineMinSpacing = 10.0f;      // keep stones from overlapping each other
+const int shrinePlaceTries = 8;
+const Vector2f shrineSlabSize(4.0f, 8.0f); // standing slab, about half a tree tall
+const float shrineCapH = 2.0f;             // gold cap sits on top of the slab (4x2)
+const Vector2f shrineStandOffset(3.0f, -6.0f); // slab top-left relative to the builder's spot: barb stands at its left foot
+const Color shrineSlabColor(138, 136, 128); // warm stone grey: lighter than rocks (125), clear of wolf blue-grey
+const Color shrineCapColor(214, 192, 118); // pale gold: not mine orange, lamp amber, hover gold or hungry tan
 // Game animals share the deer code (deers/deershape vectors); per-species numbers live in speciesDefs below.
 // Sprite offsets are relative to the logic shape (body = hitbox), written for an animal facing right.
 enum animalSpecies {speciesDeer, speciesRabbit, speciesCount};
@@ -505,6 +520,8 @@ RectangleShape bushDrawShape(const CircleShape& bs) {
 
 struct house {int x, y, health; bool hasFoundation = false; int id = -1;}; // id: stable, from nextHouseId
 int nextHouseId = 0;   // assigned only in buildhouse(); never reused, so ids survive any swapRemove
+struct shrine {int x, y; int id = -1;};  // x,y = slab top-left; id: stable, from nextShrineId (refer to shrines by id, never index)
+int nextShrineId = 0;  // assigned only in buildshrine(); at most maxShrines are ever standing
 
 struct barb {
     int id = -1;                 // stable, unique; assigned only by makeBarb()
@@ -516,7 +533,8 @@ struct barb {
     bool movingbspot = false;
     bool building = false;
     bool reservedwood = false;
-    int reservedstone = 0;       // stone held for a house foundation; refunded with the wood on cancel
+    int reservedstone = 0;       // stone held for a house foundation (or a shrine); refunded with the wood on cancel
+    bool shrineJob = false;      // movingbspot/building belong to a shrine, not a house; buildhouse() skips these
     int stepTimer = 0;
     bool targetIsRock = false;
     bool targetIsBush = false;   // chopping + targetIsBush = picking; shares timer/chopping with chop and mine
@@ -1660,6 +1678,7 @@ void buildhouse(vector<barb>& barbs,vector<RectangleShape>& squares, vector<hous
     for (int i = 0; i < (int)squares.size(); i++) {
         auto& sq = squares[i];
         auto& b  = barbs[i];
+        if (b.shrineJob) continue;   // buildshrine() owns this barb
         if (b.chopping || (b.timer > 0 && !b.building)) continue;
         if (!b.movingbspot && !b.moving) {
             if (!canclaim || wood < houseWoodCost) continue;
@@ -1713,6 +1732,112 @@ void buildhouse(vector<barb>& barbs,vector<RectangleShape>& squares, vector<hous
                 }
             }
         }
+    }
+}
+
+// Slab top-left of a shrine built from this standing spot
+Vector2f shrineSlabPos(int tx, int ty) { return Vector2f((float)tx, (float)ty) + shrineStandOffset; }
+
+// Index of the shrine with this id, or -1 if there is none. Anything that remembers a shrine keeps its id.
+int findShrineById(const vector<shrine>& shrines, int id) {
+    if (id < 0) return -1;
+    for (int i = 0; i < (int)shrines.size(); ++i)
+        if (shrines[i].id == id) return i;
+    return -1;
+}
+
+// Runs after buildhouse(), so a barb free for a house this tick takes the house first.
+// Only spends stone above a house foundation's worth, and only once housing is ahead of the shrine count.
+void buildshrine(vector<barb>& barbs, vector<RectangleShape>& squares, const vector<house>& houses, vector<shrine>& shrines) {
+    int pending = 0;
+    for (auto& b : barbs) if (b.shrineJob) pending++;
+    int planned = (int)shrines.size() + pending;
+    bool canclaim = planned < maxShrines
+                 && (int)houses.size() >= (planned + 1) * shrineHousesPerShrine
+                 && stone >= shrineStoneCost + houseStoneCost;
+    for (int i = 0; i < (int)squares.size() && i < (int)barbs.size(); i++) {
+        auto& sq = squares[i];
+        auto& b  = barbs[i];
+        if (b.chopping || (b.timer > 0 && !b.building)) continue;
+        if (!b.movingbspot && !b.moving) {
+            if (!canclaim) continue;
+            uniform_real_distribution<float> ang(0.0f, 6.2831853f), rad(shrineMinRadius, shrineMaxRadius);
+            bool found = false;
+            int tx = 0, ty = 0;
+            for (int k = 0; k < shrinePlaceTries && !found; k++) {
+                float a = ang(gen), r = rad(gen);
+                tx = (int)(villageCenter.x + cos(a) * r);
+                ty = (int)(villageCenter.y + sin(a) * r);
+                Vector2f p = shrineSlabPos(tx, ty);
+                found = true;
+                for (auto& s : shrines) {
+                    Vector2f d = p - Vector2f((float)s.x, (float)s.y);
+                    if (d.x * d.x + d.y * d.y < shrineMinSpacing * shrineMinSpacing) found = false;
+                }
+                for (auto& o : barbs) {
+                    if (!o.shrineJob) continue;
+                    Vector2f d = p - shrineSlabPos(o.targetx, o.targety);
+                    if (d.x * d.x + d.y * d.y < shrineMinSpacing * shrineMinSpacing) found = false;
+                }
+            }
+            canclaim = false;   // one claim attempt per tick; keep looping so builders already en route still progress
+            if (!found) continue;
+            stone -= shrineStoneCost;
+            b.reservedstone = shrineStoneCost;
+            b.shrineJob = true;
+            b.targetx = tx;
+            b.targety = ty;
+            b.moving = true;
+            b.movingbspot = true;
+        } else if (b.movingbspot && b.shrineJob) {
+            Vector2f pos  = sq.getPosition();
+            Vector2f diff = Vector2f(b.targetx, b.targety) - pos;
+            float dSq = diff.x * diff.x + diff.y * diff.y;
+
+            if (dSq < 1.0f) {
+                if ((int)shrines.size() >= maxShrines) {   // cap reached while walking: refund
+                    stone += b.reservedstone;
+                    b.reservedstone = 0;
+                    b.shrineJob = false;
+                    b.moving = b.movingbspot = b.building = false;
+                    b.timer = 0;
+                    continue;
+                }
+                b.building = true;
+                if (workTick(b)) b.timer++;
+                if (b.timer >= shrineBuildTicks) {
+                    Vector2f p = shrineSlabPos(b.targetx, b.targety);
+                    shrine s{(int)p.x, (int)p.y, nextShrineId++};
+                    shrines.push_back(s);
+                    b.reservedstone = 0;
+                    b.shrineJob = false;
+                    b.building = b.moving = b.movingbspot = false;
+                    b.timer = 0;
+                    printf("---SHRINE BUILT--- id %d (%d/%d)\n", s.id, (int)shrines.size(), maxShrines);
+                    logEvent("Shrine stone raised");
+                }
+            } else {
+                if (++b.stepTimer >= stepLimit(b, pos)) {
+                    b.stepTimer = 0;
+                    sq.move(diff / sqrt(dSq));
+                    trailStep(sq.getPosition());
+                }
+            }
+        }
+    }
+}
+
+// Grey 4x8 standing slab with a 2px pale-gold cap on top. Drawn with the houses, under barbs and trees.
+void drawShrines(RenderWindow& window, const vector<shrine>& shrines) {
+    RectangleShape slab(shrineSlabSize), cap(Vector2f(shrineSlabSize.x, shrineCapH));
+    slab.setFillColor(shrineSlabColor);
+    cap.setFillColor(shrineCapColor);
+    for (auto& s : shrines) {
+        Vector2f o((float)s.x, (float)s.y);
+        slab.setPosition(o);
+        cap.setPosition(o - Vector2f(0.0f, shrineCapH));
+        window.draw(slab);
+        window.draw(cap);
     }
 }
 
@@ -2141,6 +2266,8 @@ int main() {
 
     vector<house> houses;
     vector<RectangleShape> houseshapes;
+    vector<shrine> shrines;
+    shrines.reserve(maxShrines);
 
     vector<deer> deers;
     vector<RectangleShape> deershape;
@@ -2248,6 +2375,7 @@ int main() {
             ticksThisFrame++;
             for (int rep = 0; rep < simSpeed; rep++) {
                 buildhouse(barbs, squares, houses, houseshapes);
+                buildshrine(barbs, squares, houses, shrines);
                 minematerials(squares, barbs, tris, stumps, trees, octs, rocks, bushes, bushshapes);
                 barbmove(squares, barbs);
                 treespawn(trees, tris, stumps);
@@ -2314,6 +2442,7 @@ int main() {
 		}
 	}
 	drawHouses(window, houseshapes);
+	drawShrines(window, shrines);
 
 	drawCampfire(window, fire, frameCount);
 
@@ -2338,7 +2467,7 @@ int main() {
             if (b.chopping && b.timer > 0 && b.targetIsBush)
                 drawBar(window, Vector2f(b.targetx - 10, b.targety - 14), (float)b.timer / bushPickTicks, pal.barPick);
             if (b.building &&  b.timer > 0)
-                drawBar(window, Vector2f(b.targetx - 9, b.targety - 10), b.timer / 600.0f, pal.barBuild);
+                drawBar(window, Vector2f(b.targetx - 9, b.targety - 10), b.timer / (b.shrineJob ? (float)shrineBuildTicks : 600.0f), pal.barBuild);
 	    if (b.chopping && b.timer > 0 && b.targetIsRock)
                 drawBar(window, Vector2f(b.targetx - 10, b.targety - 16), (float)b.timer / mineTicks(b), pal.barMine);
 	}
