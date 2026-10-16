@@ -221,6 +221,15 @@ const int eraTownBarbs = 12;               // a well-established village, long a
 const int eraTownHouses = 10;
 const int eraCheckIntervalTicks = 60;      // recompute about once per second at 1x
 
+// Dawn council: each barb casts one ballot at dawn; the winning decree tilts job weights until the next dawn
+enum councilDecree { decreeTimber, decreeStone, decreeBerries, decreeCount, decreeNone = decreeCount };
+const char* const decreeNames[decreeCount] = {"Timber", "Stone", "Berries"};
+const int councilDawnHour = 6;             // vote when game_time ticks over to this hour (night ends at 6)
+const float councilDecreeMult = 1.3f;      // matching job weight is multiplied by this (after the need clamp, so it always bites)
+const float councilRaceLean = 1.0f;        // ballot score for a barb's racial preference
+const float councilNeedLean = 1.5f;        // ballot score for a full colony need; outweighs race so needs swing the vote
+const councilDecree raceLeans[raceCount] = {decreeBerries, decreeStone, decreeTimber}; // human, dwarf, elf
+
 const int houseWoodCost = 30;
 const int houseStoneCost = 2;              // small; with less stone a plain house is built instead
 const Vector2f houseSlabSize(10.0f, 10.0f); // centred under the 4px house (6px with outline): 2px rim shows
@@ -1693,6 +1702,36 @@ void eraTick(const vector<barb>& barbs, const vector<house>& houses) {
     }
 }
 
+councilDecree currentDecree = decreeNone;   // none until the first dawn
+
+// Ballot: race lean plus colony needs (wood short of a house, stone short of a foundation, this barb hungry or no food)
+councilDecree castBallot(const barb& b) {
+    float score[decreeCount] = {0.0f, 0.0f, 0.0f};
+    score[raceLeans[b.race]] += councilRaceLean;
+    score[decreeTimber]  += councilNeedLean * clamp((float)(houseWoodCost - wood) / (float)houseWoodCost, 0.0f, 1.0f);
+    score[decreeStone]   += councilNeedLean * clamp((float)(houseStoneCost - stone) / (float)houseStoneCost, 0.0f, 1.0f);
+    score[decreeBerries] += (isHungry(b) || food <= 0) ? councilNeedLean : 0.0f;
+    int best = raceLeans[b.race];               // ties go to the barb's own lean
+    for (int d = 0; d < decreeCount; d++) if (score[d] > score[best]) best = d;
+    return (councilDecree)best;
+}
+
+void councilTick(const vector<barb>& barbs) {
+    static int lastHour = game_time;
+    if (game_time == lastHour) return;
+    lastHour = game_time;
+    if (game_time != councilDawnHour || barbs.empty()) return;
+    int votes[decreeCount] = {0, 0, 0};
+    for (auto& b : barbs) votes[castBallot(b)]++;
+    int top = *max_element(votes, votes + decreeCount);
+    vector<int> tied;
+    for (int d = 0; d < decreeCount; d++) if (votes[d] == top) tied.push_back(d);
+    currentDecree = (councilDecree)tied[uniform_int_distribution<int>(0, (int)tied.size() - 1)(gen)];
+    printf("DAWN COUNCIL - Timber %d, Stone %d, Berries %d -> %s\n", votes[decreeTimber], votes[decreeStone], votes[decreeBerries], decreeNames[currentDecree]);
+    logEvent(string("Council decrees ") + decreeNames[currentDecree] + " (" + to_string(votes[decreeTimber]) + "-" +
+             to_string(votes[decreeStone]) + "-" + to_string(votes[decreeBerries]) + ")");
+}
+
 void barbspawner(vector<RectangleShape>& squares, vector<barb>& barbs, const vector<house>& houses, vector<RectangleShape>& houseshapes, vector<birthRing>& rings) {
     for (int i = 0; i < (int)houseshapes.size() && i < (int)houses.size(); i++) {
         if (spawnChance(gen) != 0) continue;
@@ -1792,6 +1831,9 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
             float treeW = clamp(1.0f + treeNeedBoost * woodShort, needWeightMin, needWeightMax);
             float rockW = clamp(1.0f, needWeightMin, needWeightMax);
             float bushW = clamp(1.0f, needWeightMin, needWeightMax);
+            if (currentDecree == decreeTimber)  treeW *= councilDecreeMult;
+            if (currentDecree == decreeStone)   rockW *= councilDecreeMult;
+            if (currentDecree == decreeBerries) bushW *= councilDecreeMult;
             const float notFound = numeric_limits<float>::infinity();
             float treeScore = bestTree != -1 ? treeDSq / (treeW * treeW) : notFound;
             float rockScore = bestRock != -1 ? rockDSq / (rockW * rockW) : notFound;
@@ -2143,6 +2185,7 @@ int main() {
                 bushTick(bushes, bushshapes);
                 campfireTick(fire);
                 eraTick(barbs, houses);
+                councilTick(barbs);
             }
         }
 
