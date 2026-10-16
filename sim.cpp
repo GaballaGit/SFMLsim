@@ -13,7 +13,6 @@
 using namespace sf;
 using namespace std;
 
-const int numbarbs = 1;
 const int numtrees = 2000;
 const int numrocks = 100;
 
@@ -69,6 +68,9 @@ const Color barbSkinColor(196, 158, 122);   // muted tan (HUD people icon)
 // races differ by body size (which is also the hitbox) and a hat mark drawn above the head.
 const int rockMineTicks = 480;              // base work ticks to mine one rock
 enum barbRace { raceHuman, raceDwarf, raceElf, raceCount };
+// Kin clans (R28-F1): the colony starts with an even clan of founders per race
+const int foundersPerRace = 5;
+const int numbarbs = foundersPerRace * raceCount;   // founder i is race i / foundersPerRace
 struct raceDef {
     const char* name;      // capitalised, for the tooltip
     const char* birthName; // with article, for the birth log line ("An elf is born")
@@ -2892,13 +2894,15 @@ struct birthRing {Vector2f pos; int age = 0;};
 int nextBarbId = 0;
 
 // The only place a barb is created: keeps barbs/squares in sync and owns nextBarbId
-void makeBarb(Vector2i pos, vector<barb>& barbs, vector<RectangleShape>& squares, vector<birthRing>& rings, int homeHouse = -1) {
+void makeBarb(Vector2i pos, vector<barb>& barbs, vector<RectangleShape>& squares, vector<birthRing>& rings, int homeHouse, int race) {
     barb b;
     b.id = nextBarbId++;
     b.homeHouse = homeHouse;
     b.x = pos.x;
     b.y = pos.y;
-    b.race = (barbRace)uniform_int_distribution<int>(0, raceCount - 1)(gen);
+    // R28-F1: race passed in by the caller; -1 (or out of range) rolls one at random
+    b.race = (race >= 0 && race < raceCount) ? (barbRace)race
+                                             : (barbRace)uniform_int_distribution<int>(0, raceCount - 1)(gen);
     b.hasSpear = false;   // R20-F3: every new barb starts unarmed with no craft in progress
     b.spearTimer = 0;
     b.trait = (barbTrait)uniform_int_distribution<int>(0, traitCount - 1)(gen);   // R25-F1
@@ -3235,7 +3239,7 @@ void barbspawner(vector<RectangleShape>& squares, vector<barb>& barbs, const vec
         int paid = min(food, birthFoodCost);
         food = max(0, food - birthFoodCost);
         Vector2f pos = houseshapes[i].getPosition();
-        makeBarb(Vector2i((int)(pos.x + 4), (int)(pos.y + 13)), barbs, squares, rings, houses[i].id);
+        makeBarb(Vector2i((int)(pos.x + 4), (int)(pos.y + 13)), barbs, squares, rings, houses[i].id, houses[i].race);   // R28-F1: born into the house's clan
         logEvent(string(barbs.back().name) + " the " + traitOf(barbs.back()).name + " is born (pop " + to_string(barbs.size()) + ")" +
                  (paid > 0 ? " -" + to_string(paid) + " food" : ""));
         if (paid > 0) foodFlashFrames = birthFlashFrames;
@@ -3726,10 +3730,17 @@ int main() {
     squares.reserve(numbarbs);
     {
         uniform_int_distribution<int> d(350, 450);
+        int founded[raceCount] = {};
         for (int i = 0; i < numbarbs; i++) {
             int x = d(gen), y = d(gen);
-            makeBarb(Vector2i(x, y), barbs, squares, birthRings);
+            makeBarb(Vector2i(x, y), barbs, squares, birthRings, -1, i / foundersPerRace);   // R28-F1: clan by index
+            founded[barbs.back().race]++;
         }
+        string founders = "Founders:";
+        for (int r = 0; r < raceCount; r++)
+            founders += string(r ? ", " : " ") + to_string(founded[r]) + " " + raceDefs[r].name;
+        printf("%s\n", founders.c_str());
+        logEvent(founders);
     }
 
     vector<tree> trees(numtrees);
