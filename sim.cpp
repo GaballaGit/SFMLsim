@@ -229,6 +229,16 @@ const float councilDecreeMult = 1.3f;      // matching job weight is multiplied 
 const float councilRaceLean = 1.0f;        // ballot score for a barb's racial preference
 const float councilNeedLean = 1.5f;        // ballot score for a full colony need; outweighs race so needs swing the vote
 const councilDecree raceLeans[raceCount] = {decreeBerries, decreeStone, decreeTimber}; // human, dwarf, elf
+// Open ballot: right after the dawn vote each barb shows its ballot as a pip overhead (shapes only, no text)
+const int ballotShowFrames = 480;          // ~8s on screen (frames, so it reads the same at any sim speed); frozen while paused
+const int ballotFadeFrames = 120;          // last ~2s fade out
+const float ballotMinZoom = 2.0f;          // hidden below this zoom: a 2x2 pip is only 2 screen px at 1x
+const Vector2f ballotPipSize(2.0f, 2.0f);  // same footprint as the household pips, same spot above the head
+const Color ballotPipColors[decreeCount] = {
+    Color(70, 190, 170),   // Timber: teal, clear of chop green and build blue
+    Color(170, 176, 186),  // Stone: pale slate, darker than the off-white body and idle white
+    Color(190, 80, 170),   // Berries: violet, darker than pick pink, brighter than ripe bushes
+};
 
 const int houseWoodCost = 30;
 const int houseStoneCost = 2;              // small; with less stone a plain house is built instead
@@ -545,6 +555,7 @@ struct barb {
     int slowTick = 0;
     barbRace race = raceHuman;   // rolled once in makeBarb()
     int homeHouse = -1;          // house.id of the birth house (stable id, not an index); -1 = founder
+    councilDecree lastVote = decreeNone; // ballot from the latest dawn; lives in the struct so it is dropped with the barb
 };
 
 const raceDef& raceOf(const barb& b) { return raceDefs[b.race]; }
@@ -1911,7 +1922,7 @@ void eraTick(const vector<barb>& barbs, const vector<house>& houses) {
 councilDecree currentDecree = decreeNone;   // none until the first dawn
 
 // Ballot: race lean plus colony needs (wood short of a house, stone short of a foundation, this barb hungry or no food)
-councilDecree castBallot(const barb& b) {
+councilDecree castBallot(barb& b) {
     float score[decreeCount] = {0.0f, 0.0f, 0.0f};
     score[raceLeans[b.race]] += councilRaceLean;
     score[decreeTimber]  += councilNeedLean * clamp((float)(houseWoodCost - wood) / (float)houseWoodCost, 0.0f, 1.0f);
@@ -1919,16 +1930,39 @@ councilDecree castBallot(const barb& b) {
     score[decreeBerries] += (isHungry(b) || food <= 0) ? councilNeedLean : 0.0f;
     int best = raceLeans[b.race];               // ties go to the barb's own lean
     for (int d = 0; d < decreeCount; d++) if (score[d] > score[best]) best = d;
-    return (councilDecree)best;
+    b.lastVote = (councilDecree)best;           // shown overhead by drawBallots
+    return b.lastVote;
 }
 
-void councilTick(const vector<barb>& barbs) {
+int ballotFramesLeft = 0;                       // >0 while the open-ballot pips are on screen
+
+// Draw-only: one pip per barb in its ballot colour, fading out; skipped when zoomed out too far to read
+void drawBallots(RenderWindow& window, const View& worldView, float zoom,
+                 const vector<barb>& barbs, const vector<RectangleShape>& squares) {
+    if (ballotFramesLeft <= 0 || zoom < ballotMinZoom) return;
+    window.setView(worldView);
+    float a = min(1.0f, (float)ballotFramesLeft / ballotFadeFrames);
+    RectangleShape pip(ballotPipSize);
+    for (int i = 0; i < (int)squares.size() && i < (int)barbs.size(); i++) {
+        if (barbs[i].lastVote == decreeNone) continue;   // born after the vote
+        Color c = ballotPipColors[barbs[i].lastVote];
+        c.a = (uint8_t)(255 * a);
+        pip.setFillColor(c);
+        Vector2f top = snapPx(squares[i].getPosition());
+        float cx = top.x + round((squares[i].getSize().x - ballotPipSize.x) / 2.0f);
+        pip.setPosition(Vector2f(cx, top.y - householdPipGap - ballotPipSize.y));
+        window.draw(pip);
+    }
+}
+
+void councilTick(vector<barb>& barbs) {
     static int lastHour = game_time;
     if (game_time == lastHour) return;
     lastHour = game_time;
     if (game_time != councilDawnHour || barbs.empty()) return;
     int votes[decreeCount] = {0, 0, 0};
     for (auto& b : barbs) votes[castBallot(b)]++;
+    ballotFramesLeft = ballotShowFrames;
     int top = *max_element(votes, votes + decreeCount);
     vector<int> tied;
     for (int d = 0; d < decreeCount; d++) if (votes[d] == top) tied.push_back(d);
@@ -2483,6 +2517,8 @@ int main() {
         if (raining) drawOverlay(window, dnc, rainOverlayColor);
         if (t >= 21 || t < 6) drawCampfireGlow(window, worldView, fire, frameCount);
         if (t >= 21 || t < 6) drawHouseLights(window, worldView, houseshapes);
+        drawBallots(window, worldView, zoom, barbs, squares); // above the overlays so the pips read true; under hover marks
+        if (ballotFramesLeft > 0 && !paused) ballotFramesLeft--;
 
         optional<hoverHit> hover;
         bool overHud = false;
