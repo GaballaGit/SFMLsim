@@ -189,6 +189,18 @@ const int hungerThreshold = 15 * ticksPerMinute; // 15 real min between meals; d
 const int hungerWorkSlowdown = 2;         // hungry barbs with no food work and walk this many times slower
 const Color hungryTintColor(140, 100, 60);
 const float hungryTintAmount = 0.45f;     // 0 = pure task colour, 1 = pure tint
+// R30-F5: health and starvation. Unfed from the last meal: 15 min to hungry, +5 min grace, then 1hp per 15s (25 min to 0)
+// = ~45 real min (Sturdy ~52, Glutton ~41). Any meal heals and resets the grace; Gentry eat first, so a long famine
+// takes the hungriest Commoners one by one instead of the whole race at once.
+const int barbMaxHealth = 100;
+const int starveGraceTicks = 5 * ticksPerMinute;  // hungry this long (no meal) before damage starts
+const int starveDamageTicks = 15 * 60;            // then -1hp every this many ticks
+const int eatHealHp = 25;                         // hp restored per meal (capped at barbMaxHealth)
+const float healthBarMinZoom = 2.0f;              // hidden below this zoom; also only drawn when hurt
+const float healthBarW = 4.0f;                    // 1px tall bar, centred under the feet (2px human/elf, 3px dwarf)
+const float healthBarGap = 1.0f;                  // px of grass between the feet and the bar
+const Color healthBarFillColor(196, 72, 58);      // muted brick red, same family as the hunt stripe but dimmer
+const Color healthBarBackColor(70, 60, 56, 200);  // dull grey-brown for the missing part, readable on dark green
 
 const int eventMaxLines = 5;              // ticker shows (and stores) at most this many events
 const int eventFadeTicks = 300;           // frames an event stays on screen (~5s at 60fps)
@@ -1104,6 +1116,8 @@ struct barb {
     barbTrait trait = traitSwift; // R25-F1: rolled once in makeBarb()
     bool shinobi = false;        // R25-F2: Sasuke; set once in makeBarb()
     carryLoad carryKind = carryNone; // R29-F1: load being hauled to a storehouse/the campfire; dropped with the barb, cleared by dropCarry()
+    int health = barbMaxHealth;  // R30-F5: 0 = dies at the end of the tick (removeBarb)
+    int starveTicks = 0;         // R30-F5: ticks spent hungry since the last meal; starving past starveGraceTicks
 };
 
 const raceDef& raceOf(const barb& b) { return raceDefs[b.race]; }
@@ -1835,9 +1849,12 @@ void hungerTick(vector<barb>& barbs) {
     // R25-F1: a Glutton takes gluttonMealFood, but never digs into `keep` (callers guarantee food > keep, so bite >= 1)
     auto eat = [](barb& b, int keep) {
         int bite = min(b.trait == traitGlutton ? gluttonMealFood : 1, food - keep);
+        if (bite <= 0) return;   // R30-F5: no food taken = no meal, no heal
         food -= bite;
         b.hunger = 0;
         b.slowTick = 0;
+        b.starveTicks = 0;                                       // R30-F5
+        b.health = min(barbMaxHealth, b.health + eatHealHp);
         printf("BARB ATE (%s, %s %d) - Food: %d\n", isGentry(b) ? "Gentry" : "Commoner", b.name, bite, food);
     };
     int gentryKeep = hungryCommoners > 0 ? gentryFoodReserve : 0;
@@ -1845,7 +1862,20 @@ void hungerTick(vector<barb>& barbs) {
         if (isGentry(b) && isHungry(b) && food > gentryKeep) eat(b, gentryKeep);
     for (auto& b : barbs)
         if (!isGentry(b) && isHungry(b) && food > 0) eat(b, 0);
+    // Pass 3 (R30-F5): whoever is still hungry after the meal goes on starving; damage only past the grace period.
+    // Health is only lowered here; deaths are removed by starveDeathTick() at the end of the tick.
+    for (auto& b : barbs) {
+        if (!isHungry(b) || b.health <= 0) continue;
+        b.starveTicks++;
+        int over = b.starveTicks - starveGraceTicks;
+        if (over > 0 && over % starveDamageTicks == 0) {
+            b.health--;
+            if (b.health % 25 == 0) printf("STARVING - %s %d hp\n", b.name, b.health);
+        }
+    }
 }
+
+bool isStarving(const barb& b) { return isHungry(b) && b.starveTicks >= starveGraceTicks; }
 
 Color hungryTint(Color c) {
     auto mix = [](uint8_t a, uint8_t t) { return (uint8_t)(a + (t - a) * hungryTintAmount); };
@@ -2004,6 +2034,19 @@ void drawBarbs(RenderWindow& window, const vector<barb>& barbs, const vector<Rec
             tool.setPosition(top - Vector2f(0.0f, spearTipSize.y));   // top edge = bodyTop - 2
             window.draw(tool);
             tool.setSize(barbToolSize);
+        }
+        if (zoom >= healthBarMinZoom && b.health < barbMaxHealth) {   // R30-F5: 1px bar under the feet, only when hurt
+            float barX = base.x + floor((bodySize.x - healthBarW) / 2.0f), barY = feet + healthBarGap;
+            float fillW = min(healthBarW, ceil(healthBarW * max(b.health, 0) / barbMaxHealth));   // any hp left shows >= 1px
+            stripe.setSize(Vector2f(healthBarW, 1.0f));
+            stripe.setFillColor(healthBarBackColor);
+            stripe.setPosition(Vector2f(barX, barY));
+            window.draw(stripe);
+            if (fillW > 0.0f) {
+                stripe.setSize(Vector2f(fillW, 1.0f));
+                stripe.setFillColor(healthBarFillColor);
+                window.draw(stripe);
+            }
         }
     }
 }
@@ -2187,7 +2230,7 @@ optional<hoverHit> pickHover(Vector2f p, float radius, const vector<barb>& barbs
     for (int i = 0; i < (int)squares.size() && i < (int)barbs.size(); i++)
         if (near(squares[i])) {
             const barb& b = barbs[i];
-            string label = string(b.name) + ", " + traitOf(b).name + ", " + raceOf(b).name + ": " + barbTaskName(b) + (isHungry(b) ? " (hungry)" : "");
+            string label = string(b.name) + ", " + traitOf(b).name + ", " + raceOf(b).name + ": " + barbTaskName(b) + (isStarving(b) ? " (starving)" : isHungry(b) ? " (hungry)" : "");
             if (b.homeHouse >= 0) {   // kin counted here, on hover only
                 int kin = 0;
                 for (auto& o : barbs) if (o.id != b.id && o.homeHouse == b.homeHouse) kin++;
@@ -3512,6 +3555,56 @@ void leaderWatchTick(const vector<barb>& barbs) {
         if (raceElected[r] && findBarbById(barbs, raceLeaderId[r]) < 0) loseLeader(r);
 }
 
+// R30-F5: the only place a barb is removed. Releases everything the barb holds or is referenced by (hunt, carried load,
+// reserved house/shrine materials, one-off build claims, paving/spear jobs, the crown), then swapRemoves barbs and
+// squares at the same index. Callers removing several must go in descending index order.
+void removeBarb(vector<barb>& barbs, vector<RectangleShape>& squares, int i,
+                smokehouse& sh, forge& fg, storehouse (&stores)[raceCount], plot& fp) {
+    barb& b = barbs[i];
+    if (b.deertargeting) clearHunt(b);
+    dropCarry(b);
+    if (b.reservedwood) wood += houseWoodCost;   // house claim walked to but never built: back to the stock
+    stone += b.reservedstone;                    // house foundation or shrine stone
+    b.reservedwood = false;
+    b.reservedstone = 0;
+    switch (b.jobKind) {                         // claims paid at claim time stay spent; the next builder pays again
+        case jobSmoke: if (!sh.built) sh.claimed = false; break;
+        case jobForge: if (!fg.built) fg.claimed = false; break;
+        case jobStall: if (!hasStall) stallClaimed = false; break;
+        case jobStore: if (b.race >= 0 && b.race < raceCount && !stores[b.race].built) stores[b.race].claimed = false; break;
+        case jobField: if (!fp.built) fp.claimed = false; break;
+        case jobPave:  clearPave(b); break;
+        case jobSpear: clearSpearCraft(b); break;
+        default: break;
+    }
+    b.jobKind = jobNone;
+    b.moving = b.movingbspot = b.building = b.chopping = false;
+    b.timer = 0;
+    if (isLeader(b)) loseLeader(b.race);
+    printf("BARB DIED - %s the %s (%s, %s), id %d - %d left\n", b.name, traitOf(b).name, raceOf(b).name,
+           isGentry(b) ? "Gentry" : "Commoner", b.id, (int)barbs.size() - 1);
+    b.homeHouse = -1;
+    swapRemove(barbs, i);
+    swapRemove(squares, i);
+}
+
+// R30-F5: end of tick. Every barb at 0 hp is collected first, then removed once each, highest index first, so a
+// swapRemove only ever pulls in a living barb from the back and the lower dead indices stay valid.
+void starveDeathTick(vector<barb>& barbs, vector<RectangleShape>& squares,
+                     smokehouse& sh, forge& fg, storehouse (&stores)[raceCount], plot& fp) {
+    vector<int> deadIds;
+    for (auto& b : barbs) if (b.health <= 0) deadIds.push_back(b.id);
+    if (deadIds.empty()) return;
+    vector<int> dead;   // ids -> current indices, resolved once before any removal
+    for (int id : deadIds) { int i = findBarbById(barbs, id); if (i >= 0) dead.push_back(i); }
+    sort(dead.begin(), dead.end(), [](int a, int b) { return a > b; });
+    for (int i : dead) {
+        if (i >= (int)barbs.size() || i >= (int)squares.size()) continue;
+        printf("STARVED - ");
+        removeBarb(barbs, squares, i, sh, fg, stores, fp);
+    }
+}
+
 // R30-F2: leader ranks the colony's wood/stone/food shortage (0..1 each); worst wins, none if nothing is short
 void rankRaceNeed(const vector<barb>& barbs, int r) {
     int members = 0;
@@ -4408,6 +4501,7 @@ int main() {
                 paveTick(barbs, squares);
                 leaderWatchTick(barbs);   // R30-F2: leader death -> global weights + ticker line, same tick
                 councilTick(barbs);
+                starveDeathTick(barbs, squares, smoke, dwarfForge, stores, field);   // R30-F5: last, once per tick
             }
         }
 
