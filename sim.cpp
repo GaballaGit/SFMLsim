@@ -34,6 +34,9 @@ const float worldSize = 800.0f;
 const float minZoom = 1.0f;
 const float maxZoom = 4.0f;
 const float zoomStep = 1.1f;
+const int ticksPerGameHour = 216000;        // clockk() advances game_time by one hour after this many ticks
+const float clearRadiusSq = 50.0f * 50.0f;  // trees/rocks within 50px of the village centre (400,400) are cleared
+const Color stumpColor(115, 30, 2);         // every tree stump, startup and respawned
 
 const Color barbIdleColor(255, 255, 255);
 const Color barbChopColor(120, 220, 90);
@@ -650,14 +653,14 @@ const iconDef hudIcons[iconCount] = {
 };
 
 mt19937 gen(random_device{}());
-uniform_int_distribution<int> distrib(0, 800);
+uniform_int_distribution<int> distrib(0, (int)worldSize - 1);
 uniform_int_distribution<int> wanderChance(0, 149);
 uniform_int_distribution<int> wanderDX(-50, 50);
 uniform_int_distribution<int> wanderDY(-50, 50);
 uniform_int_distribution<int> spawnChance(0, 7500);
 uniform_int_distribution<int> treespawnChance(0, 99999);
-uniform_int_distribution<int> buildSpotDX(-250, 250); //-25, 25
-uniform_int_distribution<int> buildSpotDY(-250, 250); //-25, 25
+uniform_int_distribution<int> buildSpotDX(-250, 250);
+uniform_int_distribution<int> buildSpotDY(-250, 250);
 uniform_int_distribution<int> DeerSpawnY(20, 780); 
 uniform_int_distribution<int> DeerSpawnRL(0, 1);
 uniform_int_distribution<int> DeerSpawnXgotoL(20, 100);
@@ -745,7 +748,7 @@ RectangleShape bushDrawShape(const CircleShape& bs) {
     return s;
 }
 
-struct house {int x, y, health; bool hasFoundation = false; int id = -1; barbRace race = raceHuman;}; // id: stable, from nextHouseId; race: builder's, picks the roof style
+struct house {int x, y; bool hasFoundation = false; int id = -1; barbRace race = raceHuman;}; // id: stable, from nextHouseId; race: builder's, picks the roof style
 int nextHouseId = 0;   // assigned only in buildhouse(); never reused, so ids survive any swapRemove
 struct shrine {int x, y; int id = -1;};  // x,y = slab top-left; id: stable, from nextShrineId (refer to shrines by id, never index)
 int nextShrineId = 0;  // assigned only in buildshrine(); at most maxShrines are ever standing
@@ -849,7 +852,7 @@ enum targetKind {targetNone, targetBush, targetRock, targetLake, targetField};
 
 struct barb {
     int id = -1;                // stable, unique; assigned only by makeBarb()
-    int x, y, health = 100;
+    int x, y;
     bool moving = false;
     int targetx = -1, targety = -1;
     int timer = 0;
@@ -989,8 +992,8 @@ FloatRect drawEvents(RenderWindow& window, const Font& font) {
     return FloatRect(topLeft, {width, height});
 }
 
-struct tree  {int x, y, health; bool dying = false;};
-struct rock  {int x, y, health; bool dying = false;};
+struct tree  {int x, y; bool dying = false;};
+struct rock  {int x, y; bool dying = false;};
 struct bush  {int x, y; bool ripe = true; bool picking = false; int regrow = 0;};
 
 // Nearest candidate to pos strictly inside radius: posOf(i) gives candidate i's position and
@@ -1301,21 +1304,16 @@ void deerwander(vector<RectangleShape>& deershape, vector<deer>& deers, const ve
             } else if (++d.stepTimer >= (d.fleeTimer > 0 ? speciesOf(d).fleeStepInterval : speciesOf(d).stepInterval)) {
                 d.stepTimer = 0;
                 ds.move(diff / sqrt(dSq));
-		ds.getGlobalBounds();
             }
         }
     }
 }
 
- // 216000
 int clockk() {
     static int timer = 0;
-    if (++timer >= 216000) {
-        game_time++;
+    if (++timer >= ticksPerGameHour) {
+        game_time = (game_time + 1) % 24;   // 0..23: midnight follows 23:00
         printf("The time is now: %d:00\n", game_time);
-        if (game_time >=24) {
-            game_time = -1;
-        }
         timer = 0;
     }
     return game_time;
@@ -2225,7 +2223,7 @@ void buildhouse(vector<barb>& barbs,vector<RectangleShape>& squares, vector<hous
                 if (workTick(b)) b.timer++;
                 if (b.timer >= houseBuildTicks) {
                     b.reservedwood = false;
-                    house h{b.targetx, b.targety, 100, b.reservedstone > 0, nextHouseId++, b.race};
+                    house h{b.targetx, b.targety, b.reservedstone > 0, nextHouseId++, b.race};
                     b.reservedstone = 0;
                     houses.push_back(h);
                     RectangleShape hs(Vector2f(4, 4));
@@ -3056,7 +3054,6 @@ void barbmove(vector<RectangleShape>& squares, vector<barb>& barbs) {
                 b.stepTimer = 0;
                 sq.move(diff / sqrt(dSq));
                 trailStep(sq.getPosition());
-		sq.getGlobalBounds();
             }
         }
     }
@@ -3352,7 +3349,7 @@ CircleShape makeTreeTri(int x, int y) {
 
 void treespawn(vector<tree>& trees, vector<CircleShape>& tris, vector<RectangleShape>& stumps, const plot& fp) {
     if (treespawnChance(gen) != 0) return;
-    tree t{distrib(gen), distrib(gen), 100, false};
+    tree t{distrib(gen), distrib(gen), false};
     if (!lakeClear(FloatRect(Vector2f(t.x, t.y), Vector2f(treeFootprint, treeFootprint)))) return; // no trees in the water
     if (!fieldClear(fp, FloatRect(Vector2f(t.x, t.y), Vector2f(treeFootprint, treeFootprint)))) return; // nor on the wheat plot
     trees.push_back(t);
@@ -3360,7 +3357,7 @@ void treespawn(vector<tree>& trees, vector<CircleShape>& tris, vector<RectangleS
     tris.push_back(makeTreeTri(t.x, t.y));
 
     RectangleShape stump(Vector2f(4, 4));
-    stump.setFillColor(Color(128, 26, 0));
+    stump.setFillColor(stumpColor);
     stump.setPosition(Vector2f(t.x + 6, t.y + 12));
     stumps.push_back(stump);
 }
@@ -3491,10 +3488,10 @@ int main() {
     }
 
     vector<tree> trees(numtrees);
-    for (auto& t : trees) {t.x = distrib(gen); t.y = distrib(gen); t.health = 100;}
+    for (auto& t : trees) {t.x = distrib(gen); t.y = distrib(gen);}
 
     vector<rock> rocks(numrocks);
-    for (auto& r : rocks) {r.x = distrib(gen); r.y = distrib(gen); r.health = 100;}
+    for (auto& r : rocks) {r.x = distrib(gen); r.y = distrib(gen);}
 
     vector<house> houses;
     vector<RectangleShape> houseshapes;
@@ -3515,7 +3512,7 @@ int main() {
         tris.push_back(makeTreeTri(t.x, t.y));
 
         RectangleShape stump(Vector2f(4, 4));
-        stump.setFillColor(Color(115, 30, 2));
+        stump.setFillColor(stumpColor);
         stump.setPosition(Vector2f(t.x + 6, t.y + 12));
         stumps.push_back(stump);
     }
@@ -3647,7 +3644,7 @@ int main() {
         for (int i = (int)tris.size() - 1; i >= 0; i--) {
             Vector2f p = tris[i].getPosition();
             float dx = p.x - 400, dy = p.y - 400;
-            if (dx*dx + dy*dy < 2500.0f) { // 50^2
+            if (dx*dx + dy*dy < clearRadiusSq) {
                 int tix = (int)(p.x + 8), tiy = (int)(p.y + 15);
                 for (auto& b : barbs) {
                     if (b.target != targetBush && b.targetx == tix && b.targety == tiy) {
@@ -3662,7 +3659,16 @@ int main() {
         for (int i = (int)octs.size() - 1; i >= 0; i--) {
             Vector2f p = octs[i].getPosition();
             float dx = p.x - 400, dy = p.y - 400;
-            if (dx*dx + dy*dy < 2500.0f) { // 100^2
+            if (dx*dx + dy*dy < clearRadiusSq) {
+                int rix = (int)(p.x + 6), riy = (int)(p.y + 10);   // same stand spot minematerials targets
+                for (auto& b : barbs) {
+                    if (b.target == targetRock && b.targetx == rix && b.targety == riy) {
+                        b.moving = b.chopping = false;
+                        b.timer  = 0;
+                        b.targetx = b.targety = -1;
+                        printf("Rock cleared near the village - miner %d dropped its target\n", b.id);
+                    }
+                }
                 swapRemove(octs, i); swapRemove(rocks, i);
             }
         }
@@ -3712,7 +3718,7 @@ int main() {
 	if (activeTrader) drawSnapped(window, activeTrader->shape);
 	drawTrees(window, tris, treeVerts);
 	drawSmoke(window, smoke, frameCount);
-	drawBirds(window, birds, birdShape, frameCount++);
+	drawBirds(window, birds, birdShape, frameCount);
 	if (raining) drawRain(window, rainVerts, frameCount);
 	for (int q = 0; q < (int)squares.size(); ++q) {
             auto& b = barbs[q];
@@ -3769,7 +3775,7 @@ int main() {
             for (auto& b : barbs) if (isHungry(b)) hv.hungry++;
             hv.people = (int)barbs.size();
             hv.houses = (int)houses.size();
-            hv.hour = t < 0 ? 0 : t;
+            hv.hour = t;
             hv.speed = simSpeed;
             hv.night = (t >= 21 || t < 6);
             hv.paused = paused;
@@ -3790,6 +3796,7 @@ int main() {
         }
         eventTick();
         window.display();
+        frameCount++;
     }
     return 0;
 }
