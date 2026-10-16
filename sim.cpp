@@ -400,6 +400,24 @@ const float lakeShorePx = 1.0f;            // shore points sit this far outside 
 const Color lakeColor(60, 95, 140);        // muted desaturated blue: darker and greyer than the rain streaks/tint
 const Color lakeRimColor(128, 150, 168);   // pale grey-blue bank
 
+// Lakeside angling (R19-F1): a barb with no tree/rock/bush in reach walks to a free cached shore point and fishes.
+// One angler per shore point; stand spots sit on the bank and are never lakeClear()-checked (they are inside the keep-clear zone).
+const float fishSearchRadius = 60.0f;      // wider than barbWorkSearchRadius: lakes are few and away from the village
+const int fishCatchTicks = 360;            // ~6s per catch at 1x
+const int fishFoodYield = 1;               // below a deer's 2 food
+const Color barbFishColor(90, 225, 225);   // bright cyan: far lighter than the pond, clear of build blue and timber teal
+const float fishRodPx = 3.0f;              // 1px diagonal rod reaching from the hand out over the water
+const Color fishRodColor(90, 225, 225);    // same cyan as the task stripe
+const float fishLineReach = 5.0f;          // line runs this far from the rod tip into the water
+const float fishLineDrop = 2.0f;           // side-on casts: the line also hangs this far down
+const Color fishLineColor(185, 240, 240, 170); // thin pale cyan, a hairline at any zoom
+const int fishRingTicks = 45;              // catch ring lifetime (~0.75s)
+const float fishRingStartRadius = 1.0f;
+const float fishRingEndRadius = 6.0f;
+const float fishRingThickness = 1.0f;
+const Color fishRingColor(190, 235, 235);  // pale cyan ripple on the water
+const uint8_t fishRingMaxAlpha = 150;      // fades linearly to 0
+
 // Build jobs: which structure a barb's movingbspot/building belongs to. jobNone = no job, or a house (buildhouse()).
 enum buildJob {jobNone, jobShrine, jobSmoke, jobStall, jobForge, buildJobCount};
 const int buildJobTicks[buildJobCount] = {houseBuildTicks, shrineBuildTicks, smokehouseBuildTicks, stallBuildTicks, forgeBuildTicks};
@@ -705,8 +723,11 @@ bool lakeClear(const FloatRect& r, const Vector2f* pathFrom = nullptr) {
     return true;
 }
 
+// Work target of a barb. targetNone with a set targetx is a tree (or a hunt/wander/build spot, which own their flags).
+enum targetKind {targetNone, targetBush, targetRock, targetLake};
+
 struct barb {
-    int id = -1;                 // stable, unique; assigned only by makeBarb()
+    int id = -1;                // stable, unique; assigned only by makeBarb()
     int x, y, health = 100;
     bool moving = false;
     int targetx = -1, targety = -1;
@@ -718,9 +739,9 @@ struct barb {
     int reservedstone = 0;       // stone held for a house foundation (or a shrine); refunded with the wood on cancel
     buildJob jobKind = jobNone;  // structure the movingbspot/building belongs to; each builder skips the others' jobs
     int stepTimer = 0;
-    bool targetIsRock = false;
-    bool targetIsBush = false;   // chopping + targetIsBush = picking; shares timer/chopping with chop and mine
+    targetKind target = targetNone; // what targetx/targety points at; chopping + kind = the work (shares timer/chopping)
     int targetBush = -1;         // bush index (bushes are never removed, so indices are stable)
+    int targetShore = -1;        // shorePoints index while target == targetLake (shore points are fixed after startup)
     bool deertargeting = false;
     int targetDeerId = -1;
     int hunger = 0;
@@ -862,12 +883,13 @@ void swapRemove(vector<T>& v, int i) {
     v.pop_back();
 }
 
-// Priority when flags overlap: hunting > building > picking > mining > chopping > idle
+// Priority when flags overlap: hunting > building > picking > fishing > mining > chopping > idle
 Color barbColor(const barb& b) {
     if (b.deertargeting) return barbHuntColor;
     if (b.building) return barbBuildColor;
-    if (b.chopping && b.targetIsBush) return barbPickColor;
-    if (b.chopping && b.targetIsRock) return barbMineColor;
+    if (b.chopping && b.target == targetBush) return barbPickColor;
+    if (b.chopping && b.target == targetLake) return barbFishColor;
+    if (b.chopping && b.target == targetRock) return barbMineColor;
     if (b.chopping) return barbChopColor;
     return barbIdleColor;
 }
@@ -876,8 +898,9 @@ Color barbColor(const barb& b) {
 const char* barbTaskName(const barb& b) {
     if (b.deertargeting) return "hunting";
     if (b.building) return "building";
-    if (b.chopping && b.targetIsBush) return "picking";
-    if (b.chopping && b.targetIsRock) return "mining";
+    if (b.chopping && b.target == targetBush) return "picking";
+    if (b.chopping && b.target == targetLake) return "fishing";
+    if (b.chopping && b.target == targetRock) return "mining";
     if (b.chopping) return "chopping";
     return "idle";
 }
@@ -931,6 +954,8 @@ void deerkilling(vector<deer>& deers, vector<RectangleShape>& deershape, vector<
 				if (dx * dx + dy * dy >= deerInfluenceDSq) continue;
 				b.deertargeting = true;
 				b.targetDeerId = d.id;
+				b.target = targetNone;   // a hunt drops any walk to a bush or shore point (work in progress is never hijacked)
+				b.targetBush = b.targetShore = -1;
 			} else if (b.targetDeerId != d.id) {
 				continue;
 			}
@@ -1355,6 +1380,35 @@ Color hungryTint(Color c) {
     return Color(mix(c.r, hungryTintColor.r), mix(c.g, hungryTintColor.g), mix(c.b, hungryTintColor.b));
 }
 
+// Direction from shore point k toward its water. spawnLakes() pushes each lake's points as top, bottom, left, right.
+Vector2f shoreWaterDir(int k) {
+    static const Vector2f dirs[4] = {{0.0f, 1.0f}, {0.0f, -1.0f}, {1.0f, 0.0f}, {-1.0f, 0.0f}};
+    return dirs[k % 4];
+}
+
+// Hitbox top-left for an angler at shore point k: the body sits wholly on the bank, its water-facing edge on the point.
+Vector2f shoreStandSpot(int k, Vector2f bodySize) {
+    Vector2f p = shorePoints[k], w = shoreWaterDir(k);
+    float x = w.x < 0.0f ? p.x : (w.x > 0.0f ? p.x - bodySize.x + 1.0f : p.x);
+    float y = w.y < 0.0f ? p.y : p.y - bodySize.y + 1.0f;
+    return Vector2f(x, y);
+}
+
+// Rod and line of a fishing barb, from its snapped hitbox (same body top drawBarbs uses; no bob while working).
+// The hand is the pixel beside the body on the water side; the rod steps diagonally out over the water.
+struct fishPose {Vector2f hand, step, tip, lineEnd;};
+fishPose fishPoseOf(const barb& b, const RectangleShape& sq) {
+    Vector2f base = snapPx(sq.getPosition()), size = sq.getSize();
+    float bodyTop = base.y + (isHungry(b) ? barbHungryDroopPx : 0.0f);
+    Vector2f w = shoreWaterDir(b.targetShore);
+    fishPose f;
+    f.hand = Vector2f(w.x < 0.0f ? base.x - 1.0f : base.x + size.x, bodyTop + 1.0f);
+    f.step = w.x != 0.0f ? Vector2f(w.x, -1.0f) : Vector2f(1.0f, w.y);   // side casts lift the rod; up/down casts reach over
+    f.tip = f.hand + f.step * fishRodPx;
+    f.lineEnd = f.tip + w * fishLineReach + (w.x != 0.0f ? Vector2f(0.0f, fishLineDrop) : Vector2f(0.0f, 0.0f));
+    return f;
+}
+
 // Read-only on game state: squares stay the hitbox, the sprite is built from temporary shapes.
 // Plain white 2x4 rectangle (no head/hair); the task shows as a 2x1 stripe and a tinted tool pixel.
 // Pose comes from existing flags only: walking bob, chop/mine/build tool tick, pick arm dip, hungry droop.
@@ -1406,7 +1460,18 @@ void drawBarbs(RenderWindow& window, const vector<barb>& barbs, const vector<Rec
 
         float side = base.x + bodySize.x;                // tool/arm sits just right of the body
         tool.setFillColor(tc);
-        if (b.chopping && b.targetIsBush) {
+        if (b.chopping && b.target == targetLake && b.targetShore >= 0 && b.targetShore < (int)shorePoints.size()) {
+            fishPose f = fishPoseOf(b, squares[i]);
+            Vertex line[2] = {Vertex{f.tip + Vector2f(0.5f, 0.5f), fishLineColor}, Vertex{f.lineEnd + Vector2f(0.5f, 0.5f), fishLineColor}};
+            window.draw(line, 2, PrimitiveType::Lines);   // hairline under the rod so the tip pixel stays solid
+            tool.setPosition(f.hand);
+            window.draw(tool);                            // hand, in the (hunger-tinted) task colour
+            tool.setFillColor(fishRodColor);
+            for (int k = 1; k <= (int)fishRodPx; k++) {
+                tool.setPosition(f.hand + f.step * (float)k);
+                window.draw(tool);
+            }
+        } else if (b.chopping && b.target == targetBush) {
             bool dip = (phase / barbPickFrames) % 2 == 1;
             tool.setPosition(Vector2f(side, dip ? feet - barbToolSize.y : bodyTop + 1.0f));
             window.draw(tool);
@@ -2320,6 +2385,31 @@ void drawBirthRings(RenderWindow& window, const vector<birthRing>& rings) {
     }
 }
 
+// Catch rings reuse the birthRing record: one expanding ripple where the line meets the water, per fish landed
+void catchRingTick(vector<birthRing>& rings) {
+    for (auto& r : rings) r.age++;
+    for (int i = (int)rings.size() - 1; i >= 0; i--)
+        if (rings[i].age >= fishRingTicks) swapRemove(rings, i);
+}
+
+void drawCatchRings(RenderWindow& window, const vector<birthRing>& rings) {
+    CircleShape c;
+    c.setFillColor(Color::Transparent);
+    c.setOutlineThickness(fishRingThickness);
+    c.setPointCount(20);
+    for (auto& r : rings) {
+        float t = (float)r.age / fishRingTicks;
+        float rad = fishRingStartRadius + (fishRingEndRadius - fishRingStartRadius) * t;
+        Color col = fishRingColor;
+        col.a = (uint8_t)(fishRingMaxAlpha * (1.0f - t));
+        c.setRadius(rad);
+        c.setOrigin({rad, rad});
+        c.setPosition(r.pos);
+        c.setOutlineColor(col);
+        window.draw(c);
+    }
+}
+
 settlementEra currentEra = eraCamp;
 int eraCheckTimer = 0;
 
@@ -2470,8 +2560,8 @@ void buildWorkClaims(const vector<barb>& barbs, const vector<CircleShape>& tris,
     unordered_map<long long, int> treeSpots, rockSpots;
     for (int j = 0; j < (int)barbs.size(); j++) {
         const barb& b = barbs[j];
-        if (b.targetx == -1 || b.targetIsBush || b.deertargeting || b.movingbspot || b.building) continue;
-        (b.targetIsRock ? rockSpots : treeSpots).emplace(workSpotKey(b.targetx, b.targety), j); // first claimant kept
+        if (b.targetx == -1 || b.target == targetBush || b.target == targetLake || b.deertargeting || b.movingbspot || b.building) continue;
+        (b.target == targetRock ? rockSpots : treeSpots).emplace(workSpotKey(b.targetx, b.targety), j); // first claimant kept
     }
     treeClaim.assign(tris.size(), -1);
     for (int i = 0; i < (int)tris.size(); i++) {
@@ -2488,9 +2578,14 @@ void buildWorkClaims(const vector<barb>& barbs, const vector<CircleShape>& tris,
 }
 
 void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<CircleShape>& tris, vector<RectangleShape>& stumps, vector<tree>& trees, vector<CircleShape>& octs, vector<rock>& rocks,
-                   vector<bush>& bushes, vector<CircleShape>& bushshapes) {
+                   vector<bush>& bushes, vector<CircleShape>& bushshapes, vector<birthRing>& catchRings) {
     vector<int> treeClaim, rockClaim;   // parallel to trees/tris and rocks/octs for this tick
     buildWorkClaims(barbs, tris, octs, treeClaim, rockClaim);
+    vector<int> shoreClaim(shorePoints.size(), -1);   // rebuilt every tick like the tree/rock claims, so no stale anglers
+    for (int j = 0; j < (int)barbs.size(); j++) {
+        int k = barbs[j].targetShore;
+        if (barbs[j].target == targetLake && k >= 0 && k < (int)shoreClaim.size() && shoreClaim[k] == -1) shoreClaim[k] = j;
+    }
     for (int j = 0; j < (int)squares.size(); j++) {
         auto& sq = squares[j];
         auto& b  = barbs[j];
@@ -2530,8 +2625,7 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
                 b.targetx = (int)wp.x;
                 b.targety = (int)wp.y;
                 b.moving  = true;
-                b.targetIsRock = false;
-                b.targetIsBush = true;
+                b.target = targetBush;
                 b.targetBush = bestBush;
             }
             if (best != -1 && !bestIsBush && !bestIsRock && b.moving==false) {
@@ -2539,8 +2633,7 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
                 b.targetx = (int)(tp.x + 8);
                 b.targety = (int)(tp.y + 15);
                 b.moving  = true;
-                b.targetIsRock = false;
-                b.targetIsBush = false;
+                b.target = targetNone;
                 treeClaim[best] = j;
             }
 	    if (best != -1 && !bestIsBush && bestIsRock && b.moving==false) {
@@ -2548,13 +2641,52 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
 		    b.targetx = (int)(rp.x + 6);
 		    b.targety = (int)(rp.y + 10);
 		    b.moving = true;
-		    b.targetIsRock = true;
-		    b.targetIsBush = false;
+		    b.target = targetRock;
 		    rockClaim[best] = j;
         }
+            // Nothing to chop, mine or pick in reach: walk to the nearest free shore point and fish
+            if (best == -1 && !bestIsBush && !b.moving && !b.deertargeting) {
+                Vector2f size = sq.getSize();
+                int k = findNearest(bpos, fishSearchRadius, (int)shorePoints.size(),
+                                    [&](int s) { return shoreStandSpot(s, size); },
+                                    [&](int s) { return shoreClaim[s] != -1 && shoreClaim[s] != j; });
+                if (k != -1) {
+                    Vector2f sp = shoreStandSpot(k, size);
+                    b.targetx = (int)sp.x;
+                    b.targety = (int)sp.y;
+                    b.moving = true;
+                    b.target = targetLake;
+                    b.targetShore = k;
+                    shoreClaim[k] = j;
+                }
+            }
         if (b.targetx == -1) continue;
 	}
-	if (b.targetIsBush) {
+	if (b.target == targetLake) {
+            int k = b.targetShore;
+            auto quit = [&]() {   // every way out of fishing clears the same fields
+                b.moving = b.chopping = false;
+                b.timer = 0;
+                b.targetx = b.targety = -1;
+                b.target = targetNone;
+                b.targetShore = -1;
+            };
+            if (k < 0 || k >= (int)shorePoints.size()) { quit(); continue; }
+            Vector2f sp = shoreStandSpot(k, sq.getSize());
+            if (b.targetx != (int)sp.x || b.targety != (int)sp.y) { quit(); continue; } // retargeted elsewhere
+            float dx = sp.x - bpos.x, dy = sp.y - bpos.y;
+            if (dx * dx + dy * dy >= 4.0f) continue;   // still walking (barbmove)
+            b.chopping = true;
+            if (workTick(b)) b.timer++;
+            if (b.timer >= fishCatchTicks) {
+                food += fishFoodYield;
+                catchRings.push_back({fishPoseOf(b, sq).lineEnd + Vector2f(0.5f, 0.5f)});
+                quit();
+                printf("FISH CAUGHT - food: %d\n", food);
+            }
+            continue;
+	}
+	if (b.target == targetBush) {
             int i = b.targetBush;
             if (i < 0 || i >= (int)bushes.size()) continue;
             Vector2f wp = bushWorkSpot(bushshapes[i]);
@@ -2562,7 +2694,7 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
             if ((!bushes[i].ripe || bushes[i].picking) && !b.chopping) {   // someone else got there first
                 b.moving = false;
                 b.targetx = b.targety = -1;
-                b.targetIsBush = false;
+                b.target = targetNone;
                 b.targetBush = -1;
                 continue;
             }
@@ -2579,13 +2711,13 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
                 b.moving = b.chopping = false;
                 b.timer = 0;
                 b.targetx = b.targety = -1;
-                b.targetIsBush = false;
+                b.target = targetNone;
                 b.targetBush = -1;
                 printf("BERRIES PICKED - food: %d\n", food);
             }
             continue;
 	}
-	if (!b.targetIsRock) {
+	if (b.target != targetRock) {
         for (int i = 0; i < (int)trees.size(); i++) {
             Vector2f tp = tris[i].getPosition();
             float tix = tp.x + 8, tiy = tp.y + 15;
@@ -2784,6 +2916,7 @@ int main() {
     vector<barb> barbs;
     vector<RectangleShape> squares;
     vector<birthRing> birthRings;
+    vector<birthRing> catchRings;   // fishing ripples (R19-F1)
     barbs.reserve(numbarbs);
     squares.reserve(numbarbs);
     {
@@ -2919,11 +3052,12 @@ int main() {
                 buildsmokehouse(barbs, squares, houses, smoke);
                 buildstall(barbs, squares);
                 buildforge(barbs, squares, houses, dwarfForge);
-                minematerials(squares, barbs, tris, stumps, trees, octs, rocks, bushes, bushshapes);
+                minematerials(squares, barbs, tris, stumps, trees, octs, rocks, bushes, bushshapes, catchRings);
                 barbmove(squares, barbs);
                 treespawn(trees, tris, stumps);
                 barbspawner(squares, barbs, houses, houseshapes, birthRings);
                 birthRingTick(birthRings);
+                catchRingTick(catchRings);
                 deerspawn(deers, deershape);
                 deerwander(deershape, deers, squares);
                 deerkilling(deers, deershape, barbs, squares, smoke);
@@ -2947,7 +3081,7 @@ int main() {
             if (dx*dx + dy*dy < 2500.0f) { // 50^2
                 int tix = (int)(p.x + 8), tiy = (int)(p.y + 15);
                 for (auto& b : barbs) {
-                    if (!b.targetIsBush && b.targetx == tix && b.targety == tiy) {
+                    if (b.target != targetBush && b.targetx == tix && b.targety == tiy) {
                         b.moving = b.chopping = false;
                         b.timer  = 0;
                         b.targetx = b.targety = -1;
@@ -3011,16 +3145,17 @@ int main() {
 	if (raining) drawRain(window, rainVerts, frameCount);
 	for (int q = 0; q < (int)squares.size(); ++q) {
             auto& b = barbs[q];
-            if (b.chopping && b.timer > 0 && !b.targetIsRock && !b.targetIsBush)
+            if (b.chopping && b.timer > 0 && b.target == targetNone)
                 drawBar(window, Vector2f(b.targetx - 10, b.targety - 20), b.timer / 180.0f, pal.barChop);
-            if (b.chopping && b.timer > 0 && b.targetIsBush)
+            if (b.chopping && b.timer > 0 && b.target == targetBush)
                 drawBar(window, Vector2f(b.targetx - 10, b.targety - 14), (float)b.timer / bushPickTicks, pal.barPick);
             if (b.building &&  b.timer > 0)
                 drawBar(window, Vector2f(b.targetx - 9, b.targety - 10), b.timer / (float)buildJobTicks[b.jobKind], pal.barBuild);
-	    if (b.chopping && b.timer > 0 && b.targetIsRock)
+	    if (b.chopping && b.timer > 0 && b.target == targetRock)
                 drawBar(window, Vector2f(b.targetx - 10, b.targety - 16), (float)b.timer / mineTicks(b), pal.barMine);
 	}
 	drawBirthRings(window, birthRings);
+	drawCatchRings(window, catchRings);
 
         int t = game_time;
         Color dncColor;
