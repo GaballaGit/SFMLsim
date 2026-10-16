@@ -411,6 +411,11 @@ const float lakeRimPx = 1.0f;
 const float lakeShorePx = 1.0f;            // shore points sit this far outside the rim
 const Color lakeColor(60, 95, 140);        // muted desaturated blue: darker and greyer than the rain streaks/tint
 const Color lakeRimColor(128, 150, 168);   // pale grey-blue bank
+// Organic pond shapes (R22-F1): each lake rect is drawn as a wobbly oval. Collision still uses the rect.
+const int lakeShapePoints = 16;            // multiple of 4 so E/S/W/N land on points 0/4/8/12
+const float lakeWobbleMax = 0.15f;         // in-between points pulled inward by up to this fraction of the radius
+const float lakeShallowsPx = 2.0f;         // pale band inside the bank
+const Color lakeShallowsColor(70, 106, 146); // a touch lighter than lakeColor
 
 // Lakeside angling (R19-F1): a barb with no tree/rock/bush in reach walks to a free cached shore point and fishes.
 // One angler per shore point; stand spots sit on the bank and are never lakeClear()-checked (they are inside the keep-clear zone).
@@ -814,6 +819,8 @@ bool fieldClear(const plot& fp, const FloatRect& r) {
 }
 
 vector<FloatRect> lakes;         // water rects, fixed after spawnLakes()
+vector<ConvexShape> lakeShallows; // per lake: full oval in shallows colour with the 1px bank outline (same index as lakes)
+vector<ConvexShape> lakeShapes;   // per lake: deep water, the same oval inset by lakeShallowsPx (same index as lakes)
 vector<Vector2f> shorePoints;     // 1px spots just outside each lake's rim at its edge midpoints (cached for angling, R19-F1)
 
 // True if segment a->b touches box (slab test). Pure geometry, used only by lakeClear().
@@ -3382,6 +3389,27 @@ void spawnLakes(vector<tree>& trees, vector<CircleShape>& tris, vector<Rectangle
             }
             if (!ok) continue;
             lakes.push_back(r);
+            // Wobbly oval: point i sits at angle i*2pi/N on the inscribed ellipse. E/S/W/N are pinned to the rect edge
+            // midpoints (so shore points stay on the bank); the rest are pulled inward only, so the shape stays inside
+            // the rect and star-shaped about its centre (ConvexShape fans from the bounds centre, which is the rect centre).
+            mt19937 lakeRng((uint32_t)r.position.x * 73856093u ^ (uint32_t)r.position.y * 19349663u);
+            uniform_real_distribution<float> wob(0.0f, lakeWobbleMax);
+            ConvexShape shallow(lakeShapePoints), deep(lakeShapePoints);
+            Vector2f lc = r.position + r.size / 2.0f, rad = r.size / 2.0f;
+            for (int p = 0; p < lakeShapePoints; p++) {
+                float a = 2.0f * 3.14159265f * p / lakeShapePoints;
+                float s = (p % (lakeShapePoints / 4) == 0) ? 1.0f : 1.0f - wob(lakeRng);
+                float cx = cos(a), cy = sin(a);
+                if (p % (lakeShapePoints / 4) == 0) { cx = round(cx); cy = round(cy); } // exact edge midpoints
+                shallow.setPoint(p, lc + Vector2f(rad.x * cx * s, rad.y * cy * s));
+                deep.setPoint(p, lc + Vector2f((rad.x - lakeShallowsPx) * cx * s, (rad.y - lakeShallowsPx) * cy * s));
+            }
+            shallow.setFillColor(lakeShallowsColor);
+            shallow.setOutlineColor(lakeRimColor);
+            shallow.setOutlineThickness(lakeRimPx);
+            deep.setFillColor(lakeColor);
+            lakeShallows.push_back(shallow);
+            lakeShapes.push_back(deep);
             break;
         }
     }
@@ -3404,16 +3432,12 @@ void spawnLakes(vector<tree>& trees, vector<CircleShape>& tris, vector<Rectangle
     printf("Spawned %zu lakes (%zu shore points)\n", lakes.size(), shorePoints.size());
 }
 
-// Flat water with a 1px pale rim drawn outside it. Ground layer: after trails, before rocks/trees.
+// Wobbly oval ponds (R22-F1): shallows oval with a 1px pale bank outside it, deep water inset on top.
+// Ground layer: after trails, before rocks/trees.
 void drawLakes(RenderWindow& window) {
-    RectangleShape s(lakeSize);
-    s.setFillColor(lakeColor);
-    s.setOutlineColor(lakeRimColor);
-    s.setOutlineThickness(lakeRimPx);
-    for (auto& l : lakes) {
-        s.setSize(l.size);
-        s.setPosition(l.position);
-        window.draw(s);
+    for (size_t i = 0; i < lakeShallows.size() && i < lakeShapes.size(); i++) {
+        window.draw(lakeShallows[i]);
+        window.draw(lakeShapes[i]);
     }
 }
 
