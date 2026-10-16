@@ -479,6 +479,30 @@ const Color forgeEmberHot(176, 90, 44);    // brief glow after a dwarf mines a r
 const int forgeEmberBreathFrames = 150;    // one slow breath every ~2.5s
 const int forgeEmberBoostFrames = 120;     // ~2s brighter after a dwarf mines (frames, so it reads the same at any speed)
 
+// Race storehouses (R29-F1): one per race at a fixed spot, built by a barb of that race. Chopped wood and mined stone
+// are carried to the hauler's own race's storehouse (the campfire while it isn't standing) and only counted on arrival.
+const int storehouseWoodCost = 10;
+const int storehouseMinRaceHouses = 1;     // a race builds its storehouse once it has a house of its own
+const int storehouseBuildTicks = 600;      // same work as a house
+const Vector2f storehouseSize(10.0f, 10.0f);
+const Vector2f storehousePos[raceCount] = {   // crate top-left, indexed by barbRace; ring ~44px out, inside the 50px clearing
+    {395.0f, 351.0f},                      // human: north of the campfire
+    {350.0f, 398.0f},                      // dwarf: west, beyond the forge
+    {438.0f, 402.0f},                      // elf: east, beyond the stall
+};
+const Vector2f storehouseStandOffset(-4.0f, 3.0f); // builder/hauler hitbox top-left relative to the crate: at its left side
+const float storehouseClearPx = 3.0f;      // houses, shrines, the field and blinks keep this far from crate + stand spot
+const float storehouseOutlinePx = 1.0f;    // drawn inward, so the crate stays exactly storehouseSize
+const Color storehouseColors[raceCount] = {
+    Color(142, 106, 66),                   // human: muted timber brown
+    Color(116, 112, 102),                  // dwarf: stone grey
+    Color(108, 134, 94),                   // elf: sage
+};
+const Color storehouseOutlineColor(34, 26, 18); // dark rim and lid slat
+const int storehouseFlashFrames = 18;      // deposit flash, ~0.3s (frames, frozen while paused)
+const float storehouseFlashMix = 0.4f;     // peak blend toward white: subtle
+const Vector2f campfireDepotOffset(-10.0f, -2.0f); // fallback drop spot (hitbox top-left) just west of the stone ring
+
 // Lakes (R19-F2): static ponds placed once at startup. Static rect + rim only in v1 (no glint/ripples).
 // Only wander paths (barbs, deer) avoid lakes; task paths (chop/mine/build/hunt/flee/wolves) are straight lines and may cross
 // one. Nothing is ever placed in a lake, so those crossings are brief, and an animal that ends up inside can always wander out.
@@ -590,8 +614,8 @@ const int spearKnapFrames = 8;                // crafter's knapping hand ticks u
 // Build jobs: which structure a barb's movingbspot/building belongs to. jobNone = no job, or a house (buildhouse()).
 // jobSpear is a craft, not a structure: it uses movingbspot (so no other system grabs the barb) but never building/timer.
 // jobPave (R20-F2) is run by paveTick(): movingbspot while walking, building/timer while laying the cobbles.
-enum buildJob {jobNone, jobShrine, jobSmoke, jobStall, jobForge, jobField, jobSpear, jobPave, buildJobCount};
-const int buildJobTicks[buildJobCount] = {houseBuildTicks, shrineBuildTicks, smokehouseBuildTicks, stallBuildTicks, forgeBuildTicks, fieldBuildTicks, spearCraftTicks, paveTicks};
+enum buildJob {jobNone, jobShrine, jobSmoke, jobStall, jobForge, jobField, jobSpear, jobPave, jobStore, buildJobCount};
+const int buildJobTicks[buildJobCount] = {houseBuildTicks, shrineBuildTicks, smokehouseBuildTicks, stallBuildTicks, forgeBuildTicks, fieldBuildTicks, spearCraftTicks, paveTicks, storehouseBuildTicks};
 // Game animals share the deer code (deers/deershape vectors); per-species numbers live in speciesDefs below.
 // Sprite offsets are relative to the logic shape (body = hitbox), written for an animal facing right.
 enum animalSpecies {speciesDeer, speciesRabbit, speciesCount};
@@ -853,11 +877,24 @@ bool stallClaimed = false;  // a builder is on the stall
 int stallBonusLots = 0;     // extra lots the stall added to the current visit; drawn as crates while the trader is Trading
 struct forge {bool built = false; bool claimed = false;}; // the one dwarf forge; claimed = a builder is on it
 int forgeEmberFrames = 0;   // >0 = ember glows hot; set when a dwarf mines a rock, counted down per drawn frame
+// R29-F1: one per race (index = barbRace), held in a fixed array in main; built is the validity flag haulers check
+struct storehouse {bool built = false; bool claimed = false; int stored = 0; int flashFrames = 0;}; // flashFrames: deposit flash, per drawn frame
 
-// False if r comes within forgeClearPx of the forge footprint (reserved from the start, built or not)
+// False if r comes within storehouseClearPx of any race's crate or its stand spot (reserved from the start, built or not)
+bool storehouseClear(const FloatRect& r) {
+    for (int k = 0; k < raceCount; k++) {
+        Vector2f lo = storehousePos[k] + Vector2f(storehouseStandOffset.x - storehouseClearPx, -storehouseClearPx);
+        FloatRect zone(lo, storehouseSize + Vector2f(-storehouseStandOffset.x + 2 * storehouseClearPx, 2 * storehouseClearPx));
+        if (r.findIntersection(zone).has_value()) return false;
+    }
+    return true;
+}
+
+// False if r comes within forgeClearPx of the forge footprint (reserved from the start, built or not).
+// R29-F1: also keeps the storehouse spots clear, so every placement that avoids the forge avoids them too.
 bool forgeClear(const FloatRect& r) {
     FloatRect zone(forgePos - Vector2f(forgeClearPx, forgeClearPx), forgeParts[0].size + Vector2f(2 * forgeClearPx, 2 * forgeClearPx));
-    return !r.findIntersection(zone).has_value();
+    return !r.findIntersection(zone).has_value() && storehouseClear(r);
 }
 
 // Know-how (R20-F1): every counter, learned flag and pip pulse lives here; reset as a whole with resetKnowHow()
@@ -944,7 +981,8 @@ bool lakeClear(const FloatRect& r, const Vector2f* pathFrom = nullptr) {
 }
 
 // Work target of a barb. targetNone with a set targetx is a tree (or a hunt/wander/build spot, which own their flags).
-enum targetKind {targetNone, targetBush, targetRock, targetLake, targetField};
+enum targetKind {targetNone, targetBush, targetRock, targetLake, targetField, targetDepot}; // targetDepot: hauling a load (R29-F1)
+enum carryLoad {carryNone, carryWood, carryStone};   // R29-F1: what a hauler holds; set only while target == targetDepot
 
 struct barb {
     int id = -1;                // stable, unique; assigned only by makeBarb()
@@ -975,6 +1013,7 @@ struct barb {
     const char* name = "";       // R25-F1: points into barbNames (no heap strings); set in makeBarb()
     barbTrait trait = traitSwift; // R25-F1: rolled once in makeBarb()
     bool shinobi = false;        // R25-F2: Sasuke; set once in makeBarb()
+    carryLoad carryKind = carryNone; // R29-F1: load being hauled to a storehouse/the campfire; dropped with the barb, cleared by dropCarry()
 };
 
 const raceDef& raceOf(const barb& b) { return raceDefs[b.race]; }
@@ -998,6 +1037,13 @@ bool isLeader(const barb& b) {
     return b.race >= 0 && b.race < raceCount && raceElected[b.race] && raceLeaderId[b.race] >= 0 && raceLeaderId[b.race] == b.id;
 }
 int mineTicks(const barb& b) { return (int)(rockMineTicks / raceOf(b).mineSpeed / (know.learned[techPickwork] ? pickworkMineSpeed : 1.0f)); }
+
+// R29-F1: every way out of a haul other than the deposit itself; the load is lost. Safe on a barb that isn't hauling.
+void dropCarry(barb& b) {
+    if (b.carryKind != carryNone) printf("LOAD DROPPED - barb %d (%s)\n", b.id, b.carryKind == carryWood ? "wood" : "stone");
+    b.carryKind = carryNone;
+    if (b.target == targetDepot) b.target = targetNone;
+}
 
 struct deer {            // any game animal; species picks its row in speciesDefs
 animalSpecies species = speciesDeer;
@@ -1177,6 +1223,7 @@ void clearHunt(barb& b) {
 	b.moving = false;
 	b.timer = 0;
 	b.targetx = b.targety = -1;
+	dropCarry(b);   // R29-F1
 }
 
 // Any barb whose target deer no longer exists stops hunting. Safe to call after any deer removal.
@@ -1204,7 +1251,7 @@ void deerkilling(vector<deer>& deers, vector<RectangleShape>& deershape, vector<
 		for (int j = 0; j < (int)barbs.size(); ++j) {
 			auto& b = barbs[j];
 			auto& sq = squares[j];
-			if (b.building || b.movingbspot || b.chopping || b.timer > 0) continue;
+			if (b.building || b.movingbspot || b.chopping || b.timer > 0 || b.carryKind != carryNone) continue;   // R29-F1: haulers finish the trip
 			if (!b.deertargeting) {
 				Vector2f bpos = sq.getPosition();
 				float dx = deerpos.x - bpos.x, dy = deerpos.y - bpos.y;
@@ -2740,6 +2787,59 @@ void drawForge(RenderWindow& window, const forge& fg, int frame) {
     window.draw(r);
 }
 
+// R29-F1: runs after buildforge(). One storehouse per race, built through buildOneOff() by a barb of that race once the
+// race has a house of its own. All share jobStore, so only one is under construction at a time; if its builder is lost
+// before finishing (no barb holds jobStore), the claim is released.
+void buildstorehouses(vector<barb>& barbs, vector<RectangleShape>& squares, const vector<house>& houses, storehouse (&stores)[raceCount]) {
+    bool held = false;
+    for (auto& b : barbs) if (b.jobKind == jobStore) held = true;
+    int active = -1;
+    for (int r = 0; r < raceCount; r++) {
+        if (stores[r].built) continue;
+        if (stores[r].claimed && !held) stores[r].claimed = false;
+        if (stores[r].claimed) active = r;
+    }
+    for (int r = 0; r < raceCount; r++) {
+        storehouse& st = stores[r];
+        if (st.built || (active >= 0 && r != active)) continue;
+        bool done = buildOneOff(barbs, squares, st.claimed, jobStore, storehousePos[r] + storehouseStandOffset, "STOREHOUSE",
+            [&](const barb& b) {
+                int raceHouses = 0;
+                for (auto& h : houses) if (h.race == r) raceHouses++;
+                if (raceHouses < storehouseMinRaceHouses || wood < storehouseWoodCost) return -1;
+                if (b.race != r) return 0;
+                wood -= storehouseWoodCost;
+                return 1;
+            });
+        if (done) {
+            st.built = true;
+            st.claimed = false;
+            printf("---STOREHOUSE BUILT--- %s (%d wood)\n", raceDefs[r].name, storehouseWoodCost);
+            logEvent(string(racePlurals[r]) + " build a storehouse");
+        }
+        if (st.claimed) return;   // one under construction at a time
+    }
+}
+
+// R29-F1: 10x10 race-coloured crate, dark inset rim and one dark lid slat across it. The fill eases toward white
+// for a moment after each deposit. Drawn with the forge, under barbs and trees.
+void drawStorehouses(RenderWindow& window, const storehouse (&stores)[raceCount]) {
+    RectangleShape crate(storehouseSize), slat(Vector2f(storehouseSize.x, storehouseOutlinePx));
+    crate.setOutlineThickness(-storehouseOutlinePx);
+    crate.setOutlineColor(storehouseOutlineColor);
+    slat.setFillColor(storehouseOutlineColor);
+    for (int r = 0; r < raceCount; r++) {
+        const storehouse& st = stores[r];
+        if (!st.built) continue;
+        float t = storehouseFlashMix * (float)st.flashFrames / storehouseFlashFrames;
+        crate.setFillColor(lerpColor(storehouseColors[r], Color::White, t));
+        crate.setPosition(storehousePos[r]);
+        window.draw(crate);
+        slat.setPosition(storehousePos[r] + Vector2f(0.0f, floor(storehouseSize.y / 2.0f) - 1.0f));
+        window.draw(slat);
+    }
+}
+
 // 7x6 stall: striped 2-row awning on two 1px posts over a 2-row counter. While a trader is Trading on a visit
 // the stall enlarged, one 1px crate per bonus lot sits under the awning so the bigger trade reads on screen.
 void drawStall(RenderWindow& window, const optional<trader>& tr) {
@@ -2850,6 +2950,7 @@ void clearSpearCraft(barb& b) {
     b.spearTimer = 0;
     b.stepTimer = 0;
     b.targetx = b.targety = -1;
+    dropCarry(b);   // R29-F1
 }
 
 // Runs after buildfield(). One crafter at a time: an idle barb without a spear walks to the campfire and knaps for
@@ -3132,6 +3233,7 @@ void clearPave(barb& b) {
     b.stepTimer = 0;
     b.targetx = b.targety = -1;
     paveClaim = -1;
+    dropCarry(b);   // R29-F1
 }
 
 // Runs after eraTick(). One paver at a time, holding the one global paveClaim. With nobody paving, every paveScanTicks
@@ -3356,7 +3458,7 @@ void barbmove(vector<RectangleShape>& squares, vector<barb>& barbs) {
     for (int i = 0; i < (int)squares.size(); i++) {
         auto& sq = squares[i];
         auto& b  = barbs[i];
-        if (b.chopping || b.timer > 0 || b.movingbspot || b.building) continue;
+        if (b.chopping || b.timer > 0 || b.movingbspot || b.building || b.carryKind != carryNone) continue;   // R29-F1: haulTick() walks haulers
         Vector2f pos = sq.getPosition();
         if (!b.moving) {
             if (wanderChance(gen) != 0) continue;
@@ -3399,7 +3501,7 @@ void buildWorkClaims(const vector<barb>& barbs, const vector<CircleShape>& tris,
     unordered_map<long long, int> treeSpots, rockSpots;
     for (int j = 0; j < (int)barbs.size(); j++) {
         const barb& b = barbs[j];
-        if (b.targetx == -1 || b.target == targetBush || b.target == targetLake || b.target == targetField || b.deertargeting || b.movingbspot || b.building) continue;
+        if (b.targetx == -1 || b.target == targetBush || b.target == targetLake || b.target == targetField || b.target == targetDepot || b.deertargeting || b.movingbspot || b.building) continue;
         (b.target == targetRock ? rockSpots : treeSpots).emplace(workSpotKey(b.targetx, b.targety), j); // first claimant kept
     }
     treeClaim.assign(tris.size(), -1);
@@ -3423,6 +3525,7 @@ void clearHarvest(barb& b) {
     b.targetx = b.targety = -1;
     b.target = targetNone;
     b.targetBush = -1;
+    dropCarry(b);   // R29-F1
 }
 
 // Shared crop gathering for bushes and the field: once the barb stands within 2px of spot it works the crop.
@@ -3438,8 +3541,58 @@ bool harvestTick(barb& b, Vector2f spot, Vector2f bpos, int ticks, int yield) {
     return true;
 }
 
+// R29-F1: where a hauler drops its load: its own race's storehouse if standing, else the campfire. A lookup, no search.
+Vector2f depotSpot(const barb& b, const storehouse (&stores)[raceCount]) {
+    if (b.race >= 0 && b.race < raceCount && stores[b.race].built) return storehousePos[b.race] + storehouseStandOffset;
+    return villageCenter + campfireDepotOffset;
+}
+
+// R29-F1: a felled tree / mined rock becomes a load; the barb walks it to the depot (haulTick) before it counts
+void startHaul(barb& b, carryLoad load, const storehouse (&stores)[raceCount]) {
+    Vector2f spot = depotSpot(b, stores);
+    b.chopping = false;
+    b.timer = 0;
+    b.carryKind = load;
+    b.target = targetDepot;
+    b.targetx = (int)spot.x;
+    b.targety = (int)spot.y;
+    b.moving = true;
+    b.stepTimer = 0;
+}
+
+// R29-F1: one hauler step. The depot is re-resolved every tick, so a storehouse that is gone sends the load to the
+// campfire. On arrival the load is added to the stock, the storehouse flashes, and the barb is idle again.
+void haulTick(barb& b, RectangleShape& sq, storehouse (&stores)[raceCount]) {
+    Vector2f spot = depotSpot(b, stores);
+    b.targetx = (int)spot.x;
+    b.targety = (int)spot.y;
+    b.moving = true;
+    Vector2f pos  = sq.getPosition();
+    Vector2f diff = Vector2f(b.targetx, b.targety) - pos;
+    float dSq = diff.x * diff.x + diff.y * diff.y;
+    if (dSq >= 1.0f) {
+        if (++b.stepTimer >= stepLimit(b, pos)) {
+            b.stepTimer = 0;
+            sq.move(pathStep(pos, diff));
+            trailStep(sq.getPosition());
+        }
+        return;
+    }
+    bool isWood = b.carryKind == carryWood;
+    (isWood ? wood : stone)++;
+    storehouse* st = (b.race >= 0 && b.race < raceCount && stores[b.race].built) ? &stores[b.race] : nullptr;
+    if (st) { st->stored++; st->flashFrames = storehouseFlashFrames; }
+    printf("%s DEPOSITED at %s - wood: %d stone: %d\n", isWood ? "WOOD" : "STONE",
+           st ? "storehouse" : "campfire", wood, stone);
+    b.carryKind = carryNone;
+    b.target = targetNone;
+    b.moving = false;
+    b.stepTimer = 0;
+    b.targetx = b.targety = -1;
+}
+
 void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<CircleShape>& tris, vector<RectangleShape>& stumps, vector<tree>& trees, vector<CircleShape>& octs, vector<rock>& rocks,
-                   vector<bush>& bushes, vector<CircleShape>& bushshapes, vector<birthRing>& catchRings, plot& fp) {
+                   vector<bush>& bushes, vector<CircleShape>& bushshapes, vector<birthRing>& catchRings, plot& fp, storehouse (&stores)[raceCount]) {
     vector<int> treeClaim, rockClaim;   // parallel to trees/tris and rocks/octs for this tick
     buildWorkClaims(barbs, tris, octs, treeClaim, rockClaim);
     vector<int> shoreClaim(shorePoints.size(), -1);   // rebuilt every tick like the tree/rock claims, so no stale anglers
@@ -3452,6 +3605,10 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
     for (int j = 0; j < (int)squares.size(); j++) {
         auto& sq = squares[j];
         auto& b  = barbs[j];
+        if (b.carryKind != carryNone) {   // R29-F1: any other state taken over the haul drops the load
+            if (b.target != targetDepot || b.movingbspot || b.building || b.deertargeting || b.chopping || b.jobKind != jobNone) dropCarry(b);
+            else { haulTick(b, sq, stores); continue; }
+        }
         if (b.movingbspot || b.building) continue;
         Vector2f bpos = sq.getPosition();
         bool bestIsRock = false;
@@ -3615,16 +3772,13 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
             trees[i].dying = true;
             if (workTick(b)) b.timer++;
             if (b.timer >= chopTicks()) {
-                wood++;
                 practice(techHandAxe);
                 swapRemove(trees,  i);
                 swapRemove(tris,   i);
                 swapRemove(stumps, i);
                 swapRemove(treeClaim, i);
-                b.moving = b.chopping = false;
-                b.timer  = 0;
-                b.targetx = b.targety = -1;
-                printf("TREE DESTROYED - wood: %d\n", wood);
+                startHaul(b, carryWood, stores);   // R29-F1: wood counts once it reaches the depot
+                printf("TREE DESTROYED - hauling wood (stock %d)\n", wood);
            		}
             break;
         	}
@@ -3645,16 +3799,13 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
 			rocks[i].dying = true;
 			if (workTick(b)) b.timer++;
 			if (b.timer >= mineTicks(b)) {           // dwarves finish rocks faster
-				stone++;
 				practice(techPickwork);
 				if (b.race == raceDwarf) forgeEmberFrames = forgeEmberBoostFrames; // forge ember flares (drawn only once built)
 				swapRemove(rocks, i);
 				swapRemove(octs, i);
 				swapRemove(rockClaim, i);
-				b.moving = b.chopping = false;
-				b.timer = 0;
-				b.targetx = b.targety = -1;
-				printf("ROCK DESTROYED - stone: %d\n", stone);
+				startHaul(b, carryStone, stores);  // R29-F1: stone counts once it reaches the depot
+				printf("ROCK DESTROYED - hauling stone (stock %d)\n", stone);
 			}
 			break;
 		}
@@ -3863,6 +4014,7 @@ int main() {
     shrines.reserve(maxShrines);
     smokehouse smoke;
     forge dwarfForge;
+    storehouse stores[raceCount];   // R29-F1: one per race, indexed by barbRace
     plot field;   // the one wheat plot (R19-F3)
 
     vector<deer> deers;
@@ -3978,9 +4130,10 @@ int main() {
                 buildsmokehouse(barbs, squares, houses, smoke);
                 buildstall(barbs, squares);
                 buildforge(barbs, squares, houses, dwarfForge);
+                buildstorehouses(barbs, squares, houses, stores);
                 buildfield(barbs, squares, houses, shrines, tris, octs, field);
                 craftspear(barbs, squares);
-                minematerials(squares, barbs, tris, stumps, trees, octs, rocks, bushes, bushshapes, catchRings, field);
+                minematerials(squares, barbs, tris, stumps, trees, octs, rocks, bushes, bushshapes, catchRings, field, stores);
                 barbmove(squares, barbs);
                 shinobiTick(barbs, squares, houseshapes, octs, shinobiPuffs);
                 treespawn(trees, tris, stumps, field);
@@ -4066,6 +4219,8 @@ int main() {
 	drawStall(window, activeTrader);
 	drawForge(window, dwarfForge, frameCount);
 	if (forgeEmberFrames > 0 && !paused) forgeEmberFrames--;
+	drawStorehouses(window, stores);
+	for (auto& st : stores) if (st.flashFrames > 0 && !paused) st.flashFrames--;
 	drawField(window, field, frameCount);
 
 	drawCampfire(window, fire, frameCount);
