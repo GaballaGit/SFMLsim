@@ -207,6 +207,15 @@ const float birthRingThickness = 1.0f;
 const Color birthRingColor(225, 220, 190); // pale warm cream, matches ticker text
 const uint8_t birthRingMaxAlpha = 70;      // faint at birth, fades linearly to 0
 
+// Settlement eras: a rank needs both thresholds (houses are capped at one per barb, so both grow together)
+enum settlementEra { eraCamp, eraHamlet, eraTown, eraCount };
+const char* const eraNames[eraCount] = {"Camp", "Hamlet", "Town"};
+const int eraHamletBarbs = 4;              // a few births in, first few houses up
+const int eraHamletHouses = 3;
+const int eraTownBarbs = 12;               // a well-established village, long after startup
+const int eraTownHouses = 10;
+const int eraCheckIntervalTicks = 60;      // recompute about once per second at 1x
+
 const int houseWoodCost = 30;
 const int houseStoneCost = 2;              // small; with less stone a plain house is built instead
 const Vector2f houseSlabSize(10.0f, 10.0f); // centred under the 4px house (6px with outline): 2px rim shows
@@ -1332,6 +1341,7 @@ struct hudValues {
     bool night, paused, raining;
     const char* trader;      // Away / Arriving / Trading / Leaving
     const char* tradeLine;   // last trade message, "" when expired
+    const char* era;         // settlement rank: Camp / Hamlet / Town
 };
 
 // Draws one table icon at pos (top-left, screen px), one quad per filled cell
@@ -1350,9 +1360,9 @@ void drawIcon(RenderWindow& window, hudIconId id, Vector2f pos) {
 
 // The old full text block, now shown as a tooltip while hovering the strip
 string hudDetailText(const hudValues& v) {
-    char buf[320];
-    snprintf(buf, sizeof(buf), "Wood: %d\nStone: %d\nFood: %d\nHungry: %d\nPopulation: %d\nHouses: %d\nTime: %02d:00 (%s)\nSpeed: %dx%s\nWeather: %s\nTrader: %s%s%s",
-             v.wood, v.stone, v.food, v.hungry, v.people, v.houses, v.hour, v.night ? "Night" : "Day", v.speed, v.paused ? " PAUSED" : "",
+    char buf[340];
+    snprintf(buf, sizeof(buf), "Settlement: %s\nWood: %d\nStone: %d\nFood: %d\nHungry: %d\nPopulation: %d\nHouses: %d\nTime: %02d:00 (%s)\nSpeed: %dx%s\nWeather: %s\nTrader: %s%s%s",
+             v.era, v.wood, v.stone, v.food, v.hungry, v.people, v.houses, v.hour, v.night ? "Night" : "Day", v.speed, v.paused ? " PAUSED" : "",
              v.raining ? "Rain" : "Clear", v.trader, v.tradeLine[0] ? "\n" : "", v.tradeLine);
     return buf;
 }
@@ -1401,6 +1411,16 @@ FloatRect drawHud(RenderWindow& window, const Font& font, const hudValues& v) {
         t.setPosition({round(x - tb.position.x), textY});
         window.draw(t);
         x += max(tb.size.x, rb.size.x) + hudCellGap;
+    }
+
+    // Settlement rank as plain text, right-aligned on the shared baseline; skipped if the cells ever reach that far
+    Text era(font, v.era, hudFontSize);
+    FloatRect eb = era.getLocalBounds();
+    float eraX = round(win.x - hudPadX - eb.size.x);
+    if (eraX >= x) {
+        era.setFillColor(pal.hudText);
+        era.setPosition({eraX - eb.position.x, textY});
+        window.draw(era);
     }
     return bar;
 }
@@ -1590,6 +1610,27 @@ void drawBirthRings(RenderWindow& window, const vector<birthRing>& rings) {
         c.setPosition(r.pos);
         c.setOutlineColor(col);
         window.draw(c);
+    }
+}
+
+settlementEra currentEra = eraCamp;
+int eraCheckTimer = 0;
+
+settlementEra computeEra(int barbCount, int houseCount) {
+    if (barbCount >= eraTownBarbs && houseCount >= eraTownHouses) return eraTown;
+    if (barbCount >= eraHamletBarbs && houseCount >= eraHamletHouses) return eraHamlet;
+    return eraCamp;
+}
+
+// Promotions are announced; a drop (barbs dying) just updates the rank quietly
+void eraTick(const vector<barb>& barbs, const vector<house>& houses) {
+    if (++eraCheckTimer < eraCheckIntervalTicks) return;
+    eraCheckTimer = 0;
+    settlementEra prev = currentEra;
+    currentEra = computeEra((int)barbs.size(), (int)houses.size());
+    if (currentEra > prev) {
+        printf("SETTLEMENT PROMOTED - %s -> %s (pop %d, houses %d)\n", eraNames[prev], eraNames[currentEra], (int)barbs.size(), (int)houses.size());
+        logEvent(string("The settlement grows into a ") + eraNames[currentEra]);
     }
 }
 
@@ -2042,6 +2083,7 @@ int main() {
                 birdTick(birds, birdHeading, squares);
                 bushTick(bushes, bushshapes);
                 campfireTick(fire);
+                eraTick(barbs, houses);
             }
         }
 
@@ -2161,6 +2203,7 @@ int main() {
                 : activeTrader->phase == trader::Arriving ? "Arriving"
                 : activeTrader->phase == trader::Trading ? "Trading" : "Leaving";
             hv.tradeLine = tradeMsgTimer > 0 ? tradeMsg : "";
+            hv.era = eraNames[currentEra];
             hudRect = drawHud(window, hudFont, hv);
             tickerRect = drawEvents(window, hudFont);
             Vector2f mouse = window.mapPixelToCoords(Mouse::getPosition(window), window.getDefaultView());
