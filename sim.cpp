@@ -399,7 +399,6 @@ const int forgeEmberBoostFrames = 120;     // ~2s brighter after a dwarf mines (
 // Lakes (R19-F2): static ponds placed once at startup. Static rect + rim only in v1 (no glint/ripples).
 // Only wander paths (barbs, deer) avoid lakes; task paths (chop/mine/build/hunt/flee/wolves) are straight lines and may cross
 // one. Nothing is ever placed in a lake, so those crossings are brief, and an animal that ends up inside can always wander out.
-const Vector2f lakeSize(40.0f, 28.0f);     // a bit over two trees wide
 const int lakeCountMin = 2;
 const int lakeCountMax = 3;
 const int lakePlaceTries = 60;             // per lake; fewer lakes are kept if a spot can't be found
@@ -407,15 +406,23 @@ const float lakeVillageMinDist = 150.0f;   // lake centre at least this far from
 const float lakeEdgeMargin = 12.0f;        // from the map edges (and below the HUD strip)
 const float lakeMinGap = 30.0f;            // between two lakes
 const float lakeClearPx = 3.0f;            // trees, rocks, bushes, builds and wander targets keep this far from the water
-const float lakeRimPx = 1.0f;
-const float lakeShorePx = 1.0f;            // shore points sit this far outside the rim
-const Color lakeColor(60, 95, 140);        // muted desaturated blue: darker and greyer than the rain streaks/tint
-const Color lakeRimColor(128, 150, 168);   // pale grey-blue bank
-// Organic pond shapes (R22-F1): each lake rect is drawn as a wobbly oval. Collision still uses the rect.
-const int lakeShapePoints = 16;            // multiple of 4 so E/S/W/N land on points 0/4/8/12
-const float lakeWobbleMax = 0.15f;         // in-between points pulled inward by up to this fraction of the radius
-const float lakeShallowsPx = 2.0f;         // pale band inside the bank
-const Color lakeShallowsColor(70, 106, 146); // a touch lighter than lakeColor
+const float lakeShorePx = 1.0f;            // shore points sit this far outside the bank
+// Blocky pixel lakes (R23-F1): each lake is a grid of lakeTilePx tiles inside its rect, with up to one tile trimmed per
+// corner for a rounded, uneven outline. Collision still uses the full rect.
+struct lakeSizeDef { int cols, rows; bool shallows; }; // shallows: outermost tile ring is shallow water
+const float lakeTilePx = 8.0f;
+const lakeSizeDef lakeSizes[] = {
+    {4, 3, false},                         // small: all deep
+    {5, 4, true},                          // medium
+    {7, 5, true},                          // large
+};
+const int lakeSizeCount = sizeof(lakeSizes) / sizeof(lakeSizes[0]);
+const float lakeCornerTrimChance = 0.75f;  // per corner: drop that corner tile
+const float lakeBankPx = 2.0f;             // bank band around the tile outline (blocky, follows the trimmed corners)
+const Color lakeDeepColorA(60, 95, 140);   // muted desaturated blue: darker and greyer than the rain streaks/tint
+const Color lakeDeepColorB(56, 90, 134);   // checker partner, kept very close to A
+const Color lakeShallowsColor(82, 112, 146); // deep blue pulled toward the bank
+const Color lakeBankColor(118, 138, 150);  // muted grey-blue bank
 
 // Lakeside angling (R19-F1): a barb with no tree/rock/bush in reach walks to a free cached shore point and fishes.
 // One angler per shore point; stand spots sit on the bank and are never lakeClear()-checked (they are inside the keep-clear zone).
@@ -819,8 +826,7 @@ bool fieldClear(const plot& fp, const FloatRect& r) {
 }
 
 vector<FloatRect> lakes;         // water rects, fixed after spawnLakes()
-vector<ConvexShape> lakeShallows; // per lake: full oval in shallows colour with the 1px bank outline (same index as lakes)
-vector<ConvexShape> lakeShapes;   // per lake: deep water, the same oval inset by lakeShallowsPx (same index as lakes)
+vector<VertexArray> lakeTiles;    // per lake: bank quads then water tiles as triangles (same index as lakes; swap-remove together)
 vector<Vector2f> shorePoints;     // 1px spots just outside each lake's rim at its edge midpoints (cached for angling, R19-F1)
 
 // True if segment a->b touches box (slab test). Pure geometry, used only by lakeClear().
@@ -3374,10 +3380,14 @@ void treespawn(vector<tree>& trees, vector<CircleShape>& tris, vector<RectangleS
 // lakeVillageMinDist ring, so they never need a lake check. Shore points are cached here for angling.
 void spawnLakes(vector<tree>& trees, vector<CircleShape>& tris, vector<RectangleShape>& stumps, vector<rock>& rocks, vector<CircleShape>& octs) {
     uniform_int_distribution<int> count(lakeCountMin, lakeCountMax);
-    uniform_real_distribution<float> lx(lakeEdgeMargin, worldSize - lakeSize.x - lakeEdgeMargin);
-    uniform_real_distribution<float> ly(hudBarHeight + lakeEdgeMargin, worldSize - lakeSize.y - lakeEdgeMargin);
+    uniform_int_distribution<int> pickSize(0, lakeSizeCount - 1);
+    bernoulli_distribution trimCorner(lakeCornerTrimChance);
     int want = count(gen);
     for (int n = 0; n < want; n++) {
+        const lakeSizeDef& def = lakeSizes[pickSize(gen)];
+        Vector2f lakeSize(def.cols * lakeTilePx, def.rows * lakeTilePx);
+        uniform_real_distribution<float> lx(lakeEdgeMargin, worldSize - lakeSize.x - lakeEdgeMargin);
+        uniform_real_distribution<float> ly(hudBarHeight + lakeEdgeMargin, worldSize - lakeSize.y - lakeEdgeMargin);
         for (int k = 0; k < lakePlaceTries; k++) {
             FloatRect r(Vector2f(round(lx(gen)), round(ly(gen))), lakeSize);
             Vector2f c = r.position + lakeSize / 2.0f;
@@ -3388,38 +3398,50 @@ void spawnLakes(vector<tree>& trees, vector<CircleShape>& tris, vector<Rectangle
                 if (r.findIntersection(gap).has_value()) ok = false;
             }
             if (!ok) continue;
+            // Tile mask: full grid, then at most one tile trimmed per corner. A corner is only trimmed while its row
+            // keeps at least two tiles, so trimming never leaves an empty row.
+            int cols = def.cols, rows = def.rows;
+            vector<char> wet(cols * rows, 1);
+            auto rowCount = [&](int y) { int m = 0; for (int x = 0; x < cols; x++) m += wet[y * cols + x]; return m; };
+            const int cornerX[4] = {0, cols - 1, 0, cols - 1}, cornerY[4] = {0, 0, rows - 1, rows - 1};
+            for (int q = 0; q < 4; q++)
+                if (trimCorner(gen) && rowCount(cornerY[q]) > 2) wet[cornerY[q] * cols + cornerX[q]] = 0;
+            // Bank quads first (each tile grown by lakeBankPx, so the bank follows the blocky outline), then water on top.
+            VertexArray va(PrimitiveType::Triangles);
+            auto addQuad = [&va](Vector2f p, Vector2f s, Color col) {
+                Vector2f a = p, b = p + Vector2f(s.x, 0.0f), c2 = p + s, d = p + Vector2f(0.0f, s.y);
+                va.append(Vertex{a, col}); va.append(Vertex{b, col}); va.append(Vertex{c2, col});
+                va.append(Vertex{a, col}); va.append(Vertex{c2, col}); va.append(Vertex{d, col});
+            };
+            Vector2f tile(lakeTilePx, lakeTilePx), bank(lakeBankPx, lakeBankPx);
+            for (int y = 0; y < rows; y++)
+                for (int x = 0; x < cols; x++)
+                    if (wet[y * cols + x])
+                        addQuad(r.position + Vector2f(x * lakeTilePx, y * lakeTilePx) - bank, tile + 2.0f * bank, lakeBankColor);
+            for (int y = 0; y < rows; y++)
+                for (int x = 0; x < cols; x++) {
+                    if (!wet[y * cols + x]) continue;
+                    bool ring = def.shallows && (x == 0 || y == 0 || x == cols - 1 || y == rows - 1);
+                    Color col = ring ? lakeShallowsColor : ((x + y) % 2 == 0 ? lakeDeepColorA : lakeDeepColorB);
+                    addQuad(r.position + Vector2f(x * lakeTilePx, y * lakeTilePx), tile, col);
+                }
             lakes.push_back(r);
-            // Wobbly oval: point i sits at angle i*2pi/N on the inscribed ellipse. E/S/W/N are pinned to the rect edge
-            // midpoints (so shore points stay on the bank); the rest are pulled inward only, so the shape stays inside
-            // the rect and star-shaped about its centre (ConvexShape fans from the bounds centre, which is the rect centre).
-            mt19937 lakeRng((uint32_t)r.position.x * 73856093u ^ (uint32_t)r.position.y * 19349663u);
-            uniform_real_distribution<float> wob(0.0f, lakeWobbleMax);
-            ConvexShape shallow(lakeShapePoints), deep(lakeShapePoints);
-            Vector2f lc = r.position + r.size / 2.0f, rad = r.size / 2.0f;
-            for (int p = 0; p < lakeShapePoints; p++) {
-                float a = 2.0f * 3.14159265f * p / lakeShapePoints;
-                float s = (p % (lakeShapePoints / 4) == 0) ? 1.0f : 1.0f - wob(lakeRng);
-                float cx = cos(a), cy = sin(a);
-                if (p % (lakeShapePoints / 4) == 0) { cx = round(cx); cy = round(cy); } // exact edge midpoints
-                shallow.setPoint(p, lc + Vector2f(rad.x * cx * s, rad.y * cy * s));
-                deep.setPoint(p, lc + Vector2f((rad.x - lakeShallowsPx) * cx * s, (rad.y - lakeShallowsPx) * cy * s));
-            }
-            shallow.setFillColor(lakeShallowsColor);
-            shallow.setOutlineColor(lakeRimColor);
-            shallow.setOutlineThickness(lakeRimPx);
-            deep.setFillColor(lakeColor);
-            lakeShallows.push_back(shallow);
-            lakeShapes.push_back(deep);
+            lakeTiles.push_back(va);
+            // Shore points (top, bottom, left, right; see shoreWaterDir) from the real wet spans of the centre column and row.
+            int cc = cols / 2, cr = rows / 2;
+            int y0 = 0, y1 = rows - 1, x0 = 0, x1 = cols - 1;
+            while (y0 < y1 && !wet[y0 * cols + cc]) y0++;
+            while (y1 > y0 && !wet[y1 * cols + cc]) y1--;
+            while (x0 < x1 && !wet[cr * cols + x0]) x0++;
+            while (x1 > x0 && !wet[cr * cols + x1]) x1--;
+            float edge = lakeBankPx + lakeShorePx; // just past the bank
+            float midX = round(r.position.x + (cc + 0.5f) * lakeTilePx), midY = round(r.position.y + (cr + 0.5f) * lakeTilePx);
+            shorePoints.push_back(Vector2f(midX, r.position.y + y0 * lakeTilePx - edge));
+            shorePoints.push_back(Vector2f(midX, r.position.y + (y1 + 1) * lakeTilePx + edge - 1.0f));
+            shorePoints.push_back(Vector2f(r.position.x + x0 * lakeTilePx - edge, midY));
+            shorePoints.push_back(Vector2f(r.position.x + (x1 + 1) * lakeTilePx + edge - 1.0f, midY));
             break;
         }
-    }
-    for (auto& l : lakes) {
-        float edge = lakeRimPx + lakeShorePx; // just past the rim
-        Vector2f c = l.position + l.size / 2.0f;
-        shorePoints.push_back(Vector2f(round(c.x), l.position.y - edge));
-        shorePoints.push_back(Vector2f(round(c.x), l.position.y + l.size.y + edge - 1.0f));
-        shorePoints.push_back(Vector2f(l.position.x - edge, round(c.y)));
-        shorePoints.push_back(Vector2f(l.position.x + l.size.x + edge - 1.0f, round(c.y)));
     }
     for (int i = (int)tris.size() - 1; i >= 0; i--) {
         if (lakeClear(FloatRect(tris[i].getPosition(), Vector2f(treeFootprint, treeFootprint)))) continue;
@@ -3432,13 +3454,10 @@ void spawnLakes(vector<tree>& trees, vector<CircleShape>& tris, vector<Rectangle
     printf("Spawned %zu lakes (%zu shore points)\n", lakes.size(), shorePoints.size());
 }
 
-// Wobbly oval ponds (R22-F1): shallows oval with a 1px pale bank outside it, deep water inset on top.
+// Blocky pixel lakes (R23-F1): one prebuilt vertex array per lake (bank, then shallows/checkered deep tiles).
 // Ground layer: after trails, before rocks/trees.
 void drawLakes(RenderWindow& window) {
-    for (size_t i = 0; i < lakeShallows.size() && i < lakeShapes.size(); i++) {
-        window.draw(lakeShallows[i]);
-        window.draw(lakeShapes[i]);
-    }
+    for (auto& va : lakeTiles) window.draw(va);
 }
 
 // A few clumps of bushes, away from the village center. Startup trees overlapping a bush are
