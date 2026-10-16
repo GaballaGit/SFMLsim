@@ -114,6 +114,20 @@ const int gluttonMealFood = 2;           // ...and eat this much per meal when t
 const int foragerFoodBonus = 1;          // extra food when a Forager picks berries or reaps the field
 const float traitDotMinZoom = 2.0f;      // hidden below this zoom: a 1px dot is noise at 1x
 
+// Elections (R28-F2): at dawn a race with enough members and no leader crowns one; >50% approval or retry next dawn
+const int electionThreshold = 10;        // a race needs at least this many living members to hold an election
+const char* const racePlurals[raceCount] = {"Humans", "Dwarves", "Elves"};   // ticker subject, indexed by barbRace
+// Chance a voter of this race approves a candidate with this trait; the candidate always approves itself
+const float raceTraitLike[raceCount][traitCount] = {
+    // Swift Sturdy Glutton Forager
+    {0.50f, 0.55f, 0.30f, 0.75f},   // humans prize foragers
+    {0.35f, 0.75f, 0.55f, 0.45f},   // dwarves prize the sturdy
+    {0.75f, 0.40f, 0.25f, 0.60f},   // elves prize the swift
+};
+const float crownMinZoom = 1.0f;          // the crown shows at every zoom (minZoom is 1)
+const Vector2f crownSize(2.0f, 1.0f);     // 2x1 band sitting on the head (or on top of the hat)
+const Color crownColor(250, 208, 64);     // bright gold: off the body, so it never meets a task stripe or the sash
+
 // Sasuke the Shinobi (R25-F2): the first founder; fast, and blinks a few px when idle
 const char* const shinobiName = "Sasuke";      // not in barbNames, so nobody else can roll it
 bool sasukeTaken = false;                      // set once in makeBarb() when the first founder takes the name
@@ -963,6 +977,18 @@ int hungerThresholdOf(const barb& b) {
     return (int)(hungerThreshold * s);
 }
 bool isGentry(const barb& b) { return b.homeHouse < 0; }   // R24-F1: founders; derived, no stored flag
+
+// R28-F2: leaders are held by barb id (never index); a missing id means the race has no leader
+int raceLeaderId[raceCount] = {-1, -1, -1};
+bool raceElected[raceCount] = {false, false, false};
+int findBarbById(const vector<barb>& barbs, int id) {
+    if (id < 0) return -1;
+    for (int i = 0; i < (int)barbs.size(); i++) if (barbs[i].id == id) return i;
+    return -1;
+}
+bool isLeader(const barb& b) {
+    return b.race >= 0 && b.race < raceCount && raceElected[b.race] && raceLeaderId[b.race] >= 0 && raceLeaderId[b.race] == b.id;
+}
 int mineTicks(const barb& b) { return (int)(rockMineTicks / raceOf(b).mineSpeed / (know.learned[techPickwork] ? pickworkMineSpeed : 1.0f)); }
 
 struct deer {            // any game animal; species picks its row in speciesDefs
@@ -1757,6 +1783,13 @@ void drawBarbs(RenderWindow& window, const vector<barb>& barbs, const vector<Rec
                 tip.setPosition(Vector2f(base.x, hatTop - rd.hatTipSize.y));
                 window.draw(tip);
             }
+        }
+        if (zoom >= crownMinZoom && isLeader(b)) {   // R28-F2: gold band on the very top of the head or hat (stays under the ballot pip)
+            float headTop = bodyTop - rd.hatSize.y - rd.hatTipSize.y;
+            stripe.setSize(crownSize);
+            stripe.setFillColor(crownColor);
+            stripe.setPosition(Vector2f(base.x + floor((bodySize.x - crownSize.x) / 2.0f), headTop - crownSize.y));
+            window.draw(stripe);
         }
 
         float side = base.x + bodySize.x;                // tool/arm sits just right of the body
@@ -3190,6 +3223,45 @@ void drawBallots(RenderWindow& window, const View& worldView, float zoom,
     }
 }
 
+// R28-F2: dawn elections. Each leaderless race with enough members puts up its best-liked member;
+// every other member approves with raceTraitLike odds. More than half wins the crown, else retry next dawn.
+void leaderTick(vector<barb>& barbs) {
+    for (int r = 0; r < raceCount; r++) {
+        if (raceElected[r] && findBarbById(barbs, raceLeaderId[r]) < 0) {   // leader gone: no leader, may elect again
+            printf("LEADER LOST - %s leader id %d is gone\n", racePlurals[r], raceLeaderId[r]);
+            raceElected[r] = false;
+            raceLeaderId[r] = -1;
+        }
+        if (raceElected[r]) continue;
+        vector<int> members;
+        for (int i = 0; i < (int)barbs.size(); i++) if (barbs[i].race == r) members.push_back(i);
+        if ((int)members.size() < electionThreshold) continue;
+        float best = -1.0f;
+        vector<int> picks;   // members whose trait this race likes most; one is drawn at random
+        for (int i : members) {
+            float like = raceTraitLike[r][barbs[i].trait];
+            if (like > best) { best = like; picks.clear(); }
+            if (like == best) picks.push_back(i);
+        }
+        const barb& cand = barbs[picks[uniform_int_distribution<int>(0, (int)picks.size() - 1)(gen)]];
+        bernoulli_distribution approve(best);
+        int yes = 0;
+        for (int i : members) yes += (barbs[i].id == cand.id || approve(gen)) ? 1 : 0;
+        int n = (int)members.size();
+        string who = string(cand.name) + " the " + traitOf(cand).name;
+        string tally = to_string(yes) + " of " + to_string(n);
+        if (yes * 2 > n) {
+            raceElected[r] = true;
+            raceLeaderId[r] = cand.id;
+            printf("ELECTION - %s crown %s, barb %d (%s approve)\n", racePlurals[r], who.c_str(), cand.id, tally.c_str());
+            logEvent(string(racePlurals[r]) + " crown " + who + " (" + tally + " approve)");
+        } else {
+            printf("ELECTION - %s: no consensus on %s, barb %d (%s approve)\n", racePlurals[r], who.c_str(), cand.id, tally.c_str());
+            logEvent(string(racePlurals[r]) + ": no consensus (" + tally + ")");
+        }
+    }
+}
+
 void councilTick(vector<barb>& barbs) {
     static int lastHour = game_time;
     if (game_time == lastHour) return;
@@ -3214,6 +3286,7 @@ void councilTick(vector<barb>& barbs) {
     if (gentry > 0)   // R24-F1 ticker line: who carried the weight this dawn
         logEvent(to_string(gentry) + " Gentry cast " + to_string(gentry * gentryVoteWeight) + " of " +
                  to_string(gentry * gentryVoteWeight + (int)barbs.size() - gentry) + " votes");
+    leaderTick(barbs);   // R28-F2: elections ride the same dawn
 }
 
 int popCap(const vector<house>& houses) {
