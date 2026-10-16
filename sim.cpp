@@ -110,6 +110,22 @@ const int gluttonMealFood = 2;           // ...and eat this much per meal when t
 const int foragerFoodBonus = 1;          // extra food when a Forager picks berries or reaps the field
 const float traitDotMinZoom = 2.0f;      // hidden below this zoom: a 1px dot is noise at 1x
 
+// Sasuke the Shinobi (R25-F2): the first founder; fast, and blinks a few px when idle
+const char* const shinobiName = "Sasuke";      // not in barbNames, so nobody else can roll it
+bool sasukeTaken = false;                      // set once in makeBarb() when the first founder takes the name
+const float shinobiStepSpeed = 2.0f;           // steps this many times faster (interval / 2, min 1), on top of Swift
+const Color shinobiBodyColor(150, 196, 236);   // light blue: paler than build blue (80,170,255), bright on dark green
+const Color shinobiOutlineColor(225, 238, 250, 110); // pale, translucent 1px rim so the 2px body reads without glaring
+const Color shinobiBandColor(40, 52, 96);      // dark navy headband across the top body row
+const int shinobiBlinkOneIn = 600;             // 1-in-N per idle tick (~10s of idling between blinks)
+const int shinobiBlinkMinPx = 3;               // blink hop per axis: up to max, total at least min
+const int shinobiBlinkMaxPx = 8;
+const int shinobiBlinkTries = 8;               // random spots tried per blink; no free spot = no blink
+const int shinobiPuffFrames = 20;              // puff left at the old spot fades out over this many frames
+const Vector2f shinobiPuffSize(3.0f, 3.0f);
+const Color shinobiPuffColor(170, 172, 176);   // soft grey
+const uint8_t shinobiPuffMaxAlpha = 90;        // subtle: faint at the start, linear fade to 0
+
 int wood = 0;
 int stone = 0;
 int food = 0;
@@ -925,6 +941,7 @@ struct barb {
     int spearTimer = 0;          // R20-F3: craft progress while jobKind == jobSpear; separate from timer; cleared by clearSpearCraft()
     const char* name = "";       // R25-F1: points into barbNames (no heap strings); set in makeBarb()
     barbTrait trait = traitSwift; // R25-F1: rolled once in makeBarb()
+    bool shinobi = false;        // R25-F2: Sasuke; set once in makeBarb()
 };
 
 const raceDef& raceOf(const barb& b) { return raceDefs[b.race]; }
@@ -1393,7 +1410,8 @@ bool isHungry(const barb& b) { return b.hunger >= hungerThresholdOf(b); }
 
 int stepLimit(const barb& b) {
     int lim = stepLimit() * (isHungry(b) ? hungerWorkSlowdown : 1);
-    return b.trait == traitSwift ? max(1, (int)(lim / swiftStepSpeed)) : lim;   // R25-F1
+    float speed = (b.trait == traitSwift ? swiftStepSpeed : 1.0f) * (b.shinobi ? shinobiStepSpeed : 1.0f); // R25-F1, R25-F2
+    return speed > 1.0f ? max(1, (int)(lim / speed)) : lim;
 }
 
 // Worn trails: per-cell wear from barb steps, decaying over time. Tiers: 0 none, 1 path, 2 road.
@@ -1678,8 +1696,15 @@ void drawBarbs(RenderWindow& window, const vector<barb>& barbs, const vector<Rec
         Color tc = barbColor(b);                         // task colour; barbIdleColor means no task
         bool idle = tc == barbIdleColor;
         if (hungry) tc = hungryTint(tc);
+        if (b.shinobi) {   // R25-F2: faint pale rim one px around the body, drawn underneath it
+            body.setSize(Vector2f(bodySize.x + 2.0f, bodyH + 2.0f));
+            body.setFillColor(shinobiOutlineColor);
+            body.setPosition(Vector2f(base.x - 1.0f, bodyTop - 1.0f));
+            window.draw(body);
+        }
+        Color bodyColor = b.shinobi ? shinobiBodyColor : barbBodyColor;
         body.setSize(Vector2f(bodySize.x, bodyH));
-        body.setFillColor(hungry ? hungryTint(barbBodyColor) : barbBodyColor);
+        body.setFillColor(hungry ? hungryTint(bodyColor) : bodyColor);
         body.setPosition(Vector2f(base.x, bodyTop));
         window.draw(body);
         if (showTraits) {   // R25-F1: 1px badge on the left shoulder, off the body so it never blends with stripe or sash
@@ -1698,6 +1723,12 @@ void drawBarbs(RenderWindow& window, const vector<barb>& barbs, const vector<Rec
             stripe.setSize(Vector2f(bodySize.x, gentrySashH));
             stripe.setFillColor(gentrySashColor);
             stripe.setPosition(Vector2f(base.x, bodyTop + sashTop));
+            window.draw(stripe);
+        }
+        if (b.shinobi) {   // R25-F2: 1px headband on the top body row (stripe is row 1, sash row 2)
+            stripe.setSize(Vector2f(bodySize.x, 1.0f));
+            stripe.setFillColor(shinobiBandColor);
+            stripe.setPosition(Vector2f(base.x, bodyTop));
             window.draw(stripe);
         }
         if (rd.hatSize.x > 0.0f) {                       // race mark above the head, never on the body
@@ -2859,7 +2890,11 @@ void makeBarb(Vector2i pos, vector<barb>& barbs, vector<RectangleShape>& squares
     b.hasSpear = false;   // R20-F3: every new barb starts unarmed with no craft in progress
     b.spearTimer = 0;
     b.trait = (barbTrait)uniform_int_distribution<int>(0, traitCount - 1)(gen);   // R25-F1
-    {   // R25-F1: a random unused name; once all are taken, any name may repeat
+    if (!sasukeTaken && homeHouse < 0) {   // R25-F2: the first founder is Sasuke (no table name is spent)
+        sasukeTaken = true;
+        b.shinobi = true;
+        b.name = shinobiName;
+    } else {   // R25-F1: a random unused name; once all are taken, any name may repeat
         int freeCount = 0;
         for (int k = 0; k < barbNameCount; k++) if (!barbNameUsed[k]) freeCount++;
         int k = 0;
@@ -2880,7 +2915,62 @@ void makeBarb(Vector2i pos, vector<barb>& barbs, vector<RectangleShape>& squares
     sq.setFillColor(Color::White);
     squares.push_back(sq);
     rings.push_back({Vector2f(b.x, b.y) + bodySize / 2.0f}); // centred on the body
-    printf("BARB BORN - %s the %s (%s)\n", b.name, traitOf(b).name, raceOf(b).name);
+    printf("BARB BORN - %s the %s (%s)%s\n", b.name, traitOf(b).name, raceOf(b).name, b.shinobi ? " - shinobi" : "");
+}
+
+// R25-F2: Sasuke's blink. Puffs live in their own vector, aged per drawn frame and removed in reverse.
+struct shinobiPuff {Vector2f pos; int age = 0;};
+
+bool shinobiSpotFree(const FloatRect& r, int self, const vector<RectangleShape>& squares,
+                     const vector<RectangleShape>& houseshapes, const vector<CircleShape>& octs) {
+    if (r.position.x < 1.0f || r.position.y < hudBarHeight || r.position.x + r.size.x > worldSize - 1.0f || r.position.y + r.size.y > worldSize - 1.0f) return false;
+    if (!lakeClear(r) || !forgeClear(r)) return false;
+    for (int k = 0; k < (int)squares.size(); k++)
+        if (k != self && r.findIntersection(squares[k].getGlobalBounds()).has_value()) return false;
+    for (auto& hs : houseshapes) if (r.findIntersection(hs.getGlobalBounds()).has_value()) return false;
+    for (auto& o : octs) if (r.findIntersection(o.getGlobalBounds()).has_value()) return false;
+    return true;
+}
+
+void shinobiTick(vector<barb>& barbs, vector<RectangleShape>& squares, const vector<RectangleShape>& houseshapes,
+                 const vector<CircleShape>& octs, vector<shinobiPuff>& puffs) {
+    static uniform_int_distribution<int> blinkChance(0, shinobiBlinkOneIn - 1);
+    static uniform_int_distribution<int> blinkD(-shinobiBlinkMaxPx, shinobiBlinkMaxPx);
+    for (int i = 0; i < (int)barbs.size() && i < (int)squares.size(); i++) {
+        barb& b = barbs[i];
+        if (!b.shinobi) continue;
+        if (b.moving || b.chopping || b.building || b.movingbspot || b.deertargeting || b.timer > 0 || b.jobKind != jobNone) continue;
+        if (blinkChance(gen) != 0) continue;
+        Vector2f from = squares[i].getPosition(), size = squares[i].getSize();
+        for (int t = 0; t < shinobiBlinkTries; t++) {
+            int dx = blinkD(gen), dy = blinkD(gen);
+            if (abs(dx) + abs(dy) < shinobiBlinkMinPx) continue;
+            Vector2f to = from + Vector2f((float)dx, (float)dy);
+            if (!shinobiSpotFree(FloatRect(to, size), i, squares, houseshapes, octs)) continue;
+            puffs.push_back({from + size / 2.0f});
+            squares[i].setPosition(to);
+            b.stepTimer = 0;
+            printf("SHINOBI BLINK - %s %+d,%+d\n", b.name, dx, dy);
+            break;
+        }
+    }
+}
+
+void shinobiPuffTick(vector<shinobiPuff>& puffs) {
+    for (auto& p : puffs) p.age++;
+    for (int i = (int)puffs.size() - 1; i >= 0; i--)
+        if (puffs[i].age >= shinobiPuffFrames) swapRemove(puffs, i);
+}
+
+void drawShinobiPuffs(RenderWindow& window, const vector<shinobiPuff>& puffs) {
+    RectangleShape r(shinobiPuffSize);
+    for (auto& p : puffs) {
+        Color c = shinobiPuffColor;
+        c.a = (uint8_t)(shinobiPuffMaxAlpha * (1.0f - (float)p.age / shinobiPuffFrames));
+        r.setFillColor(c);
+        r.setPosition(snapPx(p.pos - shinobiPuffSize / 2.0f));
+        window.draw(r);
+    }
 }
 
 void birthRingTick(vector<birthRing>& rings) {
@@ -3619,6 +3709,7 @@ int main() {
     vector<RectangleShape> squares;
     vector<birthRing> birthRings;
     vector<birthRing> catchRings;   // fishing ripples (R19-F1)
+    vector<shinobiPuff> shinobiPuffs; // Sasuke's blink puffs (R25-F2)
     barbs.reserve(numbarbs);
     squares.reserve(numbarbs);
     {
@@ -3760,6 +3851,7 @@ int main() {
                 craftspear(barbs, squares);
                 minematerials(squares, barbs, tris, stumps, trees, octs, rocks, bushes, bushshapes, catchRings, field);
                 barbmove(squares, barbs);
+                shinobiTick(barbs, squares, houseshapes, octs, shinobiPuffs);
                 treespawn(trees, tris, stumps, field);
                 barbspawner(squares, barbs, houses, houseshapes, birthRings);
                 birthRingTick(birthRings);
@@ -3878,6 +3970,8 @@ int main() {
 	}
 	drawBirthRings(window, birthRings);
 	drawCatchRings(window, catchRings);
+	drawShinobiPuffs(window, shinobiPuffs);   // world layer, under the day/night overlay
+	if (!paused) shinobiPuffTick(shinobiPuffs);
 
         int t = game_time;
         Color dncColor;
