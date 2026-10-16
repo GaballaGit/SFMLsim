@@ -376,6 +376,22 @@ const Color forgeEmberHot(176, 90, 44);    // brief glow after a dwarf mines a r
 const int forgeEmberBreathFrames = 150;    // one slow breath every ~2.5s
 const int forgeEmberBoostFrames = 120;     // ~2s brighter after a dwarf mines (frames, so it reads the same at any speed)
 
+// Lakes (R19-F2): static ponds placed once at startup. Static rect + rim only in v1 (no glint/ripples).
+// Only wander paths (barbs, deer) avoid lakes; task paths (chop/mine/build/hunt/flee/wolves) are straight lines and may cross
+// one. Nothing is ever placed in a lake, so those crossings are brief, and an animal that ends up inside can always wander out.
+const Vector2f lakeSize(40.0f, 28.0f);     // a bit over two trees wide
+const int lakeCountMin = 2;
+const int lakeCountMax = 3;
+const int lakePlaceTries = 60;             // per lake; fewer lakes are kept if a spot can't be found
+const float lakeVillageMinDist = 150.0f;   // lake centre at least this far from the campfire (clearing is 50, shrines 40)
+const float lakeEdgeMargin = 12.0f;        // from the map edges (and below the HUD strip)
+const float lakeMinGap = 30.0f;            // between two lakes
+const float lakeClearPx = 3.0f;            // trees, rocks, bushes, builds and wander targets keep this far from the water
+const float lakeRimPx = 1.0f;
+const float lakeShorePx = 1.0f;            // shore points sit this far outside the rim
+const Color lakeColor(60, 95, 140);        // muted desaturated blue: darker and greyer than the rain streaks/tint
+const Color lakeRimColor(128, 150, 168);   // pale grey-blue bank
+
 // Build jobs: which structure a barb's movingbspot/building belongs to. jobNone = no job, or a house (buildhouse()).
 enum buildJob {jobNone, jobShrine, jobSmoke, jobStall, jobForge, buildJobCount};
 const int buildJobTicks[buildJobCount] = {houseBuildTicks, shrineBuildTicks, smokehouseBuildTicks, stallBuildTicks, forgeBuildTicks};
@@ -645,6 +661,40 @@ int forgeEmberFrames = 0;   // >0 = ember glows hot; set when a dwarf mines a ro
 bool forgeClear(const FloatRect& r) {
     FloatRect zone(forgePos - Vector2f(forgeClearPx, forgeClearPx), forgeParts[0].size + Vector2f(2 * forgeClearPx, 2 * forgeClearPx));
     return !r.findIntersection(zone).has_value();
+}
+
+vector<FloatRect> lakes;          // water rects, fixed after spawnLakes()
+vector<Vector2f> shorePoints;     // 1px spots just outside each lake's rim at its edge midpoints (cached for angling, R19-F1)
+
+// True if segment a->b touches box (slab test). Pure geometry, used only by lakeClear().
+bool segmentHitsRect(Vector2f a, Vector2f b, const FloatRect& box) {
+    float t0 = 0.0f, t1 = 1.0f;
+    Vector2f d = b - a;
+    float lo[2] = {box.position.x, box.position.y}, hi[2] = {box.position.x + box.size.x, box.position.y + box.size.y};
+    float p[2] = {a.x, a.y}, dv[2] = {d.x, d.y};
+    for (int k = 0; k < 2; k++) {
+        if (dv[k] == 0.0f) { if (p[k] < lo[k] || p[k] > hi[k]) return false; continue; }
+        float ta = (lo[k] - p[k]) / dv[k], tb = (hi[k] - p[k]) / dv[k];
+        if (ta > tb) swap(ta, tb);
+        t0 = max(t0, ta); t1 = min(t1, tb);
+        if (t0 > t1) return false;
+    }
+    return true;
+}
+
+// The one lake check: false if r comes within lakeClearPx of any lake. With pathFrom (top-left of an entity the size of r),
+// the straight walk from pathFrom to r.position must also stay clear; a lake the walker already stands in is ignored
+// so anything that drifted into water can still leave.
+bool lakeClear(const FloatRect& r, const Vector2f* pathFrom = nullptr) {
+    for (auto& l : lakes) {
+        FloatRect zone(l.position - Vector2f(lakeClearPx, lakeClearPx), l.size + Vector2f(2 * lakeClearPx, 2 * lakeClearPx));
+        if (r.findIntersection(zone).has_value()) return false;
+        if (!pathFrom) continue;
+        FloatRect sweep(zone.position - r.size, zone.size + r.size); // top-left points whose box would touch the zone
+        if (sweep.contains(*pathFrom)) continue;
+        if (segmentHitsRect(*pathFrom, r.position, sweep)) return false;
+    }
+    return true;
 }
 
 struct barb {
@@ -989,6 +1039,8 @@ void deerspawn(vector<deer>& deers, vector<RectangleShape>& deershape) {
 			d.y = DeerSpawnY(gen);
 			d.targety = d.y;
 			d.moving  = true;
+			Vector2f from(d.x, d.y);
+			if (!lakeClear(FloatRect(Vector2f(d.targetx, d.targety), sp.bodySize + Vector2f(0.0f, sp.legPx)), &from)) continue; // retry next tick
 			addAnimal(deers, deershape, d);
 			printf("%s arrived - %d now\n", sp.name, n + 1);
 		} else if (sp.breedOneIn > 0 && n >= 2 && uniform_int_distribution<int>(0, sp.breedOneIn - 1)(gen) == 0) {
@@ -1000,6 +1052,7 @@ void deerspawn(vector<deer>& deers, vector<RectangleShape>& deershape) {
 			float side = uniform_int_distribution<int>(0, 1)(gen) == 0 ? -rabbitBirthOffsetPx : rabbitBirthOffsetPx;
 			d.x = (int)clamp(p.x + side, 0.0f, worldSize - sp.bodySize.x);
 			d.y = (int)p.y;
+			if (!lakeClear(FloatRect(Vector2f(d.x, d.y), sp.bodySize + Vector2f(0.0f, sp.legPx)))) continue; // no kits in the water
 			addAnimal(deers, deershape, d);
 			printf("%s born - %d now\n", sp.name, n + 1);
 		}
@@ -1055,7 +1108,7 @@ void deerwander(vector<RectangleShape>& deershape, vector<deer>& deers, const ve
             if (wanderChance(gen) != 0) continue;
             int tx = (int)pos.x + wanderDX(gen);
             int ty = (int)pos.y + wanderDY(gen);
-            if (tx > 0 && tx < 800 && ty > 0 && ty < 800) {
+            if (tx > 0 && tx < 800 && ty > 0 && ty < 800 && lakeClear(FloatRect(Vector2f(tx, ty), ds.getSize() + Vector2f(0.0f, speciesOf(d).legPx)), &pos)) {
                 d.targetx = tx;
                 d.targety = ty;
                 d.moving  = true;
@@ -1826,6 +1879,7 @@ void buildhouse(vector<barb>& barbs,vector<RectangleShape>& squares, vector<hous
             if (!canclaim || wood < houseWoodCost) continue;
             int tx = 400 + buildSpotDX(gen), ty = 400 + buildSpotDY(gen);
             if (!forgeClear(FloatRect(Vector2f(tx - 3.0f, ty - 3.0f), houseSlabSize))) continue; // house + roof + slab; reroll next tick
+            if (!lakeClear(FloatRect(Vector2f(tx - 3.0f, ty - 3.0f), houseSlabSize))) continue;  // same footprint, no houses in the water
             wood -= houseWoodCost;
             b.reservedwood = true;
             b.reservedstone = stone >= houseStoneCost ? houseStoneCost : 0; // 0 stone -> plain house
@@ -1924,6 +1978,7 @@ void buildshrine(vector<barb>& barbs, vector<RectangleShape>& squares, const vec
                 FloatRect stoneRect(p - Vector2f(0.0f, shrineCapH), shrineSlabSize + Vector2f(0.0f, shrineCapH));
                 if (stoneRect.findIntersection(hutClear).has_value()) found = false; // keep the smokehouse spot free
                 if (!forgeClear(stoneRect)) found = false;                          // and the forge spot
+                if (!lakeClear(stoneRect)) found = false;
                 for (auto& o : barbs) {
                     if (o.jobKind != jobShrine) continue;
                     Vector2f d = p - shrineSlabPos(o.targetx, o.targety);
@@ -2341,7 +2396,7 @@ void barbmove(vector<RectangleShape>& squares, vector<barb>& barbs) {
             if (wanderChance(gen) != 0) continue;
             int tx = (int)pos.x + wanderDX(gen);
             int ty = (int)pos.y + wanderDY(gen);
-            if (tx > 0 && tx < 800 && ty > 0 && ty < 800) {
+            if (tx > 0 && tx < 800 && ty > 0 && ty < 800 && lakeClear(FloatRect(Vector2f(tx, ty), sq.getSize()), &pos)) {
                 b.targetx = tx;
                 b.targety = ty;
                 b.moving  = true;
@@ -2568,6 +2623,7 @@ CircleShape makeTreeTri(int x, int y) {
 void treespawn(vector<tree>& trees, vector<CircleShape>& tris, vector<RectangleShape>& stumps) {
     if (treespawnChance(gen) != 0) return;
     tree t{distrib(gen), distrib(gen), 100, false};
+    if (!lakeClear(FloatRect(Vector2f(t.x, t.y), Vector2f(treeFootprint, treeFootprint)))) return; // no trees in the water
     trees.push_back(t);
 
     tris.push_back(makeTreeTri(t.x, t.y));
@@ -2578,6 +2634,61 @@ void treespawn(vector<tree>& trees, vector<CircleShape>& tris, vector<RectangleS
     stumps.push_back(stump);
 }
 
+// 2-3 ponds away from the village, apart from each other. Startup trees (trees/tris/stumps) and rocks (rocks/octs)
+// in or touching a lake are removed together. Fixed village spots (smokehouse, stall, forge) are inside the
+// lakeVillageMinDist ring, so they never need a lake check. Shore points are cached here for angling.
+void spawnLakes(vector<tree>& trees, vector<CircleShape>& tris, vector<RectangleShape>& stumps, vector<rock>& rocks, vector<CircleShape>& octs) {
+    uniform_int_distribution<int> count(lakeCountMin, lakeCountMax);
+    uniform_real_distribution<float> lx(lakeEdgeMargin, worldSize - lakeSize.x - lakeEdgeMargin);
+    uniform_real_distribution<float> ly(hudBarHeight + lakeEdgeMargin, worldSize - lakeSize.y - lakeEdgeMargin);
+    int want = count(gen);
+    for (int n = 0; n < want; n++) {
+        for (int k = 0; k < lakePlaceTries; k++) {
+            FloatRect r(Vector2f(round(lx(gen)), round(ly(gen))), lakeSize);
+            Vector2f c = r.position + lakeSize / 2.0f;
+            if (hypot(c.x - villageCenter.x, c.y - villageCenter.y) < lakeVillageMinDist) continue;
+            bool ok = true;
+            for (auto& l : lakes) {
+                FloatRect gap(l.position - Vector2f(lakeMinGap, lakeMinGap), l.size + Vector2f(2 * lakeMinGap, 2 * lakeMinGap));
+                if (r.findIntersection(gap).has_value()) ok = false;
+            }
+            if (!ok) continue;
+            lakes.push_back(r);
+            break;
+        }
+    }
+    for (auto& l : lakes) {
+        float edge = lakeRimPx + lakeShorePx; // just past the rim
+        Vector2f c = l.position + l.size / 2.0f;
+        shorePoints.push_back(Vector2f(round(c.x), l.position.y - edge));
+        shorePoints.push_back(Vector2f(round(c.x), l.position.y + l.size.y + edge - 1.0f));
+        shorePoints.push_back(Vector2f(l.position.x - edge, round(c.y)));
+        shorePoints.push_back(Vector2f(l.position.x + l.size.x + edge - 1.0f, round(c.y)));
+    }
+    for (int i = (int)tris.size() - 1; i >= 0; i--) {
+        if (lakeClear(FloatRect(tris[i].getPosition(), Vector2f(treeFootprint, treeFootprint)))) continue;
+        swapRemove(trees, i); swapRemove(tris, i); swapRemove(stumps, i);
+    }
+    for (int i = (int)octs.size() - 1; i >= 0; i--) {
+        if (lakeClear(octs[i].getGlobalBounds())) continue;
+        swapRemove(rocks, i); swapRemove(octs, i);
+    }
+    printf("Spawned %zu lakes (%zu shore points)\n", lakes.size(), shorePoints.size());
+}
+
+// Flat water with a 1px pale rim drawn outside it. Ground layer: after trails, before rocks/trees.
+void drawLakes(RenderWindow& window) {
+    RectangleShape s(lakeSize);
+    s.setFillColor(lakeColor);
+    s.setOutlineColor(lakeRimColor);
+    s.setOutlineThickness(lakeRimPx);
+    for (auto& l : lakes) {
+        s.setSize(l.size);
+        s.setPosition(l.position);
+        window.draw(s);
+    }
+}
+
 // A few clumps of bushes, away from the village center. Startup trees overlapping a bush are
 // cleared (trees, tris and stumps together) so the clumps sit in small clearings and stay visible.
 void spawnBushes(vector<bush>& bushes, vector<CircleShape>& bushshapes, vector<tree>& trees, vector<CircleShape>& tris, vector<RectangleShape>& stumps) {
@@ -2586,7 +2697,9 @@ void spawnBushes(vector<bush>& bushes, vector<CircleShape>& bushshapes, vector<t
     for (int c = 0; c < numBushClumps; c++) {
         Vector2f cp;
         do cp = Vector2f((float)centre(gen), (float)centre(gen));
-        while (hypot(cp.x - villageCenter.x, cp.y - villageCenter.y) < bushClumpMinCenterDist);
+        while (hypot(cp.x - villageCenter.x, cp.y - villageCenter.y) < bushClumpMinCenterDist
+               || !lakeClear(FloatRect(cp - Vector2f(bushClumpSpread, bushClumpSpread),     // whole clump + work spots off the water
+                                       Vector2f(2 * (bushClumpSpread + bushRadius), 2 * (bushClumpSpread + bushRadius) + bushWorkOffset.y))));
         for (int k = 0; k < bushesPerClump; k++) {
             bush bu{(int)(cp.x + spread(gen)), (int)(cp.y + spread(gen))};
             bushes.push_back(bu);
@@ -2682,6 +2795,8 @@ int main() {
         oct.setFillColor(Color(125, 125, 125));
         octs.push_back(oct);
     }
+
+    spawnLakes(trees, tris, stumps, rocks, octs); // before the bushes so clumps can avoid the water
 
     vector<bush> bushes;
     vector<CircleShape> bushshapes;
@@ -2814,6 +2929,7 @@ int main() {
         window.clear(Color(4, 20, 14)); //bg color
         window.setView(worldView);
         drawTrails(window, trailVerts);
+        drawLakes(window);
 	
 	for (auto& oct : octs)
 		window.draw(rockDrawShape(oct));
