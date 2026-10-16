@@ -485,11 +485,7 @@ const int storehouseWoodCost = 10;
 const int storehouseMinRaceHouses = 1;     // a race builds its storehouse once it has a house of its own
 const int storehouseBuildTicks = 600;      // same work as a house
 const Vector2f storehouseSize(10.0f, 10.0f);
-const Vector2f storehousePos[raceCount] = {   // crate top-left, indexed by barbRace; ring ~44px out, inside the 50px clearing
-    {395.0f, 351.0f},                      // human: north of the campfire
-    {350.0f, 398.0f},                      // dwarf: west, beyond the forge
-    {438.0f, 402.0f},                      // elf: east, beyond the stall
-};
+Vector2f storehousePos[raceCount];         // crate top-left, indexed by barbRace; set once at startup by placeQuarters() (R30-F1)
 const Vector2f storehouseStandOffset(-4.0f, 3.0f); // builder/hauler hitbox top-left relative to the crate: at its left side
 const float storehouseClearPx = 3.0f;      // houses, shrines, the field and blinks keep this far from crate + stand spot
 const float storehouseOutlinePx = 1.0f;    // drawn inward, so the crate stays exactly storehouseSize
@@ -502,6 +498,25 @@ const Color storehouseOutlineColor(34, 26, 18); // dark rim and lid slat
 const int storehouseFlashFrames = 18;      // deposit flash, ~0.3s (frames, frozen while paused)
 const float storehouseFlashMix = 0.4f;     // peak blend toward white: subtle
 const Vector2f campfireDepotOffset(-10.0f, -2.0f); // fallback drop spot (hitbox top-left) just west of the stone ring
+
+// Race quarters (R30-F1): each race's crate sits in its own quarter around the village, at least raceMinSeparation from
+// the others; that race's houses go within quarterHouseRadius of it. Trees/rocks are kept off each quarter like the
+// village clearing, lakes and bush clumps avoid it, and each quarter is topped up at startup if it is short of wood/stone.
+const float raceMinSeparation = 150.0f;      // min distance between two races' crates (startup check)
+const float quarterMinRadius = 130.0f;       // crate centre distance from the campfire
+const float quarterMaxRadius = 160.0f;
+const int quarterPlaceTries = 50;            // random layouts tried before the fixed fallback layout
+const float quarterHouseRadius = 45.0f;      // house spot within this of the crate centre
+const float quarterClearRadius = 52.0f;      // trees/rocks cleared within this (house spot 45 + 5px slab half + 2)
+const float quarterResourceRadius = 140.0f;  // startup resource check: trees/rocks between the clearing and this radius
+const int quarterMinTrees = 25;              // fewer than this nearby -> plant more (expected ~140 at 2000 trees)
+const int quarterMinRocks = 3;               // fewer than this nearby -> place more (expected ~7 at 100 rocks)
+const int quarterTopUpTries = 400;           // placement attempts per quarter for the top-up
+const unsigned quarterReseedSeed = 3001;     // fixed seed (+ race) so the top-up is deterministic
+const float quarterRingMinZoom = 2.0f;       // ring hidden below this zoom
+const float quarterRingDotGap = 6.0f;        // world px between ring dots (1px each)
+const uint8_t quarterRingAlpha = 30;         // very faint, in the race's crate colour
+const Color quarterRoadColor(150, 125, 85, 56); // 1px crate -> nearest house trail: trail brown, dim
 
 // Lakes (R19-F2): static ponds placed once at startup. Static rect + rim only in v1 (no glint/ripples).
 // Only wander paths (barbs, deer) avoid lakes; task paths (chop/mine/build/hunt/flee/wolves) are straight lines and may cross
@@ -778,8 +793,7 @@ uniform_int_distribution<int> wanderDX(-50, 50);
 uniform_int_distribution<int> wanderDY(-50, 50);
 uniform_int_distribution<int> spawnChance(0, 7500);
 uniform_int_distribution<int> treespawnChance(0, 99999);
-uniform_int_distribution<int> buildSpotDX(-250, 250);
-uniform_int_distribution<int> buildSpotDY(-250, 250);
+uniform_int_distribution<int> quarterSpotD(-(int)quarterHouseRadius, (int)quarterHouseRadius); // R30-F1: house offset per axis, disc-rejected
 uniform_int_distribution<int> DeerSpawnY(20, 780); 
 uniform_int_distribution<int> DeerSpawnRL(0, 1);
 uniform_int_distribution<int> DeerSpawnXgotoL(20, 100);
@@ -895,6 +909,78 @@ bool storehouseClear(const FloatRect& r) {
 bool forgeClear(const FloatRect& r) {
     FloatRect zone(forgePos - Vector2f(forgeClearPx, forgeClearPx), forgeParts[0].size + Vector2f(2 * forgeClearPx, 2 * forgeClearPx));
     return !r.findIntersection(zone).has_value() && storehouseClear(r);
+}
+
+// R30-F1: race quarters
+Vector2f quarterCentre(int r) { return storehousePos[r] + storehouseSize / 2.0f; }
+VertexArray quarterRingVerts(PrimitiveType::Triangles);   // dotted rings, built once in placeQuarters()
+VertexArray quarterRoads[raceCount];                      // crate -> nearest own house, rebuilt only when a house is built
+
+// True if a tree/rock at top-left p is inside the village clearing or any race quarter's clearing (removed every frame)
+bool inClearing(Vector2f p) {
+    float dx = p.x - villageCenter.x, dy = p.y - villageCenter.y;
+    if (dx * dx + dy * dy < clearRadiusSq) return true;
+    for (int r = 0; r < raceCount; r++) {
+        Vector2f d = p - quarterCentre(r);
+        if (d.x * d.x + d.y * d.y < quarterClearRadius * quarterClearRadius) return true;
+    }
+    return false;
+}
+
+// Appends a 1x1 world-px quad at the pixel containing p
+void appendDot(VertexArray& va, Vector2f p, Color col) {
+    float x0 = floor(p.x), y0 = floor(p.y), x1 = x0 + 1.0f, y1 = y0 + 1.0f;
+    Vector2f q[6] = {{x0, y0}, {x1, y0}, {x1, y1}, {x0, y0}, {x1, y1}, {x0, y1}};
+    for (auto& v : q) va.append(Vertex{v, col});
+}
+
+// Startup layout check: crates far enough apart, each quarter inside the map (below the HUD) and clear of the village clearing
+bool quarterLayoutOk() {
+    for (int a = 0; a < raceCount; a++) {
+        Vector2f c = quarterCentre(a);
+        if (c.x - quarterClearRadius < 0.0f || c.x + quarterClearRadius > worldSize
+            || c.y - quarterClearRadius < hudBarHeight || c.y + quarterClearRadius > worldSize) return false;
+        if (hypot(c.x - villageCenter.x, c.y - villageCenter.y) < sqrt(clearRadiusSq) + quarterClearRadius) return false;
+        for (int b = a + 1; b < raceCount; b++) {
+            Vector2f d = storehousePos[a] - storehousePos[b];
+            if (hypot(d.x, d.y) < raceMinSeparation) return false;
+        }
+    }
+    return true;
+}
+
+// Places the crates once, before anything else is spawned: a random rotation/radius of an even 3-way split, checked by
+// quarterLayoutOk(); if no try passes, the fixed layout (human north, others 120 deg apart) is used. Builds the rings.
+void placeQuarters() {
+    uniform_real_distribution<float> ang(0.0f, 6.2831853f), rad(quarterMinRadius, quarterMaxRadius);
+    auto layout = [](float a0, float r) {
+        for (int k = 0; k < raceCount; k++) {
+            float a = a0 + 6.2831853f * k / raceCount;
+            Vector2f c(villageCenter.x + cos(a) * r, villageCenter.y + sin(a) * r);
+            storehousePos[k] = snapPx(c - storehouseSize / 2.0f);
+        }
+    };
+    bool ok = false;
+    for (int t = 0; t < quarterPlaceTries && !ok; t++) {
+        layout(ang(gen), rad(gen));
+        ok = quarterLayoutOk();
+    }
+    if (!ok) {
+        layout(-1.5707963f, (quarterMinRadius + quarterMaxRadius) / 2.0f);
+        printf("Race quarters: random layout failed the check, using the fixed layout (%s)\n", quarterLayoutOk() ? "ok" : "STILL FAILS");
+    }
+    for (int k = 0; k < raceCount; k++)
+        printf("Race quarter %s: crate at (%.0f, %.0f)\n", raceDefs[k].name, storehousePos[k].x, storehousePos[k].y);
+    quarterRingVerts.clear();
+    for (int k = 0; k < raceCount; k++) {
+        Color col = storehouseColors[k];
+        col.a = quarterRingAlpha;
+        int dots = (int)round(6.2831853f * quarterClearRadius / quarterRingDotGap);
+        for (int i = 0; i < dots; i++) {
+            float a = 6.2831853f * i / dots;
+            appendDot(quarterRingVerts, quarterCentre(k) + Vector2f(cos(a), sin(a)) * quarterClearRadius, col);
+        }
+    }
 }
 
 // Know-how (R20-F1): every counter, learned flag and pip pulse lives here; reset as a whole with resetKnowHow()
@@ -2426,6 +2512,37 @@ void drawCampfireGlow(RenderWindow& window, const View& worldView, const campfir
     }
 }
 
+// R30-F1: false if a house slab at spot (tx,ty) would touch a standing house's slab or one still being walked to / built
+bool houseSpotFree(const vector<barb>& barbs, const vector<house>& houses, int tx, int ty) {
+    FloatRect r(Vector2f(tx - 4.0f, ty - 4.0f), houseSlabSize + Vector2f(2.0f, 2.0f));   // slab grown by 1px: a sliver of grass between
+    for (auto& h : houses)
+        if (r.findIntersection(FloatRect(Vector2f(h.x - 3.0f, h.y - 3.0f), houseSlabSize))) return false;
+    for (auto& o : barbs)
+        if (o.movingbspot && o.jobKind == jobNone
+            && r.findIntersection(FloatRect(Vector2f(o.targetx - 3.0f, o.targety - 3.0f), houseSlabSize))) return false;
+    return true;
+}
+
+// R30-F1: 1px pixel line from race r's crate centre to the nearest house of that race. Called only when a house is built.
+void rebuildQuarterRoad(int r, const vector<house>& houses) {
+    if (r < 0 || r >= raceCount) return;
+    VertexArray& va = quarterRoads[r];
+    va.setPrimitiveType(PrimitiveType::Triangles);
+    va.clear();
+    Vector2f a = quarterCentre(r), best;
+    float bestDSq = -1.0f;
+    for (auto& h : houses) {
+        if (h.race != r) continue;
+        Vector2f c((float)h.x + 2.0f, (float)h.y + 2.0f);   // centre of the 4px house
+        float dSq = (c.x - a.x) * (c.x - a.x) + (c.y - a.y) * (c.y - a.y);
+        if (bestDSq < 0.0f || dSq < bestDSq) { bestDSq = dSq; best = c; }
+    }
+    if (bestDSq < 0.0f) return;
+    Vector2f d = best - a;
+    int n = max(1, (int)ceil(max(fabs(d.x), fabs(d.y))));   // one dot per step along the long axis: an unbroken 1px line
+    for (int i = 0; i <= n; i++) appendDot(va, a + d * ((float)i / n), quarterRoadColor);
+}
+
 void buildhouse(vector<barb>& barbs,vector<RectangleShape>& squares, vector<house>& houses, vector<RectangleShape>& houseshapes, const plot& fp) {
     bool canclaim = (int)houses.size() < (int)barbs.size();
     for (int i = 0; i < (int)squares.size(); i++) {
@@ -2435,7 +2552,12 @@ void buildhouse(vector<barb>& barbs,vector<RectangleShape>& squares, vector<hous
         if (b.chopping || (b.timer > 0 && !b.building)) continue;
         if (!b.movingbspot && !b.moving) {
             if (!canclaim || wood < houseWoodCost) continue;
-            int tx = 400 + buildSpotDX(gen), ty = 400 + buildSpotDY(gen);
+            if (b.race < 0 || b.race >= raceCount) continue;
+            int dx = quarterSpotD(gen), dy = quarterSpotD(gen);
+            if (dx * dx + dy * dy > quarterHouseRadius * quarterHouseRadius) continue; // R30-F1: inside the own quarter's disc
+            Vector2f qc = quarterCentre(b.race);
+            int tx = (int)qc.x + dx, ty = (int)qc.y + dy;
+            if (!houseSpotFree(barbs, houses, tx, ty)) continue;  // packed quarter: no overlapping houses
             if (!forgeClear(FloatRect(Vector2f(tx - 3.0f, ty - 3.0f), houseSlabSize))) continue; // house + roof + slab; reroll next tick
             if (!lakeClear(FloatRect(Vector2f(tx - 3.0f, ty - 3.0f), houseSlabSize))) continue;  // same footprint, no houses in the water
             if (!fieldClear(fp, FloatRect(Vector2f(tx - 3.0f, ty - 3.0f), houseSlabSize))) continue; // nor on the wheat plot
@@ -2476,6 +2598,7 @@ void buildhouse(vector<barb>& barbs,vector<RectangleShape>& squares, vector<hous
                     hs.setOutlineColor(Color(54, 35, 16));
                     hs.setOutlineThickness(1);
                     houseshapes.push_back(hs);
+                    rebuildQuarterRoad(h.race, houses);   // R30-F1: only here, never per tick
                     b.building = b.moving = b.movingbspot = false;
                     b.timer = 0;
 		            printf("---HOUSE BUILT---\n");
@@ -2823,6 +2946,14 @@ void buildstorehouses(vector<barb>& barbs, vector<RectangleShape>& squares, cons
 
 // R29-F1: 10x10 race-coloured crate, dark inset rim and one dark lid slat across it. The fill eases toward white
 // for a moment after each deposit. Drawn with the forge, under barbs and trees.
+// R30-F1: ground layer. Each standing crate's 1px road to its race's nearest house (prebuilt on house build), then the
+// faint dotted quarter rings at zoom >= quarterRingMinZoom (at 1x a 1px dot ring is just noise).
+void drawQuarters(RenderWindow& window, const storehouse (&stores)[raceCount], float zoom) {
+    for (int r = 0; r < raceCount; r++)
+        if (stores[r].built && quarterRoads[r].getVertexCount() > 0) window.draw(quarterRoads[r]);
+    if (zoom >= quarterRingMinZoom && quarterRingVerts.getVertexCount() > 0) window.draw(quarterRingVerts);
+}
+
 void drawStorehouses(RenderWindow& window, const storehouse (&stores)[raceCount]) {
     RectangleShape crate(storehouseSize), slat(Vector2f(storehouseSize.x, storehouseOutlinePx));
     crate.setOutlineThickness(-storehouseOutlinePx);
@@ -3861,6 +3992,10 @@ void spawnLakes(vector<tree>& trees, vector<CircleShape>& tris, vector<Rectangle
                 FloatRect gap(l.position - Vector2f(lakeMinGap, lakeMinGap), l.size + Vector2f(2 * lakeMinGap, 2 * lakeMinGap));
                 if (r.findIntersection(gap).has_value()) ok = false;
             }
+            for (int q = 0; q < raceCount; q++) {   // R30-F1: race quarters stay dry (clearing + lakeMinGap)
+                float m = quarterClearRadius + lakeMinGap;
+                if (r.findIntersection(FloatRect(quarterCentre(q) - Vector2f(m, m), Vector2f(2 * m, 2 * m))).has_value()) ok = false;
+            }
             if (!ok) continue;
             // Tile mask: full grid, then at most one tile trimmed per corner. A corner is only trimmed while its row
             // keeps at least two tiles, so trimming never leaves an empty row.
@@ -3924,6 +4059,15 @@ void drawLakes(RenderWindow& window) {
     for (auto& va : lakeTiles) window.draw(va);
 }
 
+// R30-F1: true if p is within dist of any race quarter's centre
+bool nearQuarter(Vector2f p, float dist) {
+    for (int q = 0; q < raceCount; q++) {
+        Vector2f d = p - quarterCentre(q);
+        if (d.x * d.x + d.y * d.y < dist * dist) return true;
+    }
+    return false;
+}
+
 // A few clumps of bushes, away from the village center. Startup trees overlapping a bush are
 // cleared (trees, tris and stumps together) so the clumps sit in small clearings and stay visible.
 void spawnBushes(vector<bush>& bushes, vector<CircleShape>& bushshapes, vector<tree>& trees, vector<CircleShape>& tris, vector<RectangleShape>& stumps) {
@@ -3933,6 +4077,7 @@ void spawnBushes(vector<bush>& bushes, vector<CircleShape>& bushshapes, vector<t
         Vector2f cp;
         do cp = Vector2f((float)centre(gen), (float)centre(gen));
         while (hypot(cp.x - villageCenter.x, cp.y - villageCenter.y) < bushClumpMinCenterDist
+               || nearQuarter(cp, quarterClearRadius + bushClumpSpread + 2 * bushRadius)   // R30-F1: house space stays free
                || !lakeClear(FloatRect(cp - Vector2f(bushClumpSpread, bushClumpSpread),     // whole clump + work spots off the water
                                        Vector2f(2 * (bushClumpSpread + bushRadius), 2 * (bushClumpSpread + bushRadius) + bushWorkOffset.y))));
         for (int k = 0; k < bushesPerClump; k++) {
@@ -3956,6 +4101,70 @@ void spawnBushes(vector<bush>& bushes, vector<CircleShape>& bushshapes, vector<t
         }
     }
     printf("Spawned %zu bushes in %d clumps\n", bushes.size(), numBushClumps);
+}
+
+// R30-F1 startup check, after trees, rocks, lakes and bushes: each quarter must be dry and have at least quarterMinTrees
+// trees and quarterMinRocks rocks between its clearing and quarterResourceRadius. A short quarter is topped up from a
+// fixed-seed generator (deterministic re-seed), keeping every parallel vector in step.
+void checkQuarters(vector<tree>& trees, vector<CircleShape>& tris, vector<RectangleShape>& stumps,
+                   vector<rock>& rocks, vector<CircleShape>& octs, const vector<CircleShape>& bushshapes) {
+    const Vector2f treeSz(treeFootprint, treeFootprint), rockSz(12.0f, 12.0f);   // rock: 6px-radius pentagon
+    auto nearby = [](Vector2f topLeft, Vector2f size, int q) {
+        Vector2f d = topLeft + size / 2.0f - quarterCentre(q);
+        return d.x * d.x + d.y * d.y <= quarterResourceRadius * quarterResourceRadius && !inClearing(topLeft);
+    };
+    auto spotOk = [&](Vector2f p, Vector2f size) {
+        if (p.x < 0.0f || p.y < hudBarHeight || p.x + size.x > worldSize || p.y + size.y > worldSize) return false;
+        FloatRect r(p, size);
+        if (inClearing(p) || !lakeClear(r)) return false;
+        for (auto& bs : bushshapes) {
+            FloatRect bb = bs.getGlobalBounds();
+            bb.position -= Vector2f(bushTreeClearance, bushTreeClearance);
+            bb.size += Vector2f(2 * bushTreeClearance, 2 * bushTreeClearance + bushWorkOffset.y);
+            if (r.findIntersection(bb)) return false;
+        }
+        return true;
+    };
+    for (int q = 0; q < raceCount; q++) {
+        float m = quarterHouseRadius + houseSlabSize.x;
+        if (!lakeClear(FloatRect(quarterCentre(q) - Vector2f(m, m), Vector2f(2 * m, 2 * m))))
+            printf("Race quarter %s: WARNING water inside the house area\n", raceDefs[q].name);
+        int nt = 0, nr = 0;
+        for (auto& t : tris) if (nearby(t.getPosition(), treeSz, q)) nt++;
+        for (auto& o : octs) if (nearby(o.getPosition(), rockSz, q)) nr++;
+        int addT = 0, addR = 0;
+        mt19937 reseed(quarterReseedSeed + q);
+        uniform_real_distribution<float> ang(0.0f, 6.2831853f), rad(quarterClearRadius + treeFootprint, quarterResourceRadius - treeFootprint);
+        for (int k = 0; k < quarterTopUpTries && (nt + addT < quarterMinTrees || nr + addR < quarterMinRocks); k++) {
+            float a = ang(reseed), r = rad(reseed);
+            Vector2f c = quarterCentre(q) + Vector2f(cos(a), sin(a)) * r;
+            if (nt + addT < quarterMinTrees) {
+                Vector2f p = snapPx(c - treeSz / 2.0f);
+                if (!spotOk(p, treeSz)) continue;
+                trees.push_back(tree{(int)p.x, (int)p.y, false});
+                tris.push_back(makeTreeTri((int)p.x, (int)p.y));
+                RectangleShape stump(Vector2f(4, 4));
+                stump.setFillColor(stumpColor);
+                stump.setPosition(Vector2f(p.x + 6, p.y + 12));
+                stumps.push_back(stump);
+                addT++;
+            } else {
+                Vector2f p = snapPx(c - rockSz / 2.0f);
+                if (!spotOk(p, rockSz)) continue;
+                rocks.push_back(rock{(int)p.x, (int)p.y, false});
+                CircleShape oct;
+                oct.setPointCount(5);
+                oct.setPosition(p);
+                oct.setRadius(6);
+                oct.setFillColor(Color(125, 125, 125));
+                octs.push_back(oct);
+                addR++;
+            }
+        }
+        bool shortNow = nt + addT < quarterMinTrees || nr + addR < quarterMinRocks;
+        printf("Race quarter %s: %d trees, %d rocks nearby (+%d/+%d re-seeded)%s\n", raceDefs[q].name, nt, nr, addT, addR,
+               shortNow ? " - STILL SHORT" : "");
+    }
 }
 
 // Bare bushes ripen again after bushRegrowTicks (rainRegrowMult times faster in rain)
@@ -3987,11 +4196,13 @@ int main() {
     vector<shinobiPuff> shinobiPuffs; // Sasuke's blink puffs (R25-F2)
     barbs.reserve(numbarbs);
     squares.reserve(numbarbs);
+    placeQuarters();  // R30-F1: crates first, so founders, lakes and bushes can use the quarters
     {
-        uniform_int_distribution<int> d(350, 450);
+        uniform_int_distribution<int> d(-30, 30);   // R30-F1: founders start around their own race's crate
         int founded[raceCount] = {};
         for (int i = 0; i < numbarbs; i++) {
-            int x = d(gen), y = d(gen);
+            Vector2f qc = quarterCentre(i / foundersPerRace);
+            int x = (int)qc.x + d(gen), y = (int)qc.y + d(gen);
             makeBarb(Vector2i(x, y), barbs, squares, birthRings, -1, i / foundersPerRace);   // R28-F1: clan by index
             founded[barbs.back().race]++;
         }
@@ -4049,6 +4260,7 @@ int main() {
     vector<bush> bushes;
     vector<CircleShape> bushshapes;
     spawnBushes(bushes, bushshapes, trees, tris, stumps);
+    checkQuarters(trees, tris, stumps, rocks, octs, bushshapes);   // R30-F1: no quarter short of wood/stone
 
     VertexArray treeVerts(PrimitiveType::Triangles);
     VertexArray rainVerts(PrimitiveType::Triangles); // scratch buffer for drawRain, rebuilt every frame
@@ -4161,8 +4373,7 @@ int main() {
 
         for (int i = (int)tris.size() - 1; i >= 0; i--) {
             Vector2f p = tris[i].getPosition();
-            float dx = p.x - 400, dy = p.y - 400;
-            if (dx*dx + dy*dy < clearRadiusSq) {
+            if (inClearing(p)) {   // village clearing or a race quarter (R30-F1)
                 int tix = (int)(p.x + 8), tiy = (int)(p.y + 15);
                 for (auto& b : barbs) {
                     if (b.target != targetBush && b.targetx == tix && b.targety == tiy) {
@@ -4176,8 +4387,7 @@ int main() {
         }
         for (int i = (int)octs.size() - 1; i >= 0; i--) {
             Vector2f p = octs[i].getPosition();
-            float dx = p.x - 400, dy = p.y - 400;
-            if (dx*dx + dy*dy < clearRadiusSq) {
+            if (inClearing(p)) {   // village clearing or a race quarter (R30-F1)
                 int rix = (int)(p.x + 6), riy = (int)(p.y + 10);   // same stand spot minematerials targets
                 for (auto& b : barbs) {
                     if (b.target == targetRock && b.targetx == rix && b.targety == riy) {
@@ -4195,6 +4405,7 @@ int main() {
         window.setView(worldView);
         drawTrails(window, trailVerts);
         drawPaving(window, paveVerts);   // over the trail tint, under everything else
+        drawQuarters(window, stores, zoom);   // R30-F1: ground marks, under lakes, houses and crates
         drawLakes(window);
 	
 	for (auto& oct : octs)
