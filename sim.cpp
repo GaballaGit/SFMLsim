@@ -207,6 +207,11 @@ const float birthRingThickness = 1.0f;
 const Color birthRingColor(225, 220, 190); // pale warm cream, matches ticker text
 const uint8_t birthRingMaxAlpha = 70;      // faint at birth, fades linearly to 0
 
+// Households (hover-only): cream marks, distinct from the task colours and the yellow hover outline
+const Color householdColor(238, 226, 190);    // pale cream
+const Vector2f householdPipSize(2.0f, 2.0f);  // one pip per resident, about a barb wide
+const float householdPipGap = 4.0f;           // pip bottom this far above the hitbox top: clears the 2px elf hat, 1px bob and 1px air
+
 // Settlement eras: a rank needs both thresholds (houses are capped at one per barb, so both grow together)
 enum settlementEra { eraCamp, eraHamlet, eraTown, eraCount };
 const char* const eraNames[eraCount] = {"Camp", "Hamlet", "Town"};
@@ -457,7 +462,8 @@ RectangleShape bushDrawShape(const CircleShape& bs) {
     return s;
 }
 
-struct house {int x, y, health; bool hasFoundation = false;};
+struct house {int x, y, health; bool hasFoundation = false; int id = -1;}; // id: stable, from nextHouseId
+int nextHouseId = 0;   // assigned only in buildhouse(); never reused, so ids survive any swapRemove
 
 struct barb {
     int id = -1;                 // stable, unique; assigned only by makeBarb()
@@ -479,6 +485,7 @@ struct barb {
     int hunger = 0;
     int slowTick = 0;
     barbRace race = raceHuman;   // rolled once in makeBarb()
+    int homeHouse = -1;          // house.id of the birth house (stable id, not an index); -1 = founder
 };
 
 const raceDef& raceOf(const barb& b) { return raceDefs[b.race]; }
@@ -1252,7 +1259,9 @@ void traderTick(optional<trader>& tr) {
     }
 }
 
-struct hoverHit {string label; optional<RectangleShape> rect; optional<CircleShape> circle;};
+struct hoverHit {string label; optional<RectangleShape> rect; optional<CircleShape> circle;
+                 int homeOfBarb = -1;     // hovered barb's home house id -> outline that house
+                 int hoveredHouse = -1;}; // hovered house id -> pip over each resident
 
 float rectDistSq(const FloatRect& r, Vector2f p) {
     float dx = max(max(r.position.x - p.x, p.x - (r.position.x + r.size.x)), 0.0f);
@@ -1264,12 +1273,23 @@ float rectDistSq(const FloatRect& r, Vector2f p) {
 optional<hoverHit> pickHover(Vector2f p, float radius, const vector<barb>& barbs, const vector<RectangleShape>& squares,
                              const optional<trader>& tr, const vector<wolf>& wolves, const vector<deer>& deers, const vector<RectangleShape>& deershape,
                              const vector<rock>& rocks, const vector<CircleShape>& octs,
-                             const vector<bush>& bushes, const vector<CircleShape>& bushshapes, const vector<RectangleShape>& houseshapes) {
+                             const vector<bush>& bushes, const vector<CircleShape>& bushshapes,
+                             const vector<house>& houses, const vector<RectangleShape>& houseshapes) {
     float rSq = radius * radius;
     auto near = [&](const Shape& s) { return rectDistSq(s.getGlobalBounds(), p) <= rSq; };
     for (int i = 0; i < (int)squares.size() && i < (int)barbs.size(); i++)
-        if (near(squares[i]))
-            return hoverHit{string(raceOf(barbs[i]).name) + ": " + barbTaskName(barbs[i]) + (isHungry(barbs[i]) ? " (hungry)" : ""), squares[i], nullopt};
+        if (near(squares[i])) {
+            const barb& b = barbs[i];
+            string label = string(raceOf(b).name) + ": " + barbTaskName(b) + (isHungry(b) ? " (hungry)" : "");
+            if (b.homeHouse >= 0) {   // kin counted here, on hover only
+                int kin = 0;
+                for (auto& o : barbs) if (o.id != b.id && o.homeHouse == b.homeHouse) kin++;
+                label += ", of house " + to_string(b.homeHouse + 1) + ", " + to_string(kin) + " kin";
+            }
+            hoverHit h{label, squares[i], nullopt};
+            h.homeOfBarb = b.homeHouse;
+            return h;
+        }
     if (tr && near(tr->shape)) {
         const char* ph = tr->phase == trader::Arriving ? "arriving" : tr->phase == trader::Trading ? "trading" : "leaving";
         return hoverHit{string("Trader: ") + ph, tr->shape, nullopt};
@@ -1282,9 +1302,47 @@ optional<hoverHit> pickHover(Vector2f p, float radius, const vector<barb>& barbs
         if (near(octs[i])) return hoverHit{rocks[i].dying ? "Rock: being mined" : "Rock", nullopt, rockDrawShape(octs[i])};
     for (int i = 0; i < (int)bushshapes.size() && i < (int)bushes.size(); i++)
         if (near(bushshapes[i])) return hoverHit{bushes[i].ripe ? "Bush: ripe" : "Bush: bare", bushDrawShape(bushshapes[i]), nullopt};
-    for (auto& hs : houseshapes)
-        if (near(hs)) return hoverHit{"House", hs, nullopt};
+    for (int i = 0; i < (int)houseshapes.size() && i < (int)houses.size(); i++)
+        if (near(houseshapes[i])) {
+            hoverHit h{"House " + to_string(houses[i].id + 1), houseshapes[i], nullopt};
+            h.hoveredHouse = houses[i].id;
+            return h;
+        }
     return nullopt;
+}
+
+// Hover-only household marks, drawn after the overlays like the hover outline
+void drawHousehold(RenderWindow& window, const View& worldView, const hoverHit& h, float zoom,
+                   const vector<barb>& barbs, const vector<RectangleShape>& squares,
+                   const vector<house>& houses, const vector<RectangleShape>& houseshapes) {
+    window.setView(worldView);
+    if (h.hoveredHouse >= 0) {
+        RectangleShape pip(householdPipSize);
+        pip.setFillColor(householdColor);
+        for (int i = 0; i < (int)squares.size() && i < (int)barbs.size(); i++) {
+            if (barbs[i].homeHouse != h.hoveredHouse) continue;
+            Vector2f top = snapPx(squares[i].getPosition());
+            float cx = top.x + round((squares[i].getSize().x - householdPipSize.x) / 2.0f);
+            pip.setPosition(Vector2f(cx, top.y - householdPipGap - householdPipSize.y));
+            window.draw(pip);
+        }
+    }
+    if (h.homeOfBarb >= 0) {
+        for (int i = 0; i < (int)houses.size() && i < (int)houseshapes.size(); i++) {
+            if (houses[i].id != h.homeOfBarb) continue;
+            // outline the whole drawn sprite (stepped roof down to the walls), not just the 4x4 logic shape
+            Vector2f o = snapPx(houseshapes[i].getPosition());
+            Vector2f tl(o.x + houseRoofLeft[houseRoofRows - 1], o.y + houseRoofTop);
+            Vector2f br(o.x + houseRoofLeft[houseRoofRows - 1] + houseRoofWidth[houseRoofRows - 1], o.y + houseWallPos.y + houseWallSize.y);
+            RectangleShape r(br - tl);
+            r.setPosition(tl);
+            r.setFillColor(Color::Transparent);
+            r.setOutlineThickness(tooltipOutlinePx / zoom);
+            r.setOutlineColor(householdColor);
+            window.draw(r);
+            break;
+        }
+    }
 }
 
 // Outline-only copy of the hit shape, drawn above the overlays so it stays readable at night
@@ -1543,7 +1601,7 @@ void buildhouse(vector<barb>& barbs,vector<RectangleShape>& squares, vector<hous
                 if (workTick(b)) b.timer++;
                 if (b.timer >= 600) {
                     b.reservedwood = false;
-                    house h{b.targetx, b.targety, 100, b.reservedstone > 0};
+                    house h{b.targetx, b.targety, 100, b.reservedstone > 0, nextHouseId++};
                     b.reservedstone = 0;
                     houses.push_back(h);
                     RectangleShape hs(Vector2f(4, 4));
@@ -1573,9 +1631,10 @@ struct birthRing {Vector2f pos; int age = 0;};
 int nextBarbId = 0;
 
 // The only place a barb is created: keeps barbs/squares in sync and owns nextBarbId
-void makeBarb(Vector2i pos, vector<barb>& barbs, vector<RectangleShape>& squares, vector<birthRing>& rings) {
+void makeBarb(Vector2i pos, vector<barb>& barbs, vector<RectangleShape>& squares, vector<birthRing>& rings, int homeHouse = -1) {
     barb b;
     b.id = nextBarbId++;
+    b.homeHouse = homeHouse;
     b.x = pos.x;
     b.y = pos.y;
     b.race = (barbRace)uniform_int_distribution<int>(0, raceCount - 1)(gen);
@@ -1634,11 +1693,11 @@ void eraTick(const vector<barb>& barbs, const vector<house>& houses) {
     }
 }
 
-void barbspawner(vector<RectangleShape>& squares, vector<barb>& barbs, vector<RectangleShape>& houseshapes, vector<birthRing>& rings) {
-    for (int i = 0; i < (int)houseshapes.size(); i++) {
+void barbspawner(vector<RectangleShape>& squares, vector<barb>& barbs, const vector<house>& houses, vector<RectangleShape>& houseshapes, vector<birthRing>& rings) {
+    for (int i = 0; i < (int)houseshapes.size() && i < (int)houses.size(); i++) {
         if (spawnChance(gen) != 0) continue;
         Vector2f pos = houseshapes[i].getPosition();
-        makeBarb(Vector2i((int)(pos.x + 4), (int)(pos.y + 13)), barbs, squares, rings);
+        makeBarb(Vector2i((int)(pos.x + 4), (int)(pos.y + 13)), barbs, squares, rings, houses[i].id);
         logEvent(string(raceOf(barbs.back()).birthName) + " is born (pop " + to_string(barbs.size()) + ")");
     }
 }
@@ -2069,7 +2128,7 @@ int main() {
                 minematerials(squares, barbs, tris, stumps, trees, octs, rocks, bushes, bushshapes);
                 barbmove(squares, barbs);
                 treespawn(trees, tris, stumps);
-                barbspawner(squares, barbs, houseshapes, birthRings);
+                barbspawner(squares, barbs, houses, houseshapes, birthRings);
                 birthRingTick(birthRings);
                 deerspawn(deers, deershape);
                 deerwander(deershape, deers, squares);
@@ -2182,8 +2241,9 @@ int main() {
             bool overUi = overHud || tickerRect.contains(mscreen);
             if (window.hasFocus() && !panning && !overUi && mpx.x >= 0 && mpx.y >= 0 && mpx.x < (int)wsz.x && mpx.y < (int)wsz.y) {
                 Vector2f mworld = window.mapPixelToCoords(mpx, worldView);
-                hover = pickHover(mworld, tooltipPickRadius / zoom, barbs, squares, activeTrader, wolves, deers, deershape, rocks, octs, bushes, bushshapes, houseshapes);
+                hover = pickHover(mworld, tooltipPickRadius / zoom, barbs, squares, activeTrader, wolves, deers, deershape, rocks, octs, bushes, bushshapes, houses, houseshapes);
                 if (hover) drawHoverOutline(window, worldView, *hover, zoom);
+                if (hover) drawHousehold(window, worldView, *hover, zoom, barbs, squares, houses, houseshapes);
             }
         }
 
