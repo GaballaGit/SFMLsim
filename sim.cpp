@@ -142,6 +142,15 @@ const int roadStepBonus = 1;               // ticks shaved off the step limit on
 const Color trailPathColor(150, 125, 85, 26);
 const Color trailRoadColor(150, 125, 85, 52);
 
+// Cobbled roads (R20-F2): from the Hamlet era an idle barb paves road-tier trail cells near the campfire; paved cells never decay
+const int paveScanTicks = 600;             // look for a new cell to pave this often (only while nobody is paving)
+const int paveStoneCost = 1;               // per cell, paid on completion; houseStoneCost is kept back for the next house
+const int paveMaxCells = 24;               // total paved cells ever
+const float paveRadius = 48.0f;            // cell centre within this of the campfire (inside the 50px tree clearing)
+const int paveTicks = 240;                 // ~4s at 1x of work on the cell (barb.timer, shows the build bar)
+const Color paveColorA(78, 84, 94, 140);   // slate cobbles: cool blue-grey, darker than rocks (125) and clear of the brown trails;
+const Color paveColorB(66, 72, 82, 140);   // the two tones differ by 12 so the 4px checker stays low-contrast
+
 const int birdFlockSize = 8;               // birds per flock (cosmetic only, no gameplay effect)
 const float birdFleeRadius = 30.0f;        // birds scatter from barbs closer than this (world px)
 const float birdCruiseSpeed = 0.4f;        // px per tick (~24px/s, crosses the map in ~35s)
@@ -482,8 +491,9 @@ const int spearKnapFrames = 8;                // crafter's knapping hand ticks u
 
 // Build jobs: which structure a barb's movingbspot/building belongs to. jobNone = no job, or a house (buildhouse()).
 // jobSpear is a craft, not a structure: it uses movingbspot (so no other system grabs the barb) but never building/timer.
-enum buildJob {jobNone, jobShrine, jobSmoke, jobStall, jobForge, jobField, jobSpear, buildJobCount};
-const int buildJobTicks[buildJobCount] = {houseBuildTicks, shrineBuildTicks, smokehouseBuildTicks, stallBuildTicks, forgeBuildTicks, fieldBuildTicks, spearCraftTicks};
+// jobPave (R20-F2) is run by paveTick(): movingbspot while walking, building/timer while laying the cobbles.
+enum buildJob {jobNone, jobShrine, jobSmoke, jobStall, jobForge, jobField, jobSpear, jobPave, buildJobCount};
+const int buildJobTicks[buildJobCount] = {houseBuildTicks, shrineBuildTicks, smokehouseBuildTicks, stallBuildTicks, forgeBuildTicks, fieldBuildTicks, spearCraftTicks, paveTicks};
 // Game animals share the deer code (deers/deershape vectors); per-species numbers live in speciesDefs below.
 // Sprite offsets are relative to the logic shape (body = hitbox), written for an animal facing right.
 enum animalSpecies {speciesDeer, speciesRabbit, speciesCount};
@@ -1332,6 +1342,21 @@ int stepLimit(const barb& b) { return stepLimit() * (isHungry(b) ? hungerWorkSlo
 vector<int> trailWear(trailGridN * trailGridN, 0);
 vector<uint8_t> trailTier(trailGridN * trailGridN, 0);
 bool trailDirty = false;
+vector<uint8_t> trailPaved(trailGridN * trailGridN, 0);   // R20-F2: 1 = cobbled; same grid as trailWear, skipped by trailTick decay
+int pavedCount = 0;
+int paveClaim = -1;      // the one cell being paved, -1 = none. Released by paveTick() whenever no barb holds jobPave
+                         // (paver removed from barbs) or the paver lost movingbspot (taken off the job), and on finish/abandon.
+bool paveDirty = false;
+
+// One reset path for the whole trail grid (wear, tiers, paving); called on (re)start in main
+void resetTrails() {
+    trailWear.assign(trailGridN * trailGridN, 0);
+    trailTier.assign(trailGridN * trailGridN, 0);
+    trailPaved.assign(trailGridN * trailGridN, 0);
+    pavedCount = 0;
+    paveClaim = -1;
+    trailDirty = paveDirty = true;
+}
 
 int trailCell(Vector2f p) {
     int cx = (int)(p.x / trailCellSize), cy = (int)(p.y / trailCellSize);
@@ -1357,7 +1382,7 @@ void trailTick() {
     if (++dtimer < interval) return; // dtimer >= interval falls through, so rain starting mid-countdown can't stall it
     dtimer = 0;
     for (int c = 0; c < (int)trailWear.size(); c++) {
-        if (trailWear[c] == 0) continue;
+        if (trailWear[c] == 0 || trailPaved[c]) continue;   // cobbles hold their road tier
         trailWear[c]--;
         trailSetTier(c);
     }
@@ -1383,6 +1408,28 @@ void drawTrails(RenderWindow& window, VertexArray& va) {
             for (auto& v : q) va.append(Vertex{v, col});
         }
         trailDirty = false;
+    }
+    if (va.getVertexCount() > 0) window.draw(va);
+}
+
+// R20-F2: each paved cell is a 2x2 checker of 4px slate cobbles, drawn over the trail tint. Parity is global, so
+// neighbouring cells continue the pattern. Rebuilt only when a cell is paved.
+void drawPaving(RenderWindow& window, VertexArray& va) {
+    if (paveDirty) {
+        va.clear();
+        float h = trailCellSize / 2.0f;
+        for (int c = 0; c < (int)trailPaved.size(); c++) {
+            if (!trailPaved[c]) continue;
+            float cx = (c % trailGridN) * trailCellSize, cy = (c / trailGridN) * trailCellSize;
+            for (int q = 0; q < 4; q++) {
+                int qx = q % 2, qy = q / 2;
+                Color col = (qx + qy) % 2 == 0 ? paveColorA : paveColorB;
+                float x0 = cx + qx * h, y0 = cy + qy * h, x1 = x0 + h, y1 = y0 + h;
+                Vector2f v[6] = {{x0, y0}, {x1, y0}, {x1, y1}, {x0, y0}, {x1, y1}, {x0, y1}};
+                for (auto& p : v) va.append(Vertex{p, col});
+            }
+        }
+        paveDirty = false;
     }
     if (va.getVertexCount() > 0) window.draw(va);
 }
@@ -2807,6 +2854,100 @@ void eraTick(const vector<barb>& barbs, const vector<house>& houses) {
     }
 }
 
+// R20-F2: every exit from a paving job (finished, unaffordable, interrupted) clears the same barb fields and the claim
+void clearPave(barb& b) {
+    b.jobKind = jobNone;
+    b.moving = b.movingbspot = b.building = false;
+    b.timer = 0;
+    b.stepTimer = 0;
+    b.targetx = b.targety = -1;
+    paveClaim = -1;
+}
+
+// Runs after eraTick(). One paver at a time, holding the one global paveClaim. With nobody paving, every paveScanTicks
+// it picks the unpaved road-tier cell nearest the campfire (within paveRadius) and the nearest idle barb. Stone is
+// checked on claim and paid on completion. The claim is re-derived each tick: no barb with jobPave -> released.
+void paveTick(vector<barb>& barbs, vector<RectangleShape>& squares) {
+    static int scanTimer = 0;
+    int paver = -1;
+    for (int i = 0; i < (int)barbs.size(); i++) if (barbs[i].jobKind == jobPave) paver = i;
+    if (paver < 0) paveClaim = -1;                                        // paver gone: release
+    else if (paveClaim < 0) { clearPave(barbs[paver]); paver = -1; }      // job without a cell: drop it
+    if (paver >= 0) {
+        barb& b = barbs[paver];
+        auto& sq = squares[paver];
+        if (!b.movingbspot) { printf("PAVING ABANDONED - barb %d taken off the job\n", b.id); clearPave(b); return; }
+        Vector2f pos  = sq.getPosition();
+        Vector2f diff = Vector2f(b.targetx, b.targety) - pos;
+        float dSq = diff.x * diff.x + diff.y * diff.y;
+        if (dSq >= 1.0f) {
+            if (++b.stepTimer >= stepLimit(b, pos)) {
+                b.stepTimer = 0;
+                sq.move(diff / sqrt(dSq));
+                trailStep(sq.getPosition());
+            }
+            return;
+        }
+        b.moving = false;     // on the cell: no walking bob, just the generic build tool swing
+        b.building = true;
+        if (workTick(b)) b.timer++;
+        if (b.timer < paveTicks) return;
+        if (stone < paveStoneCost) {
+            printf("PAVING ABANDONED - barb %d, no stone\n", b.id);
+            clearPave(b);
+            return;
+        }
+        int c = paveClaim;
+        stone -= paveStoneCost;
+        trailPaved[c] = 1;
+        trailWear[c] = max(trailWear[c], trailRoadThreshold);   // locked at road tier (keeps roadStepBonus)
+        trailSetTier(c);
+        pavedCount++;
+        paveDirty = true;
+        printf("---CELL PAVED--- barb %d at %d,%d (%d/%d) stone: %d\n", b.id, (int)((c % trailGridN) * trailCellSize),
+               (int)((c / trailGridN) * trailCellSize), pavedCount, paveMaxCells, stone);
+        if (pavedCount == 1) logEvent("First cobbles laid by the fire");
+        clearPave(b);
+        return;
+    }
+    if (++scanTimer < paveScanTicks) return;
+    scanTimer = 0;
+    if (currentEra < eraHamlet || pavedCount >= paveMaxCells || stone < paveStoneCost + houseStoneCost) return;
+    int best = -1;
+    float bestDSq = paveRadius * paveRadius;
+    Vector2f bestCentre;
+    for (int c = 0; c < (int)trailTier.size(); c++) {
+        if (trailTier[c] != 2 || trailPaved[c]) continue;
+        Vector2f centre(((c % trailGridN) + 0.5f) * trailCellSize, ((c / trailGridN) + 0.5f) * trailCellSize);
+        Vector2f d = centre - villageCenter;
+        float dSq = d.x * d.x + d.y * d.y;
+        if (dSq <= bestDSq) { bestDSq = dSq; best = c; bestCentre = centre; }
+    }
+    if (best < 0) return;
+    int who = -1;
+    float whoDSq = 0.0f;
+    for (int i = 0; i < (int)barbs.size(); i++) {
+        auto& b = barbs[i];
+        if (b.jobKind != jobNone || b.deertargeting || b.chopping || b.timer > 0
+            || b.moving || b.movingbspot || b.building) continue;
+        Vector2f d = squares[i].getPosition() - bestCentre;
+        float dSq = d.x * d.x + d.y * d.y;
+        if (who < 0 || dSq < whoDSq) { who = i; whoDSq = dSq; }
+    }
+    if (who < 0) return;
+    barb& b = barbs[who];
+    Vector2f stand = bestCentre - squares[who].getSize() / 2.0f;   // hitbox centred on the cell
+    paveClaim = best;
+    b.jobKind = jobPave;
+    b.target = targetNone;
+    b.targetx = (int)stand.x;
+    b.targety = (int)stand.y;
+    b.moving = b.movingbspot = true;
+    b.timer = 0;
+    printf("PAVING CLAIMED - barb %d, cell %d,%d (%d/%d paved)\n", b.id, (int)(bestCentre.x - trailCellSize / 2),
+           (int)(bestCentre.y - trailCellSize / 2), pavedCount, paveMaxCells);
+}
+
 councilDecree currentDecree = decreeNone;   // none until the first dawn
 
 // Ballot: race lean plus colony needs (wood short of a house, stone short of a foundation, this barb hungry or no food)
@@ -3334,6 +3475,7 @@ int main() {
     const Time Timepertick = seconds(1.0f / 60.0f);
 
     resetKnowHow();   // fresh practice counters and no learned techs for every new game (R20-F1)
+    resetTrails();    // wear, tiers and cobbles (R20-F2)
     vector<barb> barbs;
     vector<RectangleShape> squares;
     vector<birthRing> birthRings;
@@ -3416,6 +3558,7 @@ int main() {
     FloatRect tickerRect;                 // last frame's ticker strip, used to suppress hover over it
     FloatRect hudRect;                    // last frame's HUD strip, same use
     VertexArray trailVerts(PrimitiveType::Triangles);
+    VertexArray paveVerts(PrimitiveType::Triangles);   // cobbled cells (R20-F2), rebuilt only when a cell is paved
     vector<bird> birds;
     Vector2f birdHeading(1.0f, 0.0f);
     RectangleShape birdShape;
@@ -3496,6 +3639,7 @@ int main() {
                 fieldTick(field);
                 campfireTick(fire);
                 eraTick(barbs, houses);
+                paveTick(barbs, squares);
                 councilTick(barbs);
             }
         }
@@ -3526,6 +3670,7 @@ int main() {
         window.clear(Color(4, 20, 14)); //bg color
         window.setView(worldView);
         drawTrails(window, trailVerts);
+        drawPaving(window, paveVerts);   // over the trail tint, under everything else
         drawLakes(window);
 	
 	for (auto& oct : octs)
