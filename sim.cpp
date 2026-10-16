@@ -82,6 +82,34 @@ constexpr raceDef raceDefs[raceCount] = {
     {"Elf",   "An elf",  {2.0f, 5.0f}, {2.0f, 1.0f}, {1.0f, 1.0f}, Color(170, 196, 150), 1.0f}, // tall, pale sage pointed hat
 };
 
+// Names and traits (R25-F1): rolled once in makeBarb(). Names are unique until the table runs out.
+const char* const barbNames[] = {
+    "Mika", "Tove", "Arno", "Brin", "Cora", "Dain", "Edda", "Finn", "Gala", "Hale",
+    "Ilse", "Joss", "Kira", "Lars", "Mara", "Nils", "Oona", "Pell", "Quin", "Runa",
+    "Sven", "Tilda", "Ulf", "Vera", "Wren", "Yara", "Bram", "Esme", "Gorm", "Liv",
+    "Odo", "Rhea", "Sigi", "Tam", "Ada", "Bo", "Eir", "Hugo", "Ivo", "Nell",
+};
+const int barbNameCount = (int)(sizeof(barbNames) / sizeof(barbNames[0]));
+bool barbNameUsed[barbNameCount] = {};
+
+enum barbTrait { traitSwift, traitSturdy, traitGlutton, traitForager, traitCount };
+struct traitDef {
+    const char* name;      // capitalised, for the tooltip and the birth line ("Mika the Swift")
+    Color dotColor;        // 1px badge left of the body; kept clear of every task stripe colour
+};
+constexpr traitDef traitDefs[traitCount] = {
+    {"Swift",   Color(215, 245, 245)},   // cyan-white: far paler than fishing cyan (90,225,225)
+    {"Sturdy",  Color(160, 72, 52)},     // brick: darker and browner than hunt red (255,70,70)
+    {"Glutton", Color(190, 150, 30)},    // mustard: darker than harvest gold and the gentry sash
+    {"Forager", Color(200, 170, 225)},   // lilac: paler than the trader (190,140,230), unlike pick pink
+};
+const float swiftStepSpeed = 1.3f;       // Swift barbs step this many times faster (step interval / 1.3, min 1)
+const float sturdyHungerScale = 1.5f;    // Sturdy barbs go 1.5x longer between meals
+const float gluttonHungerScale = 0.7f;   // Gluttons get hungry sooner...
+const int gluttonMealFood = 2;           // ...and eat this much per meal when the larder allows (never below 0 / the reserve)
+const int foragerFoodBonus = 1;          // extra food when a Forager picks berries or reaps the field
+const float traitDotMinZoom = 2.0f;      // hidden below this zoom: a 1px dot is noise at 1x
+
 int wood = 0;
 int stone = 0;
 int food = 0;
@@ -895,9 +923,17 @@ struct barb {
     councilDecree lastVote = decreeNone; // ballot from the latest dawn; lives in the struct so it is dropped with the barb
     bool hasSpear = false;       // R20-F3: kept for life; cleared only in makeBarb()
     int spearTimer = 0;          // R20-F3: craft progress while jobKind == jobSpear; separate from timer; cleared by clearSpearCraft()
+    const char* name = "";       // R25-F1: points into barbNames (no heap strings); set in makeBarb()
+    barbTrait trait = traitSwift; // R25-F1: rolled once in makeBarb()
 };
 
 const raceDef& raceOf(const barb& b) { return raceDefs[b.race]; }
+const traitDef& traitOf(const barb& b) { return traitDefs[b.trait]; }
+int forageBonus(const barb& b) { return b.trait == traitForager ? foragerFoodBonus : 0; }
+int hungerThresholdOf(const barb& b) {
+    float s = b.trait == traitSturdy ? sturdyHungerScale : b.trait == traitGlutton ? gluttonHungerScale : 1.0f;
+    return (int)(hungerThreshold * s);
+}
 bool isGentry(const barb& b) { return b.homeHouse < 0; }   // R24-F1: founders; derived, no stored flag
 int mineTicks(const barb& b) { return (int)(rockMineTicks / raceOf(b).mineSpeed / (know.learned[techPickwork] ? pickworkMineSpeed : 1.0f)); }
 
@@ -1353,9 +1389,12 @@ bool weatherTick() {
 
 int stepLimit() { return raining ? rainStepInterval : stepInterval; }
 
-bool isHungry(const barb& b) { return b.hunger >= hungerThreshold; }
+bool isHungry(const barb& b) { return b.hunger >= hungerThresholdOf(b); }
 
-int stepLimit(const barb& b) { return stepLimit() * (isHungry(b) ? hungerWorkSlowdown : 1); }
+int stepLimit(const barb& b) {
+    int lim = stepLimit() * (isHungry(b) ? hungerWorkSlowdown : 1);
+    return b.trait == traitSwift ? max(1, (int)(lim / swiftStepSpeed)) : lim;   // R25-F1
+}
 
 // Worn trails: per-cell wear from barb steps, decaying over time. Tiers: 0 none, 1 path, 2 road.
 vector<int> trailWear(trailGridN * trailGridN, 0);
@@ -1564,16 +1603,19 @@ void hungerTick(vector<barb>& barbs) {
     }
     // Pass 2 (R24-F1): eating, Gentry first. While a Commoner is hungry, Gentry leave gentryFoodReserve
     // so the Commoners are never shut out of the larder entirely.
-    auto eat = [](barb& b) {
-        food--;
+    // R25-F1: a Glutton takes gluttonMealFood, but never digs into `keep` (callers guarantee food > keep, so bite >= 1)
+    auto eat = [](barb& b, int keep) {
+        int bite = min(b.trait == traitGlutton ? gluttonMealFood : 1, food - keep);
+        food -= bite;
         b.hunger = 0;
         b.slowTick = 0;
-        printf("BARB ATE (%s) - Food: %d\n", isGentry(b) ? "Gentry" : "Commoner", food);
+        printf("BARB ATE (%s, %s %d) - Food: %d\n", isGentry(b) ? "Gentry" : "Commoner", b.name, bite, food);
     };
+    int gentryKeep = hungryCommoners > 0 ? gentryFoodReserve : 0;
     for (auto& b : barbs)
-        if (isGentry(b) && isHungry(b) && food > (hungryCommoners > 0 ? gentryFoodReserve : 0)) eat(b);
+        if (isGentry(b) && isHungry(b) && food > gentryKeep) eat(b, gentryKeep);
     for (auto& b : barbs)
-        if (!isGentry(b) && isHungry(b) && food > 0) eat(b);
+        if (!isGentry(b) && isHungry(b) && food > 0) eat(b, 0);
 }
 
 Color hungryTint(Color c) {
@@ -1613,8 +1655,9 @@ fishPose fishPoseOf(const barb& b, const RectangleShape& sq) {
 // Read-only on game state: squares stay the hitbox, the sprite is built from temporary shapes.
 // Plain white 2x4 rectangle (no head/hair); the task shows as a 2x1 stripe and a tinted tool pixel.
 // Pose comes from existing flags only: walking bob, chop/mine/build tool tick, pick arm dip, hungry droop.
-void drawBarbs(RenderWindow& window, const vector<barb>& barbs, const vector<RectangleShape>& squares, int frame) {
-    RectangleShape body(barbBodySize), stripe(Vector2f(barbBodySize.x, barbStripeH)), tool(barbToolSize), hat, tip;
+void drawBarbs(RenderWindow& window, const vector<barb>& barbs, const vector<RectangleShape>& squares, int frame, float zoom) {
+    RectangleShape body(barbBodySize), stripe(Vector2f(barbBodySize.x, barbStripeH)), tool(barbToolSize), hat, tip, dot(Vector2f(1.0f, 1.0f));
+    bool showTraits = zoom >= traitDotMinZoom;
     for (int i = 0; i < (int)squares.size() && i < (int)barbs.size(); i++) {
         const barb& b = barbs[i];
         const raceDef& rd = raceOf(b);
@@ -1639,6 +1682,11 @@ void drawBarbs(RenderWindow& window, const vector<barb>& barbs, const vector<Rec
         body.setFillColor(hungry ? hungryTint(barbBodyColor) : barbBodyColor);
         body.setPosition(Vector2f(base.x, bodyTop));
         window.draw(body);
+        if (showTraits) {   // R25-F1: 1px badge on the left shoulder, off the body so it never blends with stripe or sash
+            dot.setFillColor(traitOf(b).dotColor);
+            dot.setPosition(Vector2f(base.x - 1.0f, bodyTop + 1.0f));
+            window.draw(dot);
+        }
         if (!idle) {
             stripe.setSize(Vector2f(bodySize.x, barbStripeH));
             stripe.setFillColor(tc);
@@ -1890,7 +1938,7 @@ optional<hoverHit> pickHover(Vector2f p, float radius, const vector<barb>& barbs
     for (int i = 0; i < (int)squares.size() && i < (int)barbs.size(); i++)
         if (near(squares[i])) {
             const barb& b = barbs[i];
-            string label = string(raceOf(b).name) + ": " + barbTaskName(b) + (isHungry(b) ? " (hungry)" : "");
+            string label = string(b.name) + ", " + traitOf(b).name + ", " + raceOf(b).name + ": " + barbTaskName(b) + (isHungry(b) ? " (hungry)" : "");
             if (b.homeHouse >= 0) {   // kin counted here, on hover only
                 int kin = 0;
                 for (auto& o : barbs) if (o.id != b.id && o.homeHouse == b.homeHouse) kin++;
@@ -2810,6 +2858,20 @@ void makeBarb(Vector2i pos, vector<barb>& barbs, vector<RectangleShape>& squares
     b.race = (barbRace)uniform_int_distribution<int>(0, raceCount - 1)(gen);
     b.hasSpear = false;   // R20-F3: every new barb starts unarmed with no craft in progress
     b.spearTimer = 0;
+    b.trait = (barbTrait)uniform_int_distribution<int>(0, traitCount - 1)(gen);   // R25-F1
+    {   // R25-F1: a random unused name; once all are taken, any name may repeat
+        int freeCount = 0;
+        for (int k = 0; k < barbNameCount; k++) if (!barbNameUsed[k]) freeCount++;
+        int k = 0;
+        if (freeCount > 0) {
+            int pick = uniform_int_distribution<int>(0, freeCount - 1)(gen);
+            for (k = 0; k < barbNameCount; k++) if (!barbNameUsed[k] && pick-- == 0) break;
+            barbNameUsed[k] = true;
+        } else {
+            k = uniform_int_distribution<int>(0, barbNameCount - 1)(gen);
+        }
+        b.name = barbNames[k];
+    }
     barbs.push_back(b);
     Vector2f bodySize = raceOf(b).bodySize;   // hitbox = drawn body, so hover/collision match what you see
     RectangleShape sq;
@@ -2818,7 +2880,7 @@ void makeBarb(Vector2i pos, vector<barb>& barbs, vector<RectangleShape>& squares
     sq.setFillColor(Color::White);
     squares.push_back(sq);
     rings.push_back({Vector2f(b.x, b.y) + bodySize / 2.0f}); // centred on the body
-    printf("BARB BORN - %s\n", raceOf(b).name);
+    printf("BARB BORN - %s the %s (%s)\n", b.name, traitOf(b).name, raceOf(b).name);
 }
 
 void birthRingTick(vector<birthRing>& rings) {
@@ -3072,7 +3134,7 @@ void barbspawner(vector<RectangleShape>& squares, vector<barb>& barbs, const vec
         food = max(0, food - birthFoodCost);
         Vector2f pos = houseshapes[i].getPosition();
         makeBarb(Vector2i((int)(pos.x + 4), (int)(pos.y + 13)), barbs, squares, rings, houses[i].id);
-        logEvent(string(raceOf(barbs.back()).birthName) + " is born (pop " + to_string(barbs.size()) + ")" +
+        logEvent(string(barbs.back().name) + " the " + traitOf(barbs.back()).name + " is born (pop " + to_string(barbs.size()) + ")" +
                  (paid > 0 ? " -" + to_string(paid) + " food" : ""));
         if (paid > 0) foodFlashFrames = birthFlashFrames;
     }
@@ -3294,10 +3356,11 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
                 clearHarvest(b);   // retargeted or nothing to reap
                 continue;
             }
-            if (harvestTick(b, wp, bpos, fieldHarvestTicks, fieldFoodYield)) {
+            int yield = fieldFoodYield + forageBonus(b);   // R25-F1: Forager +1
+            if (harvestTick(b, wp, bpos, fieldHarvestTicks, yield)) {
                 fp.growth = 0;     // replanted at once
                 printf("WHEAT HARVESTED - food: %d\n", food);
-                logEvent("Wheat harvested (+" + to_string(fieldFoodYield) + " food, " + to_string(food) + ")");
+                logEvent("Wheat harvested (+" + to_string(yield) + " food, " + to_string(food) + ")");
                 practice(techSeedSelection);   // after the harvest line so a discovery reads as its consequence
             }
             continue;
@@ -3311,7 +3374,7 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
                 clearHarvest(b);
                 continue;
             }
-            bool done = harvestTick(b, wp, bpos, bushPickTicks, bushFoodYield);
+            bool done = harvestTick(b, wp, bpos, bushPickTicks, bushFoodYield + forageBonus(b));   // R25-F1: Forager +1
             if (b.chopping) bushes[i].picking = true;
             if (done) {
                 bushes[i].ripe = bushes[i].picking = false;
@@ -3793,7 +3856,7 @@ int main() {
         	drawSnapped(window, stumps[i]);
         }
 
-        drawBarbs(window, barbs, squares, frameCount);
+        drawBarbs(window, barbs, squares, frameCount, zoom);
 	if (activeTrader) drawSnapped(window, activeTrader->shape);
 	drawTrees(window, tris, treeVerts);
 	drawSmoke(window, smoke, frameCount);
