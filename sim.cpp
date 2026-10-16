@@ -217,6 +217,13 @@ const int trailMaxWear = 240;             // cap so abandoned roads fade within 
 const int trailPathThreshold = 48;         // wear for the faint "path" tint (~6 recent crossings)
 const int trailRoadThreshold = 144;        // wear for "road": darker tint and the speed bonus
 const int roadStepBonus = 1;               // ticks shaved off the step limit on road cells (~10% faster)
+// R29-F2 path following: each step scores straight and +/-45 deg candidates as alignment (cos, 1.0 straight)
+// + pathBias * min(wear, pathWearClamp) / pathWearClamp. pathBias stays below the alignment weight (1.0), so the
+// heading term always dominates: trails can bend a step by at most 45 deg, never away from or around the target.
+constexpr float pathBias = 0.4f;              // a full road beside bare ground wins a 45 deg detour (0.707 + 0.4 > 1.0)
+const int pathWearClamp = trailRoadThreshold; // wear beyond road tier adds no extra pull
+const float pathSkipDistSq = 4.0f;         // within 2px of the target barbs step straight in
+static_assert(pathBias < 1.0f, "pathBias must stay below the alignment weight");
 const Color trailPathColor(150, 125, 85, 26);
 const Color trailRoadColor(150, 125, 85, 52);
 
@@ -952,6 +959,7 @@ struct barb {
     int reservedstone = 0;       // stone held for a house foundation (or a shrine); refunded with the wood on cancel
     buildJob jobKind = jobNone;  // structure the movingbspot/building belongs to; each builder skips the others' jobs
     int stepTimer = 0;
+    int wanderX = -1, wanderY = -1; // R29-F2: target of the current wander walk; a walk is a wander only while targetx/y match
     targetKind target = targetNone; // what targetx/targety points at; chopping + kind = the work (shares timer/chopping)
     int targetBush = -1;         // bush index (bushes are never removed, so indices are stable)
     int targetShore = -1;        // shorePoints index while target == targetLake (shore points are fixed after startup)
@@ -1510,6 +1518,31 @@ bool onRoad(Vector2f p) {
 }
 
 int stepLimit(const barb& b, Vector2f pos) { return max(1, stepLimit(b) - (onRoad(pos) ? roadStepBonus : 0)); }
+
+// R29-F2: one 1px step from pos toward pos + diff, bent up to 45 deg onto worn trail cells. Grid lookups only.
+// Every diagonal candidate must strictly shorten the distance to the target and stay on the map, so the
+// straight step (always valid) is the fallback and barbs can't orbit. Within 2px it is always straight.
+Vector2f pathStep(Vector2f pos, Vector2f diff) {
+    float dSq = diff.x * diff.x + diff.y * diff.y;
+    Vector2f u = diff / sqrt(dSq);
+    if (dSq < pathSkipDistSq) return u;
+    const float c45 = 0.70710678f;
+    Vector2f cands[3] = { u, Vector2f(u.x * c45 - u.y * c45, u.x * c45 + u.y * c45),
+                             Vector2f(u.x * c45 + u.y * c45, -u.x * c45 + u.y * c45) };
+    const float align[3] = { 1.0f, c45, c45 };
+    Vector2f best = u;
+    float bestScore = -1.0f;
+    for (int k = 0; k < 3; k++) {
+        Vector2f s = cands[k];
+        if (k > 0 && 2.0f * (s.x * diff.x + s.y * diff.y) <= 1.0f) continue;   // |diff - s| must be < |diff|
+        int c = trailCell(pos + s);                                              // -1 = off the grid
+        if (k > 0 && c < 0) continue;
+        float wear = c >= 0 ? (float)min(trailWear[c], pathWearClamp) / (float)pathWearClamp : 0.0f;
+        float score = align[k] + pathBias * wear;
+        if (score > bestScore) { bestScore = score; best = s; }
+    }
+    return best;
+}
 
 // Rebuilds the tinted cell quads only when some cell changed tier
 void drawTrails(RenderWindow& window, VertexArray& va) {
@@ -2566,7 +2599,7 @@ bool buildOneOff(vector<barb>& barbs, vector<RectangleShape>& squares, bool& cla
             }
         } else if (++b.stepTimer >= stepLimit(b, pos)) {
             b.stepTimer = 0;
-            sq.move(diff / sqrt(dSq));
+            sq.move(pathStep(pos, diff));   // R29-F2
             trailStep(sq.getPosition());
         }
         return false;
@@ -3330,19 +3363,21 @@ void barbmove(vector<RectangleShape>& squares, vector<barb>& barbs) {
             int tx = (int)pos.x + wanderDX(gen);
             int ty = (int)pos.y + wanderDY(gen);
             if (tx > 0 && tx < 800 && ty > 0 && ty < 800 && lakeClear(FloatRect(Vector2f(tx, ty), sq.getSize()), &pos)) {
-                b.targetx = tx;
-                b.targety = ty;
+                b.targetx = b.wanderX = tx;
+                b.targety = b.wanderY = ty;
                 b.moving  = true;
             }
         } else {
             Vector2f diff = Vector2f(b.targetx, b.targety) - pos;
             float dSq = diff.x * diff.x + diff.y * diff.y;
+            bool wandering = b.targetx == b.wanderX && b.targety == b.wanderY;
             if (dSq < 1.0f) {
                 b.moving    = false;
                 b.stepTimer = 0;
+                b.wanderX = b.wanderY = -1;
             } else if (++b.stepTimer >= stepLimit(b, pos)) {
                 b.stepTimer = 0;
-                sq.move(diff / sqrt(dSq));
+                sq.move(wandering ? diff / sqrt(dSq) : pathStep(pos, diff));   // R29-F2: wander walks stay straight
                 trailStep(sq.getPosition());
             }
         }
