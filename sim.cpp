@@ -207,6 +207,14 @@ const float birthRingThickness = 1.0f;
 const Color birthRingColor(225, 220, 190); // pale warm cream, matches ticker text
 const uint8_t birthRingMaxAlpha = 70;      // faint at birth, fades linearly to 0
 
+// Granary-gated births: past the floor, a birth needs at least one food in the larder per living barb
+const int popPerHouse = 2;                 // pop cap = houses * this
+const int birthFoodCost = 1;               // food paid per birth (food never goes below 0)
+const int birthFreeFloor = 4;              // below this many barbs births ignore the larder
+const int birthDeferCooldownTicks = 3600;  // min sim ticks between "Birth deferred" ticker lines
+const int birthFlashFrames = 30;           // ~0.5s tint on the birth ticker line when food was paid
+const Color birthFlashColor(200, 110, 90); // muted brick red, eased back to the normal ticker colour
+
 // Households (hover-only): cream marks, distinct from the task colours and the yellow hover outline
 const Color householdColor(238, 226, 190);    // pale cream
 const Vector2f householdPipSize(2.0f, 2.0f);  // one pip per resident, about a barb wide
@@ -770,14 +778,17 @@ int tradeMsgTimer = 0;
 
 struct gameEvent {string text; int age = 0;};
 deque<gameEvent> events;
+int foodFlashFrames = 0;   // >0: the newest ticker line (a paid birth) is tinted birthFlashColor
 
 void logEvent(const string& text) {
+    foodFlashFrames = 0;   // any newer line ends the flash, so it never lands on the wrong line
     events.push_back({text, 0});
     while ((int)events.size() > eventMaxLines) events.pop_front();
 }
 
 // Ages ticker lines once per rendered frame so fade time is real-time regardless of sim speed
 void eventTick() {
+    if (foodFlashFrames > 0) foodFlashFrames--;
     for (auto& e : events) e.age++;
     while (!events.empty() && events.front().age >= eventFadeTicks) events.pop_front();
 }
@@ -810,6 +821,12 @@ FloatRect drawEvents(RenderWindow& window, const Font& font) {
     for (int i = 0; i < (int)events.size(); i++) {
         Text t(font, events[i].text, eventFontSize);
         Color c = eventTextColor;
+        if (foodFlashFrames > 0 && i == (int)events.size() - 1) {
+            float f = (float)foodFlashFrames / birthFlashFrames;   // 1 -> 0: eases back to the normal colour
+            c.r = (uint8_t)(c.r + (birthFlashColor.r - c.r) * f);
+            c.g = (uint8_t)(c.g + (birthFlashColor.g - c.g) * f);
+            c.b = (uint8_t)(c.b + (birthFlashColor.b - c.b) * f);
+        }
         c.a = eventFade(events[i], eventTextAlpha);
         t.setFillColor(c);
         t.setPosition(topLeft + eventPad + Vector2f(0.0f, i * lineH));
@@ -2377,12 +2394,33 @@ void councilTick(vector<barb>& barbs) {
              to_string(votes[decreeStone]) + "-" + to_string(votes[decreeBerries]) + ")");
 }
 
+int popCap(const vector<house>& houses) {
+    return (int)houses.size() * popPerHouse;
+}
+
 void barbspawner(vector<RectangleShape>& squares, vector<barb>& barbs, const vector<house>& houses, vector<RectangleShape>& houseshapes, vector<birthRing>& rings) {
+    static int deferCooldown = 0;
+    if (deferCooldown > 0) deferCooldown--;
+    int cap = popCap(houses);
     for (int i = 0; i < (int)houseshapes.size() && i < (int)houses.size(); i++) {
         if (spawnChance(gen) != 0) continue;
+        if ((int)barbs.size() >= cap) continue;
+        bool fed = (int)barbs.size() < birthFreeFloor || food >= max(0, (int)barbs.size());
+        if (!fed) {
+            if (deferCooldown == 0) {
+                printf("Birth deferred: larder low (food %d, pop %d)\n", food, (int)barbs.size());
+                logEvent("Birth deferred: larder low");
+                deferCooldown = birthDeferCooldownTicks;
+            }
+            continue;
+        }
+        int paid = min(food, birthFoodCost);
+        food = max(0, food - birthFoodCost);
         Vector2f pos = houseshapes[i].getPosition();
         makeBarb(Vector2i((int)(pos.x + 4), (int)(pos.y + 13)), barbs, squares, rings, houses[i].id);
-        logEvent(string(raceOf(barbs.back()).birthName) + " is born (pop " + to_string(barbs.size()) + ")");
+        logEvent(string(raceOf(barbs.back()).birthName) + " is born (pop " + to_string(barbs.size()) + ")" +
+                 (paid > 0 ? " -" + to_string(paid) + " food" : ""));
+        if (paid > 0) foodFlashFrames = birthFlashFrames;
     }
 }
 
