@@ -449,6 +449,23 @@ const Color barbHarvestColor(235, 205, 85);   // harvest stripe: gold, clear of 
 const Color fieldBarColor(200, 165, 70);      // muted gold harvest progress bar
 const int bushFoodYield = 1;                  // food per picked bush (shared harvest path)
 
+// Know-how discoveries (R20-F1): practice counters unlock one-off speedups
+const int treeChopTicks = 180;                // base work ticks to fell one tree
+const int handAxeChopTicks = 150;             // after Hand Axe: 180/150 = 20% faster chopping
+const int handAxeTrees = 40;                  // trees felled to learn Hand Axe
+const int pickworkRocks = 25;                 // rocks mined to learn Pickwork
+const float pickworkMineSpeed = 1.2f;         // mining rate multiplier after Pickwork (20% faster)
+const int seedSelectionHarvests = 6;          // wheat harvests to learn Seed Selection
+const float seedSelectionGrowSpeed = 1.2f;    // wheat growth rate multiplier after Seed Selection (20% faster)
+const int knowPulseFrames = 60;               // newly learned HUD pip pulses white for ~1s (frames, frozen while paused)
+const int knowPulsePeriod = 20;               // one white flash per this many frames, fading over the pulse
+const float knowPipPx = 6.0f;                 // 6x6 HUD pip
+const float knowPipGap = 3.0f;                // between pips
+const float knowPipEraGap = 10.0f;            // pips sit this far left of the right-aligned era text
+const float knowPipRimPx = 1.0f;              // unlearned pips: hollow 1px outline
+const Color knowPipEmptyColor(78, 86, 74);    // dim grey-green rim, same family as the HUD rim
+const Color steelToolColor(178, 186, 198);    // Hand Axe head: cool pale steel, clear of chop green and bird blue-white
+
 // Build jobs: which structure a barb's movingbspot/building belongs to. jobNone = no job, or a house (buildhouse()).
 enum buildJob {jobNone, jobShrine, jobSmoke, jobStall, jobForge, jobField, buildJobCount};
 const int buildJobTicks[buildJobCount] = {houseBuildTicks, shrineBuildTicks, smokehouseBuildTicks, stallBuildTicks, forgeBuildTicks, fieldBuildTicks};
@@ -720,6 +737,25 @@ bool forgeClear(const FloatRect& r) {
     return !r.findIntersection(zone).has_value();
 }
 
+// Know-how (R20-F1): every counter, learned flag and pip pulse lives here; reset as a whole with resetKnowHow()
+enum techId {techHandAxe, techPickwork, techSeedSelection, techCount};
+struct techDef {const char* name; int threshold; const char* effect; Color pip;};
+const techDef techDefs[techCount] = {
+    {"Hand Axe",       handAxeTrees,          "chopping 20% faster", steelToolColor},
+    {"Pickwork",       pickworkRocks,         "mining 20% faster",   Color(215, 145, 55)},   // muted mine orange (pal.barMine)
+    {"Seed Selection", seedSelectionHarvests, "wheat grows 20% faster", Color(200, 165, 70)}, // muted wheat gold (fieldBarColor)
+};
+struct knowHow {
+    int count[techCount] = {};       // trees felled, rocks mined, wheat harvests
+    bool learned[techCount] = {};
+    int pulseFrames[techCount] = {}; // >0 = HUD pip flashing white after it was learned
+};
+knowHow know;
+void resetKnowHow() { know = knowHow{}; }   // called on (re)start in main; practice() is defined after logEvent
+
+int chopTicks() { return know.learned[techHandAxe] ? handAxeChopTicks : treeChopTicks; }
+int wheatGrowTicks() { return know.learned[techSeedSelection] ? (int)(fieldGrowTicks / seedSelectionGrowSpeed) : fieldGrowTicks; }
+
 // The one wheat plot (R19-F3). rect/shape are set once the spot is chosen; growth counts up to fieldGrowTicks once sown.
 struct plot {
     bool placed = false;    // spot chosen and reserved (houses/shrines/trees avoid it from then on)
@@ -730,10 +766,10 @@ struct plot {
     int growth = 0;
 };
 
-bool fieldRipe(const plot& fp) { return fp.built && fp.growth >= fieldGrowTicks; }
+bool fieldRipe(const plot& fp) { return fp.built && fp.growth >= wheatGrowTicks(); }
 
 // 0..2 growing stages, fieldGrowStages = ripe
-int fieldStage(const plot& fp) { return fieldRipe(fp) ? fieldGrowStages : fp.growth * fieldGrowStages / fieldGrowTicks; }
+int fieldStage(const plot& fp) { return fieldRipe(fp) ? fieldGrowStages : fp.growth * fieldGrowStages / wheatGrowTicks(); }
 
 Vector2f fieldWorkSpot(const plot& fp) { return fp.rect.position + fieldStandOffset; }
 
@@ -812,7 +848,7 @@ struct barb {
 };
 
 const raceDef& raceOf(const barb& b) { return raceDefs[b.race]; }
-int mineTicks(const barb& b) { return (int)(rockMineTicks / raceOf(b).mineSpeed); }
+int mineTicks(const barb& b) { return (int)(rockMineTicks / raceOf(b).mineSpeed / (know.learned[techPickwork] ? pickworkMineSpeed : 1.0f)); }
 
 struct deer {            // any game animal; species picks its row in speciesDefs
 animalSpecies species = speciesDeer;
@@ -865,6 +901,16 @@ void logEvent(const string& text) {
     foodFlashFrames = 0;   // any newer line ends the flash, so it never lands on the wrong line
     events.push_back({text, 0});
     while ((int)events.size() > eventMaxLines) events.pop_front();
+}
+
+// Know-how (R20-F1): one unit of practice; at the threshold the tech is learned once, with a ticker line
+void practice(techId t) {
+    know.count[t]++;
+    if (know.learned[t] || know.count[t] < techDefs[t].threshold) return;
+    know.learned[t] = true;
+    know.pulseFrames[t] = knowPulseFrames;
+    printf("---KNOW-HOW--- %s learned after %d (%s)\n", techDefs[t].name, know.count[t], techDefs[t].effect);
+    logEvent(string("Learned ") + techDefs[t].name + ": " + techDefs[t].effect);
 }
 
 // Ages ticker lines once per rendered frame so fade time is real-time regardless of sim speed
@@ -1539,6 +1585,7 @@ void drawBarbs(RenderWindow& window, const vector<barb>& barbs, const vector<Rec
             window.draw(tool);
         } else if (working && b.timer > 0) {
             bool raised = (phase / barbToolFrames) % 2 == 0;
+            if (b.chopping && b.target == targetNone && know.learned[techHandAxe]) tool.setFillColor(steelToolColor); // R20-F1: 1px axe head
             tool.setPosition(Vector2f(side, raised ? bodyTop - barbToolSize.y : bodyTop + 1.0f));
             window.draw(tool);
         }
@@ -1847,6 +1894,8 @@ struct hudValues {
     const char* trader;      // Away / Arriving / Trading / Leaving
     const char* tradeLine;   // last trade message, "" when expired
     const char* era;         // settlement rank: Camp / Hamlet / Town
+    bool learned[techCount]; // know-how pips (R20-F1)
+    int pulse[techCount];    // frames of white pulse left per pip
 };
 
 // Draws one table icon at pos (top-left, screen px), one quad per filled cell
@@ -1869,7 +1918,12 @@ string hudDetailText(const hudValues& v) {
     snprintf(buf, sizeof(buf), "Settlement: %s\nWood: %d\nStone: %d\nFood: %d\nHungry: %d\nPopulation: %d\nHouses: %d\nTime: %02d:00 (%s)\nSpeed: %dx%s\nWeather: %s\nTrader: %s%s%s",
              v.era, v.wood, v.stone, v.food, v.hungry, v.people, v.houses, v.hour, v.night ? "Night" : "Day", v.speed, v.paused ? " PAUSED" : "",
              v.raining ? "Rain" : "Clear", v.trader, v.tradeLine[0] ? "\n" : "", v.tradeLine);
-    return buf;
+    string s = buf;
+    s += "\nKnow-how:";
+    for (int t = 0; t < techCount; t++)   // learned techs, or progress toward each
+        s += string("\n  ") + techDefs[t].name + ": " + (v.learned[t] ? "learned"
+             : to_string(min(know.count[t], techDefs[t].threshold)) + "/" + to_string(techDefs[t].threshold));
+    return s;
 }
 
 // Full-width top strip of icon + number cells; returns the strip rect for the hover/tooltip checks
@@ -1926,6 +1980,40 @@ FloatRect drawHud(RenderWindow& window, const Font& font, const hudValues& v) {
         era.setFillColor(pal.hudText);
         era.setPosition({eraX - eb.position.x, textY});
         window.draw(era);
+    }
+
+    // Know-how pips (R20-F1), right-aligned just left of the era text so the rain cell never moves them.
+    // Unlearned: hollow dim rim. Learned: solid tech colour. Newly learned: flashes white, fading over ~1s.
+    float pipsW = techCount * knowPipPx + (techCount - 1) * knowPipGap;
+    float pipX = round(eraX - knowPipEraGap - pipsW);
+    float pipY = round((inner - knowPipPx) / 2);
+    if (eraX >= x && pipX >= x) {
+        RectangleShape pip({knowPipPx, knowPipPx});
+        for (int t = 0; t < techCount; t++) {
+            pip.setPosition({pipX + t * (knowPipPx + knowPipGap), pipY});
+            if (!v.learned[t]) {
+                pip.setSize({knowPipPx - 2 * knowPipRimPx, knowPipPx - 2 * knowPipRimPx});
+                pip.setPosition(pip.getPosition() + Vector2f(knowPipRimPx, knowPipRimPx));
+                pip.setFillColor(Color::Transparent);
+                pip.setOutlineThickness(knowPipRimPx);   // outline grows outward: 6x6 overall
+                pip.setOutlineColor(knowPipEmptyColor);
+            } else {
+                Color c = techDefs[t].pip;
+                if (v.pulse[t] > 0) {
+                    int age = knowPulseFrames - v.pulse[t];
+                    float fade = (float)v.pulse[t] / knowPulseFrames;                         // 1 -> 0 over the pulse
+                    float wave = 0.5f + 0.5f * cos(2.0f * 3.14159265f * age / knowPulsePeriod); // 1 at each flash
+                    float w = fade * wave;
+                    c.r = (uint8_t)(c.r + (255 - c.r) * w);
+                    c.g = (uint8_t)(c.g + (255 - c.g) * w);
+                    c.b = (uint8_t)(c.b + (255 - c.b) * w);
+                }
+                pip.setSize({knowPipPx, knowPipPx});
+                pip.setFillColor(c);
+                pip.setOutlineThickness(0.0f);
+            }
+            window.draw(pip);
+        }
     }
     return bar;
 }
@@ -2477,9 +2565,9 @@ void buildfield(vector<barb>& barbs, vector<RectangleShape>& squares, const vect
 }
 
 void fieldTick(plot& fp) {
-    if (fp.built && fp.growth < fieldGrowTicks) {
+    if (fp.built && fp.growth < wheatGrowTicks()) {
         fp.growth++;
-        if (fp.growth == fieldGrowTicks) printf("WHEAT RIPE\n");
+        if (fp.growth == wheatGrowTicks()) printf("WHEAT RIPE\n");
     }
 }
 
@@ -2918,6 +3006,7 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
                 fp.growth = 0;     // replanted at once
                 printf("WHEAT HARVESTED - food: %d\n", food);
                 logEvent("Wheat harvested (+" + to_string(fieldFoodYield) + " food, " + to_string(food) + ")");
+                practice(techSeedSelection);   // after the harvest line so a discovery reads as its consequence
             }
             continue;
 	}
@@ -2956,8 +3045,9 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
             b.chopping = true;
             trees[i].dying = true;
             if (workTick(b)) b.timer++;
-            if (b.timer >= 180) {
+            if (b.timer >= chopTicks()) {
                 wood++;
+                practice(techHandAxe);
                 swapRemove(trees,  i);
                 swapRemove(tris,   i);
                 swapRemove(stumps, i);
@@ -2987,6 +3077,7 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
 			if (workTick(b)) b.timer++;
 			if (b.timer >= mineTicks(b)) {           // dwarves finish rocks faster
 				stone++;
+				practice(techPickwork);
 				if (b.race == raceDwarf) forgeEmberFrames = forgeEmberBoostFrames; // forge ember flares (drawn only once built)
 				swapRemove(rocks, i);
 				swapRemove(octs, i);
@@ -3137,6 +3228,7 @@ int main() {
     Time timesincelastupdate = Time::Zero;
     const Time Timepertick = seconds(1.0f / 60.0f);
 
+    resetKnowHow();   // fresh practice counters and no learned techs for every new game (R20-F1)
     vector<barb> barbs;
     vector<RectangleShape> squares;
     vector<birthRing> birthRings;
@@ -3374,7 +3466,7 @@ int main() {
 	for (int q = 0; q < (int)squares.size(); ++q) {
             auto& b = barbs[q];
             if (b.chopping && b.timer > 0 && b.target == targetNone)
-                drawBar(window, Vector2f(b.targetx - 10, b.targety - 20), b.timer / 180.0f, pal.barChop);
+                drawBar(window, Vector2f(b.targetx - 10, b.targety - 20), (float)b.timer / chopTicks(), pal.barChop);
             if (b.chopping && b.timer > 0 && b.target == targetBush)
                 drawBar(window, Vector2f(b.targetx - 10, b.targety - 14), (float)b.timer / bushPickTicks, pal.barPick);
             if (b.chopping && b.timer > 0 && b.target == targetField)   // centred over the plot, above the bobbing ear
@@ -3400,6 +3492,8 @@ int main() {
         if (t >= 21 || t < 6) drawHouseLights(window, worldView, houseshapes);
         drawBallots(window, worldView, zoom, barbs, squares); // above the overlays so the pips read true; under hover marks
         if (ballotFramesLeft > 0 && !paused) ballotFramesLeft--;
+        for (int k = 0; k < techCount; k++)
+            if (know.pulseFrames[k] > 0 && !paused) know.pulseFrames[k]--;   // know-how pip flash (R20-F1)
 
         optional<hoverHit> hover;
         bool overHud = false;
@@ -3434,6 +3528,7 @@ int main() {
                 : activeTrader->phase == trader::Trading ? "Trading" : "Leaving";
             hv.tradeLine = tradeMsgTimer > 0 ? tradeMsg : "";
             hv.era = eraNames[currentEra];
+            for (int k = 0; k < techCount; k++) { hv.learned[k] = know.learned[k]; hv.pulse[k] = know.pulseFrames[k]; }
             hudRect = drawHud(window, hudFont, hv);
             tickerRect = drawEvents(window, hudFont);
             Vector2f mouse = window.mapPixelToCoords(Mouse::getPosition(window), window.getDefaultView());
