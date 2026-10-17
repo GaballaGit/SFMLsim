@@ -684,6 +684,37 @@ const int fieldBobFrames = 30;                // 1px up/down every ~0.5s
 const Color barbHarvestColor(235, 205, 85);   // harvest stripe: gold, clear of mine orange and the other task colours
 const Color fieldBarColor(200, 165, 70);      // muted gold harvest progress bar
 const int bushFoodYield = 1;                  // food per picked bush (shared harvest path)
+// Windmill and milling (FARM-F2): each race builds one small mill beside its first plot (buildOneOff, jobMill). Reapers
+// carry the sheaf (carryWheat) to their race's mill, where it is milled for millFoodYield; with no built mill the sheaf
+// goes to the storehouse (or the campfire) for fieldFoodYield. The mill spot is chosen with the plot and reserved with it.
+constexpr int millFoodYield = 3;              // vs fieldFoodYield (2) for an unmilled sheaf
+constexpr int millWoodCost = 8;
+constexpr int millStoneCost = 2;              // millstones; houseStoneCost is kept back for the next house
+constexpr int millBuildTicks = 600;           // same work as a house
+constexpr Vector2f millBodySize(10.0f, 10.0f);
+constexpr Vector2f millHubOffset(5.0f, 3.0f); // sail hub relative to the body top-left (upper middle of the tower)
+constexpr float millSailLen = 7.0f;           // hub -> blade tip; the sweep reaches 4px above and 2px beside the body
+constexpr float millSailInner = 1.0f;         // blades start this far from the hub, so the hub pixel shows
+constexpr float millSailWidth = 2.0f;         // blade width, all on one side of its stock like a real sail
+constexpr float millGapPx = 3.0f;             // plot frame -> nearest edge of the sail sweep
+constexpr Vector2f millStandOffset(4.0f, 11.0f); // builder/delivery hitbox top-left relative to the body: just below the door
+constexpr float millClearPx = 3.0f;           // houses, shrines, trees, roads and other plots keep this far from the mill zone
+constexpr Vector2f millDoorPos(4.0f, 7.0f);
+constexpr Vector2f millDoorSize(2.0f, 3.0f);
+constexpr float millOutlinePx = 1.0f;         // drawn inward, so the body stays exactly millBodySize
+constexpr Color millBodyColor(146, 136, 114);    // neutral grey-tan, no race tint
+constexpr Color millOutlineColor(40, 34, 26);    // dark rim, same family as the crate rim
+constexpr Color millDoorColor(52, 42, 30);
+constexpr Color millSailColor(196, 188, 166, 220); // pale weathered cloth, a touch translucent so the body reads behind it
+constexpr Color millHubColor(58, 48, 36);
+constexpr int millTurnFrames = 180;           // sails turn ~3s after each delivery (frames, frozen while paused)
+constexpr int millTurnEaseFrames = 40;        // the last ~0.7s of the turn slows to a stop
+constexpr float millSailDegPerFrame = 3.0f;   // full speed: one turn every 2s
+constexpr int millPuffFrames = 24;            // flour puff ~0.4s per delivery
+constexpr int millPuffDots = 5;               // 1px dots drifting out from the door
+constexpr float millPuffSpreadPx = 4.0f;      // how far the dots drift by the end of the puff
+constexpr Color millPuffColor(236, 230, 214); // flour white
+constexpr uint8_t millPuffAlpha = 110;        // faint at the start, fading to 0
 
 // Know-how discoveries (R20-F1): practice counters unlock one-off speedups
 const int treeChopTicks = 180;                // base work ticks to fell one tree
@@ -719,8 +750,8 @@ const int spearKnapFrames = 8;                // crafter's knapping hand ticks u
 // Build jobs: which structure a barb's movingbspot/building belongs to. jobNone = no job, or a house (buildhouse()).
 // jobSpear is a craft, not a structure: it uses movingbspot (so no other system grabs the barb) but never building/timer.
 // jobPave (R20-F2) is run by paveTick(): movingbspot while walking, building/timer while laying the cobbles.
-enum buildJob {jobNone, jobShrine, jobSmoke, jobStall, jobForge, jobField, jobSpear, jobPave, jobStore, buildJobCount};
-const int buildJobTicks[buildJobCount] = {houseBuildTicks, shrineBuildTicks, smokehouseBuildTicks, stallBuildTicks, forgeBuildTicks, fieldBuildTicks, spearCraftTicks, paveTicks, storehouseBuildTicks};
+enum buildJob {jobNone, jobShrine, jobSmoke, jobStall, jobForge, jobField, jobSpear, jobPave, jobStore, jobMill, buildJobCount};
+const int buildJobTicks[buildJobCount] = {houseBuildTicks, shrineBuildTicks, smokehouseBuildTicks, stallBuildTicks, forgeBuildTicks, fieldBuildTicks, spearCraftTicks, paveTicks, storehouseBuildTicks, millBuildTicks};
 // Game animals share the deer code (deers/deershape vectors); per-species numbers live in speciesDefs below.
 // Sprite offsets are relative to the logic shape (body = hitbox), written for an animal facing right.
 enum animalSpecies {speciesDeer, speciesRabbit, speciesCount};
@@ -1124,11 +1155,45 @@ bool fieldClear(const plot& fp, const FloatRect& r) {
     return !fp.placed || !r.findIntersection(fieldZone(fp.rect.position)).has_value();
 }
 
-// FARM-F1: false if r touches any race's reserved plot zone
+// FARM-F2: one windmill per race in a fixed array (index = barbRace; never removed, so no index goes stale).
+// placed: spot chosen with the race's first plot and reserved from then on; built is the validity flag haulers check.
+struct mill {
+    bool placed = false;
+    bool built = false;
+    bool claimed = false;   // a barb of this race holds jobMill for it
+    int builderId = -1;     // stable barb id of the builder while claimed, -1 otherwise (never an index)
+    Vector2f pos;           // body top-left
+    int turnFrames = 0;     // >0 = sails turning (milling), counted down per drawn frame
+    int puffFrames = 0;     // >0 = flour puff at the door
+    float sailAngle = 45.0f; // degrees; starts as an X, the classic resting pose
+};
+mill mills[raceCount];
+
+Vector2f millWorkSpot(const mill& m) { return m.pos + millStandOffset; }
+
+// Body + sail sweep + the stand spot below it, padded by millClearPx
+FloatRect millZone(Vector2f pos) {
+    Vector2f lo = pos + millHubOffset - Vector2f(millSailLen, millSailLen) - Vector2f(millClearPx, millClearPx);
+    float right = pos.x + millHubOffset.x + millSailLen + millClearPx;
+    float bottom = pos.y + max(millBodySize.y, millStandOffset.y + fieldZoneBelowPx) + millClearPx;
+    return FloatRect(lo, Vector2f(right - lo.x, bottom - lo.y));
+}
+
+// Mill body top-left beside a plot at plotPos: side +1 = right of the plot, -1 = left; the sail sweep keeps millGapPx
+// from the plot frame, top aligned with the soil so the mill reads as standing at the plot's edge, not on it.
+Vector2f millSpotBeside(Vector2f plotPos, int side) {
+    float edge = side > 0 ? plotPos.x + fieldSize.x + fieldBorderPx + millGapPx + (millSailLen - millHubOffset.x)
+                          : plotPos.x - fieldBorderPx - millGapPx - (millHubOffset.x + millSailLen);
+    return Vector2f(edge, plotPos.y);
+}
+
+// FARM-F1: false if r touches any race's reserved plot zone. FARM-F2: or any reserved mill zone.
 bool fieldsClear(const fieldGrid& fields, const FloatRect& r) {
-    for (int q = 0; q < raceCount; q++)
+    for (int q = 0; q < raceCount; q++) {
         for (int k = 0; k < fieldsPerRace; k++)
             if (!fieldClear(fields[q][k], r)) return false;
+        if (mills[q].placed && r.findIntersection(millZone(mills[q].pos)).has_value()) return false;
+    }
     return true;
 }
 
@@ -1179,7 +1244,10 @@ bool lakeClear(const FloatRect& r, const Vector2f* pathFrom = nullptr) {
 
 // Work target of a barb. targetNone with a set targetx is a tree (or a hunt/wander/build spot, which own their flags).
 enum targetKind {targetNone, targetBush, targetRock, targetLake, targetField, targetDepot}; // targetDepot: hauling a load (R29-F1)
-enum carryLoad {carryNone, carryWood, carryStone};   // R29-F1: what a hauler holds; set only while target == targetDepot
+enum carryLoad {carryNone, carryWood, carryStone, carryWheat};   // R29-F1: what a hauler holds; set only while target == targetDepot
+// FARM-F2: carryWheat is a reaped sheaf headed for the race's mill (storehouse/campfire if none). It lives in the same
+// carryKind field, so every carryLoad reset (dropCarry, deposit, removeBarb) clears it too.
+const char* carryName(carryLoad c) { return c == carryWood ? "wood" : c == carryStone ? "stone" : c == carryWheat ? "wheat" : "none"; }
 
 struct barb {
     int id = -1;                // stable, unique; assigned only by makeBarb()
@@ -1240,7 +1308,7 @@ int mineTicks(const barb& b) { return (int)(rockMineTicks / raceOf(b).mineSpeed 
 
 // R29-F1: every way out of a haul other than the deposit itself; the load is lost. Safe on a barb that isn't hauling.
 void dropCarry(barb& b) {
-    if (b.carryKind != carryNone) printf("LOAD DROPPED - barb %d (%s)\n", b.id, b.carryKind == carryWood ? "wood" : "stone");
+    if (b.carryKind != carryNone) printf("LOAD DROPPED - barb %d (%s)\n", b.id, carryName(b.carryKind));
     b.carryKind = carryNone;
     if (b.target == targetDepot) b.target = targetNone;
 }
@@ -2354,12 +2422,23 @@ optional<hoverHit> pickHover(Vector2f p, float radius, const vector<barb>& barbs
             h.hoveredHouse = houses[i].id;
             return h;
         }
+    auto farmLine = [&](int r) {   // FARM-F2: "mill: built/none, plots n/cap" for race r
+        int sown = 0;
+        for (auto& fp : fields[r]) if (fp.built) sown++;
+        return string("mill: ") + (mills[r].built ? "built" : "none") + ", plots " + to_string(sown) + "/" + to_string(fieldsPerRace);
+    };
+    for (int r = 0; r < raceCount; r++) {   // FARM-F2: a standing mill shows its race and the farmstead line
+        if (!mills[r].built) continue;
+        RectangleShape body(millBodySize);
+        body.setPosition(snapPx(mills[r].pos));
+        if (near(body)) return hoverHit{string(raceDefs[r].name) + " " + farmLine(r), body, nullopt};
+    }
     for (int r = 0; r < raceCount; r++)   // FARM-F1: sown plots show their race and growth
         for (int k = 0; k < fieldsPerRace; k++) {
             const plot& fp = fields[r][k];
             if (!fp.built || !near(fp.shape)) continue;
             string growth = fieldRipe(fp) ? "ripe" : to_string(fp.growth * 100 / wheatGrowTicks()) + "% grown";
-            return hoverHit{string(raceDefs[r].name) + " wheat field: " + growth, fp.shape, nullopt};
+            return hoverHit{string(raceDefs[r].name) + " wheat field: " + growth + "; " + farmLine(r), fp.shape, nullopt};
         }
     return nullopt;
 }
@@ -2926,11 +3005,13 @@ bool nearestQuarterHouse(int r, const vector<house>& houses, Vector2f& best) {
     return bestDSq >= 0.0f;
 }
 
-// FARM-F1: false if a quarter road from a to b would cross any reserved plot zone
+// FARM-F1: false if a quarter road from a to b would cross any reserved plot zone (FARM-F2: or mill zone)
 bool roadClearOfFields(const fieldGrid& fields, Vector2f a, Vector2f b) {
-    for (int q = 0; q < raceCount; q++)
+    for (int q = 0; q < raceCount; q++) {
         for (int k = 0; k < fieldsPerRace; k++)
             if (fields[q][k].placed && segmentHitsRect(a, b, fieldZone(fields[q][k].rect.position))) return false;
+        if (mills[q].placed && segmentHitsRect(a, b, millZone(mills[q].pos))) return false;   // FARM-F2
+    }
     return true;
 }
 
@@ -3422,16 +3503,15 @@ bool fieldInClearing(const FloatRect& zone, int r) {
 // buildings): clear of every crate and its stand spot, the forge, lakes, the other plots, houses and shrines (standing
 // or claimed), and race r's quarter road (crate to nearest house, plus roads to houses still being built).
 // Reserved from then on via fieldsClear(); buildhouse() keeps new roads off it.
+// FARM-F2: with withMill (the race's first plot), the race's mill spot beside the plot (right, else left) must pass the
+// same checks; both are reserved together, so the mill always stands at a fixed offset from its plot.
 bool placeField(plot& fp, int r, const vector<barb>& barbs, const vector<house>& houses, const vector<shrine>& shrines,
-                const fieldGrid& fields) {
+                const fieldGrid& fields, bool withMill) {
     uniform_real_distribution<float> ang(0.0f, 6.2831853f), rad(fieldStoreMinRadius, fieldStoreMaxRadius);
     Vector2f qc = quarterCentre(r), road;
     bool hasRoad = nearestQuarterHouse(r, houses, road);
-    for (int k = 0; k < fieldPlaceTries; k++) {
-        float a = ang(gen), d = rad(gen);
-        Vector2f pos(round(qc.x + cos(a) * d - fieldSize.x / 2), round(qc.y + sin(a) * d - fieldSize.y / 2));
-        FloatRect zone = fieldZone(pos);
-        if (!fieldInClearing(zone, r) || !forgeClear(zone) || !lakeClear(zone) || !fieldsClear(fields, zone)) continue;
+    auto zoneOk = [&](const FloatRect& zone) {
+        if (!fieldInClearing(zone, r) || !forgeClear(zone) || !lakeClear(zone) || !fieldsClear(fields, zone)) return false;
         bool ok = !hasRoad || !segmentHitsRect(qc, road, zone);
         for (int i = 0; ok && i < (int)houses.size(); i++)
             if (zone.findIntersection(FloatRect(Vector2f(houses[i].x - 3.0f, houses[i].y - 3.0f), houseSlabSize))) ok = false;
@@ -3446,7 +3526,22 @@ bool placeField(plot& fp, int r, const vector<barb>& barbs, const vector<house>&
         }
         for (auto& s : shrines)
             if (ok && zone.findIntersection(FloatRect(Vector2f((float)s.x, (float)s.y - shrineCapH), shrineSlabSize + Vector2f(0.0f, shrineCapH)))) ok = false;
-        if (!ok) continue;
+        return ok;
+    };
+    for (int k = 0; k < fieldPlaceTries; k++) {
+        float a = ang(gen), d = rad(gen);
+        Vector2f pos(round(qc.x + cos(a) * d - fieldSize.x / 2), round(qc.y + sin(a) * d - fieldSize.y / 2));
+        if (!zoneOk(fieldZone(pos))) continue;
+        int side = 0;
+        if (withMill) {
+            for (int s : {1, -1})
+                if (!side && zoneOk(millZone(millSpotBeside(pos, s)))) side = s;
+            if (!side) continue;
+            mills[r].placed = true;
+            mills[r].pos = millSpotBeside(pos, side);
+            printf("MILL SPOT chosen for the %s at %d,%d (%s of the plot)\n", racePlurals[r],
+                   (int)mills[r].pos.x, (int)mills[r].pos.y, side > 0 ? "right" : "left");
+        }
         fp.placed = true;
         fp.rect = FloatRect(pos, fieldSize);
         fp.shape.setSize(fieldSize);
@@ -3489,7 +3584,7 @@ void buildfield(vector<barb>& barbs, vector<RectangleShape>& squares, const vect
             if (fp.built || (activeRace >= 0 && (r != activeRace || k != activeK))) continue;
             if (!fp.placed) {
                 if (!stores[r].built || raceHouses[r] < fieldMinHouses || wood < fieldWoodCost) continue;
-                if (!placeField(fp, r, barbs, houses, shrines, fields)) continue;
+                if (!placeField(fp, r, barbs, houses, shrines, fields, k == 0 && !mills[r].placed)) continue;
             }
             bool done = buildOneOff(barbs, squares, fp.claimed, jobField, fieldWorkSpot(fp), "FIELD",
                 [&](const barb& b) {
@@ -3509,6 +3604,46 @@ void buildfield(vector<barb>& barbs, vector<RectangleShape>& squares, const vect
             }
             if (fp.claimed) return;   // one being sown at a time
         }
+}
+
+// FARM-F2: runs after buildfield(). Each race builds one mill at the spot reserved beside its first plot, once that plot
+// is sown; only a barb of that race may claim it (jobMill through buildOneOff()). All mills share jobMill, so one is under
+// construction at a time. A claim is held only while its builder (by id, same race) still holds jobMill. O(barbs x races).
+void buildmills(vector<barb>& barbs, vector<RectangleShape>& squares, const fieldGrid& fields) {
+    int active = -1;
+    for (int r = 0; r < raceCount; r++) {
+        mill& m = mills[r];
+        if (m.built || !m.claimed) continue;
+        int i = findBarbById(barbs, m.builderId);
+        if (i < 0 || barbs[i].jobKind != jobMill || barbs[i].race != r) {
+            printf("MILL CLAIM RELEASED - %s, builder %d lost\n", racePlurals[r], m.builderId);
+            m.claimed = false;
+            m.builderId = -1;
+            continue;
+        }
+        active = r;
+    }
+    for (int r = 0; r < raceCount; r++) {
+        mill& m = mills[r];
+        if (m.built || !m.placed || !fields[r][0].built || (active >= 0 && r != active)) continue;
+        bool done = buildOneOff(barbs, squares, m.claimed, jobMill, millWorkSpot(m), "MILL",
+            [&](const barb& b) {
+                if (wood < millWoodCost || stone < millStoneCost + houseStoneCost) return -1;
+                if (b.race != r) return 0;   // only that race builds its mill
+                wood -= millWoodCost;
+                stone -= millStoneCost;
+                m.builderId = b.id;
+                return 1;
+            });
+        if (done) {
+            m.built = true;
+            m.claimed = false;
+            m.builderId = -1;
+            printf("---MILL BUILT--- %s, +%d food per milled sheaf (%d wood, %d stone)\n", racePlurals[r], millFoodYield, millWoodCost, millStoneCost);
+            logEvent(string(racePlurals[r]) + " build a windmill");
+        }
+        if (m.claimed) return;   // one under construction at a time
+    }
 }
 
 // R20-F3: every way out of a spear craft (finished, unaffordable, interrupted) clears the same barb fields
@@ -3628,6 +3763,73 @@ void drawField(RenderWindow& window, const plot& fp, int race, int frame) {
     r.setFillColor(fieldBobColor);
     r.setPosition(o + Vector2f(floor(fieldSize.x / 2), -fieldBorderPx - (up ? 3.0f : 2.0f)));
     window.draw(r);
+}
+
+// FARM-F2: 10x10 grey-tan tower with a dark inset rim and a dark door, under one sail shape (four 2px blades round a 1px
+// hub) that is rotated as a whole and turns only while milling. Drawn with the village structures, under barbs and trees.
+void drawMills(RenderWindow& window) {
+    RectangleShape body(millBodySize), r;
+    body.setFillColor(millBodyColor);
+    body.setOutlineThickness(-millOutlinePx);
+    body.setOutlineColor(millOutlineColor);
+    VertexArray sails(PrimitiveType::Triangles);   // one shape: built once per call around the hub, rotated as a whole
+    for (int k = 0; k < 4; k++) {
+        float a = 1.5707963f * k;
+        Vector2f d(cos(a), sin(a)), n(-d.y, d.x);   // stock direction, and the side the cloth hangs on
+        Vector2f p0 = d * millSailInner, p1 = d * millSailLen, p2 = p1 + n * millSailWidth, p3 = p0 + n * millSailWidth;
+        for (Vector2f v : {p0, p1, p2, p0, p2, p3}) sails.append(Vertex{v, millSailColor});
+    }
+    for (int q = 0; q < raceCount; q++) {
+        const mill& m = mills[q];
+        if (!m.built) continue;
+        Vector2f o = snapPx(m.pos);
+        body.setPosition(o);
+        window.draw(body);
+        r.setSize(millDoorSize);
+        r.setPosition(o + millDoorPos);
+        r.setFillColor(millDoorColor);
+        window.draw(r);
+        Transform t;
+        t.translate(o + millHubOffset + Vector2f(0.5f, 0.5f));   // centre of the hub pixel
+        t.rotate(degrees(m.sailAngle));
+        window.draw(sails, RenderStates(t));
+        r.setSize(Vector2f(1.0f, 1.0f));
+        r.setPosition(o + millHubOffset);
+        r.setFillColor(millHubColor);
+        window.draw(r);
+    }
+}
+
+// FARM-F2: short faint flour puff at the door after each delivery: a few 1px dots drifting out and up, fading out.
+// Drawn above the trees (like the chimney smoke) and under the day/night overlay.
+void drawMillPuffs(RenderWindow& window) {
+    RectangleShape p(Vector2f(1.0f, 1.0f));
+    for (int q = 0; q < raceCount; q++) {
+        const mill& m = mills[q];
+        if (!m.built || m.puffFrames <= 0) continue;
+        float t = 1.0f - (float)m.puffFrames / millPuffFrames;   // 0 -> 1 over the puff
+        Color c = millPuffColor;
+        c.a = (uint8_t)(millPuffAlpha * (1.0f - t));
+        p.setFillColor(c);
+        Vector2f door = snapPx(m.pos) + millDoorPos + Vector2f(millDoorSize.x / 2.0f, 0.0f);
+        for (int k = 0; k < millPuffDots; k++) {
+            float a = 3.14159265f * (0.15f + 0.7f * k / (millPuffDots - 1));   // fanned over the upper half, left to right
+            Vector2f at = door + Vector2f(-cos(a), -sin(a) * 0.6f) * (1.0f + millPuffSpreadPx * t);
+            p.setPosition(Vector2f(floor(at.x), floor(at.y)));
+            window.draw(p);
+        }
+    }
+}
+
+// FARM-F2: per drawn frame (frozen while paused): sails turn while milling, easing to a stop; the puff runs out
+void millFrameTick() {
+    for (auto& m : mills) {
+        if (m.turnFrames > 0) {
+            m.sailAngle = fmod(m.sailAngle + millSailDegPerFrame * min(1.0f, (float)m.turnFrames / millTurnEaseFrames), 360.0f);
+            m.turnFrames--;
+        }
+        if (m.puffFrames > 0) m.puffFrames--;
+    }
 }
 
 struct birthRing {Vector2f pos; int age = 0;};
@@ -3971,6 +4173,12 @@ void removeBarb(vector<barb>& barbs, vector<RectangleShape>& squares, int i,
                 for (auto& fp : fields[b.race])
                     if (!fp.built && fp.sowerId == b.id) { fp.claimed = false; fp.sowerId = -1; }
             break;
+        case jobMill:    // FARM-F2: only its own race's mill, and only if this barb holds the claim
+            if (b.race >= 0 && b.race < raceCount && !mills[b.race].built && mills[b.race].builderId == b.id) {
+                mills[b.race].claimed = false;
+                mills[b.race].builderId = -1;
+            }
+            break;
         case jobPave:  clearPave(b); break;
         case jobSpear: clearSpearCraft(b); break;
         default: break;
@@ -4197,17 +4405,24 @@ bool harvestTick(barb& b, Vector2f spot, Vector2f bpos, int ticks, int yield) {
 }
 
 // R29-F1: where a hauler drops its load: its own race's storehouse if standing, else the campfire. A lookup, no search.
+// FARM-F2: true if b carries a sheaf and its own race's mill is standing (the mill is the depot for wheat)
+bool millDepot(const barb& b) {
+    return b.carryKind == carryWheat && b.race >= 0 && b.race < raceCount && mills[b.race].built;
+}
+
 Vector2f depotSpot(const barb& b, const storehouse (&stores)[raceCount]) {
+    if (millDepot(b)) return millWorkSpot(mills[b.race]);   // FARM-F2: sheaves go to the mill while it stands
     if (b.race >= 0 && b.race < raceCount && stores[b.race].built) return storehousePos[b.race] + storehouseStandOffset;
     return villageCenter + campfireDepotOffset;
 }
 
-// R29-F1: a felled tree / mined rock becomes a load; the barb walks it to the depot (haulTick) before it counts
+// R29-F1: a felled tree / mined rock becomes a load; the barb walks it to the depot (haulTick) before it counts.
+// FARM-F2: a reaped sheaf too (carryWheat).
 void startHaul(barb& b, carryLoad load, const storehouse (&stores)[raceCount]) {
+    b.carryKind = load;   // first: the depot depends on the load (wheat -> mill)
     Vector2f spot = depotSpot(b, stores);
     b.chopping = false;
     b.timer = 0;
-    b.carryKind = load;
     b.target = targetDepot;
     b.targetx = (int)spot.x;
     b.targety = (int)spot.y;
@@ -4233,12 +4448,28 @@ void haulTick(barb& b, RectangleShape& sq, storehouse (&stores)[raceCount]) {
         }
         return;
     }
-    bool isWood = b.carryKind == carryWood;
-    (isWood ? wood : stone)++;
-    storehouse* st = (b.race >= 0 && b.race < raceCount && stores[b.race].built) ? &stores[b.race] : nullptr;
-    if (st) { st->stored++; st->flashFrames = storehouseFlashFrames; }
-    printf("%s DEPOSITED at %s - wood: %d stone: %d\n", isWood ? "WOOD" : "STONE",
-           st ? "storehouse" : "campfire", wood, stone);
+    if (b.carryKind == carryWheat) {   // FARM-F2: mill revalidated on arrival; gone/unbuilt -> the sheaf goes to the storehouse
+        bool milled = millDepot(b);
+        Vector2f ms = milled ? millWorkSpot(mills[b.race]) : Vector2f();
+        if (milled && (b.targetx != (int)ms.x || b.targety != (int)ms.y)) milled = false;   // stood at another depot instead
+        storehouse* st = (!milled && b.race >= 0 && b.race < raceCount && stores[b.race].built) ? &stores[b.race] : nullptr;
+        int yield = (milled ? millFoodYield : fieldFoodYield) + forageBonus(b);   // R25-F1: Forager +1
+        food += yield;
+        if (milled) {
+            mill& m = mills[b.race];
+            m.turnFrames = millTurnFrames;
+            m.puffFrames = millPuffFrames;
+        } else if (st) { st->stored++; st->flashFrames = storehouseFlashFrames; }
+        printf("WHEAT %s at %s - food: %d\n", milled ? "MILLED" : "STORED", milled ? "mill" : st ? "storehouse" : "campfire", food);
+        logEvent(string(milled ? "Wheat milled (+" : "Wheat stored (+") + to_string(yield) + " food, " + to_string(food) + ")");
+    } else {
+        bool isWood = b.carryKind == carryWood;
+        (isWood ? wood : stone)++;
+        storehouse* st = (b.race >= 0 && b.race < raceCount && stores[b.race].built) ? &stores[b.race] : nullptr;
+        if (st) { st->stored++; st->flashFrames = storehouseFlashFrames; }
+        printf("%s DEPOSITED at %s - wood: %d stone: %d\n", isWood ? "WOOD" : "STONE",
+               st ? "storehouse" : "campfire", wood, stone);
+    }
     b.carryKind = carryNone;
     b.target = targetNone;
     b.moving = false;
@@ -4402,12 +4633,13 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
                 clearHarvest(b);   // nothing to reap
                 continue;
             }
-            int yield = fieldFoodYield + forageBonus(b);   // R25-F1: Forager +1
-            if (harvestTick(b, wp, bpos, fieldHarvestTicks, yield)) {
+            // FARM-F2: the reaped sheaf adds no food here; it is carried (carryWheat) to the race's mill, or to the
+            // storehouse/campfire if no mill stands, and counted on arrival in haulTick() (Forager bonus applied there)
+            if (harvestTick(b, wp, bpos, fieldHarvestTicks, 0)) {
                 fp.growth = 0;     // replanted at once
-                printf("WHEAT HARVESTED - food: %d\n", food);
-                logEvent("Wheat harvested (+" + to_string(yield) + " food, " + to_string(food) + ")");
-                practice(techSeedSelection);   // after the harvest line so a discovery reads as its consequence
+                startHaul(b, carryWheat, stores);
+                printf("WHEAT REAPED - barb %d carries the sheaf to the %s\n", b.id, millDepot(b) ? "mill" : "storehouse");
+                practice(techSeedSelection);
             }
             continue;
 	}
@@ -4912,6 +5144,7 @@ int main() {
                 buildforge(barbs, squares, houses, dwarfForge);
                 buildstorehouses(barbs, squares, houses, stores);
                 buildfield(barbs, squares, houses, shrines, stores, fields);
+                buildmills(barbs, squares, fields);   // FARM-F2
                 craftspear(barbs, squares);
                 minematerials(squares, barbs, tris, stumps, trees, octs, rocks, bushes, bushshapes, catchRings, fields, stores);
                 barbmove(squares, barbs);
@@ -5005,6 +5238,8 @@ int main() {
 	for (auto& st : stores) if (st.flashFrames > 0 && !paused) st.flashFrames--;
 	for (int r = 0; r < raceCount; r++)
 	    for (auto& fp : fields[r]) drawField(window, fp, r, frameCount);
+	drawMills(window);   // FARM-F2: beside each race's plot
+	if (!paused) millFrameTick();
 
 	drawCampfire(window, fire, frameCount);
 
@@ -5021,6 +5256,7 @@ int main() {
 	if (activeTrader) drawSnapped(window, activeTrader->shape);
 	drawTrees(window, tris, treeVerts);
 	drawSmoke(window, smoke, frameCount);
+	drawMillPuffs(window);   // FARM-F2: above the trees, under the overlay
 	drawBirds(window, birds, birdShape, frameCount);
 	if (raining) drawRain(window, rainVerts, frameCount);
 	for (int q = 0; q < (int)squares.size(); ++q) {
