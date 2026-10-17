@@ -148,9 +148,21 @@ const Vector2f shinobiPuffSize(3.0f, 3.0f);
 const Color shinobiPuffColor(170, 172, 176);   // soft grey
 const uint8_t shinobiPuffMaxAlpha = 90;        // subtle: faint at the start, linear fade to 0
 
-int wood = 0;
-int stone = 0;
-int food = 0;
+// Race stockpiles (RACE-F1): every race keeps its own wood/stone/food; deposits, meals, births and builds use the barb's
+// race. Only the campfire draws on one explicit shared pool (campfireWood), fed by a tithe on wood deposits.
+struct raceStock { int wood = 0, stone = 0, food = 0; };
+constexpr raceStock startStock{8, 2, 4};       // seed and startup floor per race (stone = the shortage threshold, so no
+                                               // shortage lines fire at launch); spend() never takes a stock below 0
+raceStock stock[raceCount];
+constexpr int campfireStartWood = 0;           // shared pool at startup (the fire is already lit with campfireStartFuel)
+constexpr int campfireTitheEvery = 10;         // every Nth wood deposit (any race) goes to the campfire pool...
+constexpr int campfireWoodCap = 4;             // ...while the pool holds fewer than this, so the fire never hoards
+int campfireWood = campfireStartWood;
+int campfireTitheCount = 0;
+// Shortage cue: a race whose wood, stone or food is below this shows red on its HUD row; the same test fires one ticker
+// line per shortage (stockAnnounced), re-armed once that stock is back at or above the threshold.
+constexpr int stockShortThreshold = 2;
+bool stockAnnounced[raceCount][needCount] = {};
 int game_time = 12;
 // Day/night hours (R26-F1): night runs nightStartHour..nightEndHour-1, the day tint switches at the other two
 const int nightStartHour = 21;             // dusk: night overlay, campfire glow and lit windows begin
@@ -581,6 +593,21 @@ const unsigned int lensFontSize = 12;         // same as the inspect panel and t
 const Color lensTitleColor(240, 232, 205);    // inspect-name cream
 const Color lensTextColor(205, 200, 180);     // ticker cream
 const Color lensSwatchRim(20, 24, 20, 200);   // dark 1px rim so pale swatches don't bleed into the backing
+// Race stock panel (RACE-F1): top-left under the HUD strip (the lens legend stacks below it). One row per race:
+// race swatch + name, then wood/stone/food as 8px icons + numbers. Numbers below stockShortThreshold turn stockShortColor.
+const float stockMargin = lensMargin;         // same gaps and backing as the lens legend
+const Vector2f stockPad = lensPad;
+const float stockRowGap = lensRowGap;
+const float stockSwatchPx = lensSwatchPx;     // 8px race square, same as the legend swatches
+const float stockSwatchGap = lensSwatchGap;   // swatch -> race name
+const float stockIconPx = 1.0f;               // icon cell size: the strip's 8x8 icons at 1x (8px), about one text line
+const float stockIconGap = 3.0f;              // icon -> number
+const float stockCellGap = 9.0f;              // name -> first icon, number -> next icon
+const char* const stockMinNumber = "00";      // each number column reserves at least this width
+const unsigned int stockFontSize = 12;        // same as the lens legend and inspect panel
+const Color stockSwatchColors[raceCount] = {MM_STORE_COLORS[0], MM_STORE_COLORS[1], MM_STORE_COLORS[2]}; // lifted crate colours: read on the dark backing
+const Color stockShortColor(222, 108, 88);    // muted brick red, a shade lighter than uiStarvingRed so 12px digits read on the backing
+const Color stockEmptyRaceColor(120, 118, 108); // a race with no living members: its whole row is dimmed, never red
 
 // Race quarters (R30-F1): each race's crate sits in its own quarter around the village, at least raceMinSeparation from
 // the others; that race's houses go within quarterHouseRadius of it. Trees/rocks are kept off each quarter like the
@@ -1292,6 +1319,17 @@ int hungerThresholdOf(const barb& b) {
 }
 bool isGentry(const barb& b) { return b.homeHouse < 0; }   // R24-F1: founders; derived, no stored flag
 
+// RACE-F1: the one way to reach a race's stockpile. An out-of-range race falls back to race 0 instead of indexing past the array.
+int clampRace(int r) { return (r >= 0 && r < raceCount) ? r : 0; }
+raceStock& stockOfRace(int r) { return stock[clampRace(r)]; }
+raceStock& stockOf(const barb& b) { return stockOfRace(b.race); }
+bool canAfford(const raceStock& s, int w, int st, int f = 0) { return s.wood >= w && s.stone >= st && s.food >= f; }
+void spend(raceStock& s, int w, int st, int f = 0) {   // callers check canAfford first; the max() keeps a stock from going negative
+    s.wood = max(0, s.wood - w);
+    s.stone = max(0, s.stone - st);
+    s.food = max(0, s.food - f);
+}
+
 // R28-F2: leaders are held by barb id (never index); a missing id means the race has no leader
 int raceLeaderId[raceCount] = {-1, -1, -1};
 bool raceElected[raceCount] = {false, false, false};
@@ -1548,11 +1586,12 @@ void deerkilling(vector<deer>& deers, vector<RectangleShape>& deershape, vector<
 					swapRemove(deershape, i);
 					removed = true;
 					int smoked = sh.built ? smokehouseFoodBonus : 0;
-					food += yield + smoked;
+					raceStock& rs = stockOf(b);   // RACE-F1: the hunter's race eats it
+					rs.food += yield + smoked;
 					if (smoked > 0) sh.boostTicks = smokeBoostTicks;   // puff burst over the hut
-					printf("%s KILLED%s - Food: %d (+%d, +%d smoked)\n", name, speared ? " (spear)" : "", food, yield, smoked);
+					printf("%s KILLED%s - %s food: %d (+%d, +%d smoked)\n", name, speared ? " (spear)" : "", racePlurals[clampRace(b.race)], rs.food, yield, smoked);
 					logEvent(string(name) + (speared ? " speared (+" : " killed (+") + to_string(yield) + " food"
-					         + (smoked > 0 ? ", +" + to_string(smoked) + " smoked" : string()) + ", " + to_string(food) + ")");
+					         + (smoked > 0 ? ", +" + to_string(smoked) + " smoked" : string()) + ", " + to_string(rs.food) + ")");
 					break;
 				}
 			}
@@ -1996,35 +2035,37 @@ void hungerTick(vector<barb>& barbs) {
     static int hungryLogCooldown = 0;
     if (hungryLogCooldown > 0) hungryLogCooldown--;
     // Pass 1: hunger grows (once per barb per tick); the "no food" line is logged at most once per tick
-    int hungryCommoners = 0;
+    int hungryCommoners[raceCount] = {};   // RACE-F1: each race eats from its own larder, so the reserve is per race
     for (auto& b : barbs) {
         if (!isHungry(b)) {
             b.hunger++;
-            if (isHungry(b) && food <= 0 && hungryLogCooldown == 0) {
-                logEvent("A barb is hungry - no food");
+            if (isHungry(b) && stockOf(b).food <= 0 && hungryLogCooldown == 0) {
+                logEvent(string("A barb is hungry - no food (") + racePlurals[clampRace(b.race)] + ")");
                 hungryLogCooldown = eventHungryCooldownTicks;
             }
         }
-        if (isHungry(b) && !isGentry(b)) hungryCommoners++;
+        if (isHungry(b) && !isGentry(b)) hungryCommoners[clampRace(b.race)]++;
     }
     // Pass 2 (R24-F1): eating, Gentry first. While a Commoner is hungry, Gentry leave gentryFoodReserve
     // so the Commoners are never shut out of the larder entirely.
     // R25-F1: a Glutton takes gluttonMealFood, but never digs into `keep` (callers guarantee food > keep, so bite >= 1)
     auto eat = [](barb& b, int keep) {
-        int bite = min(b.trait == traitGlutton ? gluttonMealFood : 1, food - keep);
+        raceStock& rs = stockOf(b);
+        int bite = min(b.trait == traitGlutton ? gluttonMealFood : 1, rs.food - keep);
         if (bite <= 0) return;   // R30-F5: no food taken = no meal, no heal
-        food -= bite;
+        rs.food -= bite;
         b.hunger = 0;
         b.slowTick = 0;
         b.starveTicks = 0;                                       // R30-F5
         b.health = min(barbMaxHealth, b.health + eatHealHp);
-        printf("BARB ATE (%s, %s %d) - Food: %d\n", isGentry(b) ? "Gentry" : "Commoner", b.name, bite, food);
+        printf("BARB ATE (%s, %s %d) - %s food: %d\n", isGentry(b) ? "Gentry" : "Commoner", b.name, bite, racePlurals[clampRace(b.race)], rs.food);
     };
-    int gentryKeep = hungryCommoners > 0 ? gentryFoodReserve : 0;
+    for (auto& b : barbs) {
+        int gentryKeep = hungryCommoners[clampRace(b.race)] > 0 ? gentryFoodReserve : 0;
+        if (isGentry(b) && isHungry(b) && stockOf(b).food > gentryKeep) eat(b, gentryKeep);
+    }
     for (auto& b : barbs)
-        if (isGentry(b) && isHungry(b) && food > gentryKeep) eat(b, gentryKeep);
-    for (auto& b : barbs)
-        if (!isGentry(b) && isHungry(b) && food > 0) eat(b, 0);
+        if (!isGentry(b) && isHungry(b) && stockOf(b).food > 0) eat(b, 0);
     // Pass 3 (R30-F5): whoever is still hungry after the meal goes on starving; damage only past the grace period.
     // Health is only lowered here; deaths are removed by starveDeathTick() at the end of the tick.
     for (auto& b : barbs) {
@@ -2353,17 +2394,21 @@ void traderTick(optional<trader>& tr) {
             tr.reset();
             return;
         }
-        int lots = min(stone / tradeStoneCost, tradeMaxLots + (hasStall ? stallExtraLots : 0));
+        // RACE-F1: the trader deals with the race holding the most stone (ties: lowest index) and only takes its stone
+        int tr_r = 0;
+        for (int r = 1; r < raceCount; r++) if (stock[r].stone > stock[tr_r].stone) tr_r = r;
+        raceStock& rs = stock[tr_r];
+        int lots = min(rs.stone / tradeStoneCost, tradeMaxLots + (hasStall ? stallExtraLots : 0));
         stallBonusLots = max(0, lots - tradeMaxLots);
-        stone -= lots * tradeStoneCost;
-        wood  += lots * tradeWoodGain;
+        rs.stone -= lots * tradeStoneCost;
+        rs.wood  += lots * tradeWoodGain;
         if (lots > 0 && stallBonusLots > 0)
-            snprintf(tradeMsg, sizeof(tradeMsg), "Traded: -%d stone +%d wood (stall +%d)", lots * tradeStoneCost, lots * tradeWoodGain, stallBonusLots);
-        else if (lots > 0) snprintf(tradeMsg, sizeof(tradeMsg), "Traded: -%d stone +%d wood", lots * tradeStoneCost, lots * tradeWoodGain);
+            snprintf(tradeMsg, sizeof(tradeMsg), "%s traded: -%d stone +%d wood (stall +%d)", racePlurals[tr_r], lots * tradeStoneCost, lots * tradeWoodGain, stallBonusLots);
+        else if (lots > 0) snprintf(tradeMsg, sizeof(tradeMsg), "%s traded: -%d stone +%d wood", racePlurals[tr_r], lots * tradeStoneCost, lots * tradeWoodGain);
         else          snprintf(tradeMsg, sizeof(tradeMsg), "Trader: no stone to buy");
         tradeMsgTimer = tradeMsgTicks;
         logEvent(tradeMsg);
-        printf("TRADE - %d stone for %d wood - stone: %d wood: %d\n", lots * tradeStoneCost, lots * tradeWoodGain, stone, wood);
+        printf("TRADE - %s, %d stone for %d wood - stone: %d wood: %d\n", racePlurals[tr_r], lots * tradeStoneCost, lots * tradeWoodGain, rs.stone, rs.wood);
         t.phase = trader::Trading;
         t.timer = 0;
     } else if (++t.stepTimer >= traderStepInterval) {
@@ -2604,7 +2649,10 @@ void drawTooltip(RenderWindow& window, const Font& font, const string& label, Ve
 
 // Everything the HUD shows, gathered once per frame in main
 struct hudValues {
-    int wood, stone, food, hungry, people, houses, hour, speed;
+    raceStock stock[raceCount];   // RACE-F1: per-race stockpiles (rows in drawStockPanel)
+    int members[raceCount];       // RACE-F1: living barbs per race; an empty race never shows red or announces
+    int campfireWood;             // RACE-F1: the shared campfire pool
+    int hungry, people, houses, hour, speed;
     int gentry, commoners;   // R24-F1: founders vs house-born
     bool night, paused, raining;
     const char* trader;      // Away / Arriving / Trading / Leaving
@@ -2615,7 +2663,7 @@ struct hudValues {
 };
 
 // Draws one table icon at pos (top-left, screen px), one quad per filled cell
-void drawIcon(RenderWindow& window, hudIconId id, Vector2f pos) {
+void drawIcon(RenderWindow& window, hudIconId id, Vector2f pos, float px = hudIconPx) {   // px: screen px per icon cell
     const iconDef& d = hudIcons[id];
     VertexArray va(PrimitiveType::Triangles);
     pos = snapPx(pos);
@@ -2623,18 +2671,26 @@ void drawIcon(RenderWindow& window, hudIconId id, Vector2f pos) {
         for (int x = 0; x < hudIconGrid && d.rows[y][x]; x++) {
             char ch = d.rows[y][x];
             if (ch < 'a' || ch > 'd') continue;
-            pushQuad(va, pos + Vector2f(x * hudIconPx, y * hudIconPx), Vector2f(hudIconPx, hudIconPx), d.key[ch - 'a']);
+            pushQuad(va, pos + Vector2f(x * px, y * px), Vector2f(px, px), d.key[ch - 'a']);
         }
     window.draw(va);
 }
 
+// RACE-F1: the one shortage test, shared by the HUD's red numbers and the shortage ticker line
+int stockValue(const raceStock& s, int need) { return need == needWood ? s.wood : need == needStone ? s.stone : s.food; }
+bool stockShort(const raceStock& s, int need) { return stockValue(s, need) < stockShortThreshold; }
+
 // The old full text block, now shown as a tooltip while hovering the strip
 string hudDetailText(const hudValues& v) {
     char buf[380];
-    snprintf(buf, sizeof(buf), "Settlement: %s\nWood: %d\nStone: %d\nFood: %d\nHungry: %d\nPopulation: %d (Gentry %d, Commoners %d)\nHouses: %d\nTime: %02d:00 (%s)\nSpeed: %dx%s\nWeather: %s\nTrader: %s%s%s",
-             v.era, v.wood, v.stone, v.food, v.hungry, v.people, v.gentry, v.commoners, v.houses, v.hour, v.night ? "Night" : "Day", v.speed, v.paused ? " PAUSED" : "",
+    snprintf(buf, sizeof(buf), "Settlement: %s\nHungry: %d\nPopulation: %d (Gentry %d, Commoners %d)\nHouses: %d\nTime: %02d:00 (%s)\nSpeed: %dx%s\nWeather: %s\nTrader: %s%s%s",
+             v.era, v.hungry, v.people, v.gentry, v.commoners, v.houses, v.hour, v.night ? "Night" : "Day", v.speed, v.paused ? " PAUSED" : "",
              v.raining ? "Rain" : "Clear", v.trader, v.tradeLine[0] ? "\n" : "", v.tradeLine);
     string s = buf;
+    s += "\nStockpiles (wood/stone/food):";   // RACE-F1
+    for (int r = 0; r < raceCount; r++)
+        s += string("\n  ") + racePlurals[r] + ": " + to_string(v.stock[r].wood) + " / " + to_string(v.stock[r].stone) + " / " + to_string(v.stock[r].food);
+    s += "\n  Campfire wood: " + to_string(v.campfireWood);
     s += "\nKnow-how:";
     for (int t = 0; t < techCount; t++)   // learned techs, or progress toward each
         s += string("\n  ") + techDefs[t].name + ": " + (v.learned[t] ? "learned"
@@ -2659,10 +2715,7 @@ FloatRect drawHud(RenderWindow& window, const Font& font, const hudValues& v) {
     snprintf(hour, sizeof(hour), "%02d:00", v.hour);
     snprintf(speed, sizeof(speed), "%dx", v.speed);
     struct cell { hudIconId icon; string text; Color color; };
-    vector<cell> cells = {
-        {iconWood,   to_string(v.wood),   pal.hudText},
-        {iconStone,  to_string(v.stone),  pal.hudText},
-        {iconFood,   to_string(v.food),   pal.hudText},
+    vector<cell> cells = {   // RACE-F1: wood/stone/food moved to the per-race stock panel under the strip
         {iconPeople, to_string(v.people), pal.hudText},
         {iconHouse,  to_string(v.houses), pal.hudText},
         {v.night ? iconMoon : iconSun, hour, pal.hudText},
@@ -2806,10 +2859,10 @@ struct campfire {int fuel = campfireStartFuel; bool lit = true;};
 // Keeps up to one wood of buffer: takes 1 wood only once the fuel drops to one wood's worth,
 // so with steady wood the fire stays at full strength and it fades over campfireTicksPerWood once wood runs out
 void campfireTick(campfire& f) {
-    if (f.fuel <= campfireTicksPerWood && wood > 0) {
-        wood--;
+    if (f.fuel <= campfireTicksPerWood && campfireWood > 0) {   // RACE-F1: only the shared pool, never a race's stock
+        campfireWood--;
         f.fuel += campfireTicksPerWood;
-        printf("CAMPFIRE FED - wood: %d\n", wood);
+        printf("CAMPFIRE FED - campfire wood: %d\n", campfireWood);
     }
     if (f.fuel > 0) f.fuel--;
     if (f.lit && f.fuel == 0) {
@@ -2875,10 +2928,97 @@ void drawLens(RenderWindow& window, VertexArray& va, const View& worldView, Lens
     if (va.getVertexCount() > 0) window.draw(va);
 }
 
+// RACE-F1: per-race stock rows, top-left just under the HUD strip. Skipped (empty rect) if a short/narrow window would
+// make it touch the inspect panel, minimap or ticker, like the lens legend.
+FloatRect drawStockPanel(RenderWindow& window, const Font& font, const hudValues& v,
+                         const FloatRect& inspectR, const FloatRect& mmR, const FloatRect& tickerR) {
+    window.setView(window.getDefaultView());
+    Text ref(font, "Ag", stockFontSize);   // shared row height/baseline
+    FloatRect rb = ref.getLocalBounds();
+    float iconSize = hudIconGrid * stockIconPx;
+    float rowH = max(rb.size.y, max(stockSwatchPx, iconSize));
+    float nameW = 0.0f, numW = Text(font, stockMinNumber, stockFontSize).getLocalBounds().size.x;
+    vector<Text> names, nums;
+    for (int r = 0; r < raceCount; r++) {
+        names.emplace_back(font, raceDefs[r].name, stockFontSize);
+        nameW = max(nameW, names.back().getLocalBounds().size.x);
+        for (int n = 0; n < needCount; n++) {
+            nums.emplace_back(font, to_string(stockValue(v.stock[r], n)), stockFontSize);
+            numW = max(numW, nums.back().getLocalBounds().size.x);   // one width for every number column, so columns line up
+        }
+    }
+    float cellW = iconSize + stockIconGap + numW;
+    float innerW = stockSwatchPx + stockSwatchGap + nameW + needCount * (stockCellGap + cellW);
+    Vector2f size(round(innerW + 2 * stockPad.x), round(raceCount * rowH + (raceCount - 1) * stockRowGap + 2 * stockPad.y));
+    Vector2f pos(round(stockMargin), round(hudBarHeight + stockMargin));
+    FloatRect box(pos, size);
+    auto near = [&](const FloatRect& o) {
+        if (o.size.x <= 0) return false;
+        FloatRect grown(o.position - Vector2f(stockMargin, stockMargin), o.size + Vector2f(2 * stockMargin, 2 * stockMargin));
+        return box.findIntersection(grown).has_value();
+    };
+    if (near(inspectR) || near(mmR) || near(tickerR)) return FloatRect();
+
+    RectangleShape panel(size);
+    panel.setPosition(pos);
+    panel.setFillColor(inspectPanelColor);
+    panel.setOutlineThickness(-1.0f);   // inward, so the panel stays exactly size
+    panel.setOutlineColor(inspectBorderColor);
+    window.draw(panel);
+
+    const hudIconId icons[needCount] = {iconWood, iconStone, iconFood};   // indexed like leaderNeed
+    RectangleShape sw({stockSwatchPx, stockSwatchPx});
+    sw.setOutlineThickness(-1.0f);
+    sw.setOutlineColor(lensSwatchRim);
+    for (int r = 0; r < raceCount; r++) {
+        float y = pos.y + stockPad.y + r * (rowH + stockRowGap);
+        float textY = round(y + (rowH - rb.size.y) / 2.0f - rb.position.y);
+        bool empty = v.members[r] <= 0;
+        float x = pos.x + stockPad.x;
+        sw.setFillColor(stockSwatchColors[r]);
+        sw.setPosition(Vector2f(x, round(y + (rowH - stockSwatchPx) / 2.0f)));
+        window.draw(sw);
+        x += stockSwatchPx + stockSwatchGap;
+        Text& nm = names[r];
+        nm.setFillColor(empty ? stockEmptyRaceColor : lensTextColor);
+        nm.setPosition(Vector2f(round(x - nm.getLocalBounds().position.x), textY));
+        window.draw(nm);
+        x += nameW;
+        for (int n = 0; n < needCount; n++) {
+            x += stockCellGap;
+            drawIcon(window, icons[n], Vector2f(x, round(y + (rowH - iconSize) / 2.0f)), stockIconPx);
+            Text& t = nums[r * needCount + n];
+            bool isShort = !empty && stockShort(v.stock[r], n);
+            t.setFillColor(empty ? stockEmptyRaceColor : isShort ? stockShortColor : lensTextColor);
+            t.setPosition(Vector2f(round(x + iconSize + stockIconGap - t.getLocalBounds().position.x), textY));
+            window.draw(t);
+            x += cellW;
+        }
+    }
+    return box;
+}
+
+// RACE-F1: one ticker line when a living race's wood, stone or food drops below stockShortThreshold (the HUD's red test);
+// the race's flag for that resource re-arms once the stock is back at or above the threshold. O(barbs + races) per tick.
+void stockShortageTick(const vector<barb>& barbs) {
+    int members[raceCount] = {};
+    for (auto& b : barbs) members[clampRace(b.race)]++;
+    for (int r = 0; r < raceCount; r++)
+        for (int n = 0; n < needCount; n++) {
+            bool isShort = members[r] > 0 && stockShort(stock[r], n);
+            if (!isShort) { stockAnnounced[r][n] = false; continue; }
+            if (stockAnnounced[r][n]) continue;
+            stockAnnounced[r][n] = true;
+            printf("SHORTAGE - %s low on %s (%d)\n", racePlurals[r], leaderNeedNames[n], stockValue(stock[r], n));
+            logEvent(string(racePlurals[r]) + " are short of " + leaderNeedNames[n], stockShortColor);
+        }
+}
+
 // UIO-F3: lens name + colour legend, top-left just under the HUD strip (the inspect panel is top-right, the minimap
 // bottom-right, the ticker bottom-left). Skipped if a short/narrow window would make it touch any of them.
+// RACE-F1: stacks just below the race stock panel (stockR) when that is shown.
 FloatRect drawLensLegend(RenderWindow& window, const Font& font, Lens lens,
-                         const FloatRect& inspectR, const FloatRect& mmR, const FloatRect& tickerR) {
+                         const FloatRect& inspectR, const FloatRect& mmR, const FloatRect& tickerR, const FloatRect& stockR) {
     if (lens == Lens::Off) return FloatRect();
     window.setView(window.getDefaultView());
     struct row { string label; Color swatch; };
@@ -2899,6 +3039,7 @@ FloatRect drawLensLegend(RenderWindow& window, const Font& font, Lens lens,
     int n = 1 + (int)rows.size();
     Vector2f size(round(innerW + 2 * lensPad.x), round(n * rowH + (n - 1) * lensRowGap + 2 * lensPad.y));
     Vector2f pos(round(lensMargin), round(hudBarHeight + lensMargin));
+    if (stockR.size.x > 0) pos.y = round(stockR.position.y + stockR.size.y + lensMargin);   // RACE-F1: under the stock panel
     FloatRect box(pos, size);
     auto near = [&](const FloatRect& o) {   // touching or within lensMargin of another panel
         if (o.size.x <= 0) return false;
@@ -3035,8 +3176,8 @@ void buildhouse(vector<barb>& barbs,vector<RectangleShape>& squares, vector<hous
         if (b.jobKind != jobNone) continue;   // buildshrine() / buildsmokehouse() / buildstall() / buildforge() / buildfield() own this barb
         if (b.chopping || (b.timer > 0 && !b.building)) continue;
         if (!b.movingbspot && !b.moving) {
-            if (!canclaim || wood < houseWoodCost) continue;
             if (b.race < 0 || b.race >= raceCount) continue;
+            if (!canclaim || !canAfford(stockOf(b), houseWoodCost, 0)) continue;   // RACE-F1: the builder's race pays
             int dx = quarterSpotD(gen), dy = quarterSpotD(gen);
             if (dx * dx + dy * dy > quarterHouseRadius * quarterHouseRadius) continue; // R30-F1: inside the own quarter's disc
             Vector2f qc = quarterCentre(b.race);
@@ -3046,10 +3187,10 @@ void buildhouse(vector<barb>& barbs,vector<RectangleShape>& squares, vector<hous
             if (!lakeClear(FloatRect(Vector2f(tx - 3.0f, ty - 3.0f), houseSlabSize))) continue;  // same footprint, no houses in the water
             if (!fieldsClear(fields, FloatRect(Vector2f(tx - 3.0f, ty - 3.0f), houseSlabSize))) continue; // nor on a wheat plot
             if (!roadClearOfFields(fields, qc, Vector2f(tx + 2.0f, ty + 2.0f))) continue; // FARM-F1: its road can't cross one
-            wood -= houseWoodCost;
+            raceStock& rs = stockOf(b);
             b.reservedwood = true;
-            b.reservedstone = stone >= houseStoneCost ? houseStoneCost : 0; // 0 stone -> plain house
-            stone -= b.reservedstone;
+            b.reservedstone = canAfford(rs, houseWoodCost, houseStoneCost) ? houseStoneCost : 0; // 0 stone -> plain house
+            spend(rs, houseWoodCost, b.reservedstone);
             b.targetx = tx;
             b.targety = ty;
             b.moving = true;
@@ -3062,8 +3203,8 @@ void buildhouse(vector<barb>& barbs,vector<RectangleShape>& squares, vector<hous
 
             if (dSq < 1.0f) {
                 if (!b.reservedwood || (int)houses.size() >= (int)barbs.size()) {
-                    if (b.reservedwood) wood += houseWoodCost;
-                    stone += b.reservedstone;
+                    if (b.reservedwood) stockOf(b).wood += houseWoodCost;   // RACE-F1: back to the builder's race
+                    stockOf(b).stone += b.reservedstone;
                     b.reservedwood = false;
                     b.reservedstone = 0;
                     b.moving = b.movingbspot = b.building = false;
@@ -3118,15 +3259,14 @@ void buildshrine(vector<barb>& barbs, vector<RectangleShape>& squares, const vec
     for (auto& b : barbs) if (b.jobKind == jobShrine) pending++;
     int planned = (int)shrines.size() + pending;
     bool canclaim = planned < maxShrines
-                 && (int)houses.size() >= (planned + 1) * shrineHousesPerShrine
-                 && stone >= shrineStoneCost + houseStoneCost;
+                 && (int)houses.size() >= (planned + 1) * shrineHousesPerShrine;   // RACE-F1: the stone check is per builder's race, below
     for (int i = 0; i < (int)squares.size() && i < (int)barbs.size(); i++) {
         auto& sq = squares[i];
         auto& b  = barbs[i];
         if (b.jobKind != jobNone && b.jobKind != jobShrine) continue; // buildsmokehouse() / buildstall() / buildforge() own this barb
         if (b.chopping || (b.timer > 0 && !b.building)) continue;
         if (!b.movingbspot && !b.moving) {
-            if (!canclaim) continue;
+            if (!canclaim || !canAfford(stockOf(b), 0, shrineStoneCost + houseStoneCost)) continue;
             uniform_real_distribution<float> ang(0.0f, 6.2831853f), rad(shrineMinRadius, shrineMaxRadius);
             bool found = false;
             int tx = 0, ty = 0;
@@ -3155,7 +3295,7 @@ void buildshrine(vector<barb>& barbs, vector<RectangleShape>& squares, const vec
             }
             canclaim = false;   // one claim attempt per tick; keep looping so builders already en route still progress
             if (!found) continue;
-            stone -= shrineStoneCost;
+            spend(stockOf(b), 0, shrineStoneCost);
             b.reservedstone = shrineStoneCost;
             b.jobKind = jobShrine;
             b.targetx = tx;
@@ -3169,7 +3309,7 @@ void buildshrine(vector<barb>& barbs, vector<RectangleShape>& squares, const vec
 
             if (dSq < 1.0f) {
                 if ((int)shrines.size() >= maxShrines) {   // cap reached while walking: refund
-                    stone += b.reservedstone;
+                    stockOf(b).stone += b.reservedstone;
                     b.reservedstone = 0;
                     b.jobKind = jobNone;
                     b.moving = b.movingbspot = b.building = false;
@@ -3236,7 +3376,7 @@ bool buildOneOff(vector<barb>& barbs, vector<RectangleShape>& squares, bool& cla
             b.targety = (int)stand.y;
             b.moving = true;
             b.movingbspot = true;
-            printf("%s CLAIMED - barb %d wood: %d stone: %d\n", name, b.id, wood, stone);
+            printf("%s CLAIMED - barb %d %s wood: %d stone: %d\n", name, b.id, racePlurals[clampRace(b.race)], stockOf(b).wood, stockOf(b).stone);
             return false;
         }
         if (b.jobKind != kind || !b.movingbspot) continue;
@@ -3268,13 +3408,13 @@ void buildsmokehouse(vector<barb>& barbs, vector<RectangleShape>& squares, const
     if (sh.boostTicks > 0) sh.boostTicks--;
     if (sh.built) return;
     bool done = buildOneOff(barbs, squares, sh.claimed, jobSmoke, smokehousePos + smokehouseStandOffset, "SMOKEHOUSE",
-        [&](const barb&) {
-            if ((int)houses.size() < smokehouseMinHouses || wood < smokehouseWoodCost
-                || stone < smokehouseStoneCost + houseStoneCost) return -1;
+        [&](const barb& b) {
+            if ((int)houses.size() < smokehouseMinHouses) return -1;
             if (!forgeClear(FloatRect(smokehousePos + smokehouseChimneyPos, Vector2f(smokehouseSize.x, smokehouseSize.y - smokehouseChimneyPos.y))))
                 return -1;   // fixed spots: only trips if the layout constants are moved onto the forge
-            wood -= smokehouseWoodCost;
-            stone -= smokehouseStoneCost;
+            raceStock& rs = stockOf(b);   // RACE-F1: the builder's race pays
+            if (!canAfford(rs, smokehouseWoodCost, smokehouseStoneCost + houseStoneCost)) return 0;
+            spend(rs, smokehouseWoodCost, smokehouseStoneCost);
             return 1;
         });
     if (!done) return;
@@ -3362,10 +3502,9 @@ void buildforge(vector<barb>& barbs, vector<RectangleShape>& squares, const vect
         [&](const barb& b) {
             int dwarfHouses = 0;
             for (auto& h : houses) if (h.race == raceDwarf) dwarfHouses++;
-            if (dwarfHouses < forgeMinDwarfHouses || wood < forgeWoodCost || stone < forgeStoneCost + houseStoneCost) return -1;
+            if (dwarfHouses < forgeMinDwarfHouses || !canAfford(stockOfRace(raceDwarf), forgeWoodCost, forgeStoneCost + houseStoneCost)) return -1;
             if (b.race != raceDwarf) return 0;
-            wood -= forgeWoodCost;
-            stone -= forgeStoneCost;
+            spend(stockOf(b), forgeWoodCost, forgeStoneCost);   // RACE-F1: dwarf stock only
             return 1;
         });
     if (!done) return;
@@ -3414,9 +3553,9 @@ void buildstorehouses(vector<barb>& barbs, vector<RectangleShape>& squares, cons
             [&](const barb& b) {
                 int raceHouses = 0;
                 for (auto& h : houses) if (h.race == r) raceHouses++;
-                if (raceHouses < storehouseMinRaceHouses || wood < storehouseWoodCost) return -1;
+                if (raceHouses < storehouseMinRaceHouses || !canAfford(stock[r], storehouseWoodCost, 0)) return -1;
                 if (b.race != r) return 0;
-                wood -= storehouseWoodCost;
+                spend(stock[r], storehouseWoodCost, 0);   // RACE-F1: the race's own wood
                 return 1;
             });
         if (done) {
@@ -3583,14 +3722,14 @@ void buildfield(vector<barb>& barbs, vector<RectangleShape>& squares, const vect
             plot& fp = fields[r][k];
             if (fp.built || (activeRace >= 0 && (r != activeRace || k != activeK))) continue;
             if (!fp.placed) {
-                if (!stores[r].built || raceHouses[r] < fieldMinHouses || wood < fieldWoodCost) continue;
+                if (!stores[r].built || raceHouses[r] < fieldMinHouses || !canAfford(stock[r], fieldWoodCost, 0)) continue;
                 if (!placeField(fp, r, barbs, houses, shrines, fields, k == 0 && !mills[r].placed)) continue;
             }
             bool done = buildOneOff(barbs, squares, fp.claimed, jobField, fieldWorkSpot(fp), "FIELD",
                 [&](const barb& b) {
-                    if (raceHouses[r] < fieldMinHouses || wood < fieldWoodCost) return -1;
+                    if (raceHouses[r] < fieldMinHouses || !canAfford(stock[r], fieldWoodCost, 0)) return -1;
                     if (b.race != r) return 0;   // only that race sows its plot
-                    wood -= fieldWoodCost;
+                    spend(stock[r], fieldWoodCost, 0);   // RACE-F1: the race's own wood
                     fp.sowerId = b.id;
                     return 1;
                 });
@@ -3628,10 +3767,9 @@ void buildmills(vector<barb>& barbs, vector<RectangleShape>& squares, const fiel
         if (m.built || !m.placed || !fields[r][0].built || (active >= 0 && r != active)) continue;
         bool done = buildOneOff(barbs, squares, m.claimed, jobMill, millWorkSpot(m), "MILL",
             [&](const barb& b) {
-                if (wood < millWoodCost || stone < millStoneCost + houseStoneCost) return -1;
+                if (!canAfford(stock[r], millWoodCost, millStoneCost + houseStoneCost)) return -1;
                 if (b.race != r) return 0;   // only that race builds its mill
-                wood -= millWoodCost;
-                stone -= millStoneCost;
+                spend(stock[r], millWoodCost, millStoneCost);   // RACE-F1: the race's own stock
                 m.builderId = b.id;
                 return 1;
             });
@@ -3668,10 +3806,10 @@ void craftspear(vector<barb>& barbs, vector<RectangleShape>& squares) {
     Vector2f stand = villageCenter + spearStandOffset;
     if (crafter < 0) {
         if ((spears + 1) * spearBarbsPerSpear > (int)barbs.size()) return;
-        if (wood < spearWoodCost || stone < spearStoneCost) return;
         for (auto& b : barbs) {
             if (b.hasSpear || b.jobKind != jobNone || b.deertargeting || b.chopping || b.timer > 0
                 || b.moving || b.movingbspot || b.building) continue;
+            if (!canAfford(stockOf(b), spearWoodCost, spearStoneCost)) continue;   // RACE-F1: the crafter's race pays
             b.jobKind = jobSpear;
             b.target = targetNone;
             b.targetx = (int)stand.x;
@@ -3700,13 +3838,13 @@ void craftspear(vector<barb>& barbs, vector<RectangleShape>& squares) {
     b.moving = false;   // standing at the fire: no walking bob while knapping
     if (workTick(b)) b.spearTimer++;
     if (b.spearTimer < spearCraftTicks) return;
-    if (wood < spearWoodCost || stone < spearStoneCost) {
-        printf("SPEAR ABANDONED - barb %d, no materials (wood: %d stone: %d)\n", b.id, wood, stone);
+    raceStock& rs = stockOf(b);
+    if (!canAfford(rs, spearWoodCost, spearStoneCost)) {
+        printf("SPEAR ABANDONED - barb %d, no materials (%s wood: %d stone: %d)\n", b.id, racePlurals[clampRace(b.race)], rs.wood, rs.stone);
         clearSpearCraft(b);
         return;
     }
-    wood -= spearWoodCost;
-    stone -= spearStoneCost;
+    spend(rs, spearWoodCost, spearStoneCost);
     b.hasSpear = true;
     clearSpearCraft(b);
     printf("---SPEAR MADE--- barb %d (%d wood, %d stone)\n", b.id, spearWoodCost, spearStoneCost);
@@ -4040,27 +4178,31 @@ void paveTick(vector<barb>& barbs, vector<RectangleShape>& squares) {
         b.building = true;
         if (workTick(b)) b.timer++;
         if (b.timer < paveTicks) return;
-        if (stone < paveStoneCost) {
+        raceStock& rs = stockOf(b);   // RACE-F1: the paver's race pays
+        if (!canAfford(rs, 0, paveStoneCost)) {
             printf("PAVING ABANDONED - barb %d, no stone\n", b.id);
             clearPave(b);
             return;
         }
         int c = paveClaim;
-        stone -= paveStoneCost;
+        spend(rs, 0, paveStoneCost);
         trailPaved[c] = 1;
         trailWear[c] = max(trailWear[c], trailRoadThreshold);   // locked at road tier (keeps roadStepBonus)
         trailSetTier(c);
         pavedCount++;
         paveDirty = true;
         printf("---CELL PAVED--- barb %d at %d,%d (%d/%d) stone: %d\n", b.id, (int)((c % trailGridN) * trailCellSize),
-               (int)((c / trailGridN) * trailCellSize), pavedCount, paveMaxCells, stone);
+               (int)((c / trailGridN) * trailCellSize), pavedCount, paveMaxCells, rs.stone);
         if (pavedCount == 1) logEvent("First cobbles laid by the fire");
         clearPave(b);
         return;
     }
     if (++scanTimer < paveScanTicks) return;
     scanTimer = 0;
-    if (currentEra < eraHamlet || pavedCount >= paveMaxCells || stone < paveStoneCost + houseStoneCost) return;
+    if (currentEra < eraHamlet || pavedCount >= paveMaxCells) return;
+    bool anyAfford = false;   // RACE-F1: some race must have the stone; the paver is picked from those races below
+    for (int r = 0; r < raceCount; r++) if (canAfford(stock[r], 0, paveStoneCost + houseStoneCost)) anyAfford = true;
+    if (!anyAfford) return;
     int best = -1;
     float bestDSq = paveRadius * paveRadius;
     Vector2f bestCentre;
@@ -4078,6 +4220,7 @@ void paveTick(vector<barb>& barbs, vector<RectangleShape>& squares) {
         auto& b = barbs[i];
         if (b.jobKind != jobNone || b.deertargeting || b.chopping || b.timer > 0
             || b.moving || b.movingbspot || b.building) continue;
+        if (!canAfford(stockOf(b), 0, paveStoneCost + houseStoneCost)) continue;
         Vector2f d = squares[i].getPosition() - bestCentre;
         float dSq = d.x * d.x + d.y * d.y;
         if (who < 0 || dSq < whoDSq) { who = i; whoDSq = dSq; }
@@ -4102,9 +4245,10 @@ councilDecree currentDecree = decreeNone;   // none until the first dawn
 councilDecree castBallot(barb& b) {
     float score[decreeCount] = {0.0f, 0.0f, 0.0f};
     score[raceLeans[b.race]] += councilRaceLean;
-    score[decreeTimber]  += councilNeedLean * clamp((float)(houseWoodCost - wood) / (float)houseWoodCost, 0.0f, 1.0f);
-    score[decreeStone]   += councilNeedLean * clamp((float)(houseStoneCost - stone) / (float)houseStoneCost, 0.0f, 1.0f);
-    score[decreeBerries] += (isHungry(b) || food <= 0) ? councilNeedLean : 0.0f;
+    const raceStock& rs = stockOf(b);   // RACE-F1: each voter weighs its own race's larder
+    score[decreeTimber]  += councilNeedLean * clamp((float)(houseWoodCost - rs.wood) / (float)houseWoodCost, 0.0f, 1.0f);
+    score[decreeStone]   += councilNeedLean * clamp((float)(houseStoneCost - rs.stone) / (float)houseStoneCost, 0.0f, 1.0f);
+    score[decreeBerries] += (isHungry(b) || rs.food <= 0) ? councilNeedLean : 0.0f;
     int best = raceLeans[b.race];               // ties go to the barb's own lean
     for (int d = 0; d < decreeCount; d++) if (score[d] > score[best]) best = d;
     b.lastVote = (councilDecree)best;           // shown overhead by drawBallots
@@ -4159,8 +4303,8 @@ void removeBarb(vector<barb>& barbs, vector<RectangleShape>& squares, int i,
     barb& b = barbs[i];
     if (b.deertargeting) clearHunt(b);
     dropCarry(b);
-    if (b.reservedwood) wood += houseWoodCost;   // house claim walked to but never built: back to the stock
-    stone += b.reservedstone;                    // house foundation or shrine stone
+    if (b.reservedwood) stockOf(b).wood += houseWoodCost;   // house claim walked to but never built: back to its race's stock
+    stockOf(b).stone += b.reservedstone;                    // house foundation or shrine stone
     b.reservedwood = false;
     b.reservedstone = 0;
     switch (b.jobKind) {                         // claims paid at claim time stay spent; the next builder pays again
@@ -4211,14 +4355,15 @@ void starveDeathTick(vector<barb>& barbs, vector<RectangleShape>& squares,
     }
 }
 
-// R30-F2: leader ranks the colony's wood/stone/food shortage (0..1 each); worst wins, none if nothing is short
+// R30-F2: leader ranks its race's wood/stone/food shortage (0..1 each); worst wins, none if nothing is short
 void rankRaceNeed(const vector<barb>& barbs, int r) {
     int members = 0;
     for (auto& b : barbs) members += b.race == r ? 1 : 0;
+    const raceStock& rs = stockOfRace(r);   // RACE-F1
     float s[needCount];
-    s[needWood]  = clamp((float)(houseWoodCost - wood) / (float)houseWoodCost, 0.0f, 1.0f);
-    s[needStone] = clamp((float)(houseStoneCost - stone) / (float)houseStoneCost, 0.0f, 1.0f);
-    s[needFood]  = clamp((float)(members - food) / (float)max(1, members), 0.0f, 1.0f);   // one food per member
+    s[needWood]  = clamp((float)(houseWoodCost - rs.wood) / (float)houseWoodCost, 0.0f, 1.0f);
+    s[needStone] = clamp((float)(houseStoneCost - rs.stone) / (float)houseStoneCost, 0.0f, 1.0f);
+    s[needFood]  = clamp((float)(members - rs.food) / (float)max(1, members), 0.0f, 1.0f);   // one food per member
     int best = needNone;
     for (int n = 0; n < needCount; n++) if (s[n] > 0.0f && (best == needNone || s[n] > s[best])) best = n;
     raceNeed[r] = (leaderNeed)best;
@@ -4298,17 +4443,22 @@ void barbspawner(vector<RectangleShape>& squares, vector<barb>& barbs, const vec
     for (int i = 0; i < (int)houseshapes.size() && i < (int)houses.size(); i++) {
         if (spawnChance(gen) != 0) continue;
         if ((int)barbs.size() >= cap) continue;
-        bool fed = (int)barbs.size() < birthFreeFloor || food >= max(0, (int)barbs.size());
+        // RACE-F1: a birth draws on the house race's larder, gated on that race's own head count
+        int r = clampRace(houses[i].race);
+        raceStock& rs = stock[r];
+        int members = 0;
+        for (auto& b : barbs) members += clampRace(b.race) == r ? 1 : 0;
+        bool fed = members < birthFreeFloor || rs.food >= members;
         if (!fed) {
             if (deferCooldown == 0) {
-                printf("Birth deferred: larder low (food %d, pop %d)\n", food, (int)barbs.size());
-                logEvent("Birth deferred: larder low");
+                printf("Birth deferred: %s larder low (food %d, %s %d)\n", racePlurals[r], rs.food, racePlurals[r], members);
+                logEvent(string("Birth deferred: ") + racePlurals[r] + " larder low");
                 deferCooldown = birthDeferCooldownTicks;
             }
             continue;
         }
-        int paid = min(food, birthFoodCost);
-        food = max(0, food - birthFoodCost);
+        int paid = min(rs.food, birthFoodCost);
+        spend(rs, 0, 0, birthFoodCost);
         Vector2f pos = houseshapes[i].getPosition();
         makeBarb(Vector2i((int)(pos.x + 4), (int)(pos.y + 13)), barbs, squares, rings, houses[i].id, houses[i].race);   // R28-F1: born into the house's clan
         logEvent(string(barbs.back().name) + " the " + traitOf(barbs.back()).name + " is born (pop " + to_string(barbs.size()) + ")" +
@@ -4399,7 +4549,7 @@ bool harvestTick(barb& b, Vector2f spot, Vector2f bpos, int ticks, int yield) {
     b.chopping = true;
     if (workTick(b)) b.timer++;
     if (b.timer < ticks) return false;
-    food += yield;
+    stockOf(b).food += yield;   // RACE-F1: the picker's race
     clearHarvest(b);
     return true;
 }
@@ -4454,21 +4604,29 @@ void haulTick(barb& b, RectangleShape& sq, storehouse (&stores)[raceCount]) {
         if (milled && (b.targetx != (int)ms.x || b.targety != (int)ms.y)) milled = false;   // stood at another depot instead
         storehouse* st = (!milled && b.race >= 0 && b.race < raceCount && stores[b.race].built) ? &stores[b.race] : nullptr;
         int yield = (milled ? millFoodYield : fieldFoodYield) + forageBonus(b);   // R25-F1: Forager +1
-        food += yield;
+        raceStock& rs = stockOf(b);   // RACE-F1: the reaper's race
+        rs.food += yield;
         if (milled) {
             mill& m = mills[b.race];
             m.turnFrames = millTurnFrames;
             m.puffFrames = millPuffFrames;
         } else if (st) { st->stored++; st->flashFrames = storehouseFlashFrames; }
-        printf("WHEAT %s at %s - food: %d\n", milled ? "MILLED" : "STORED", milled ? "mill" : st ? "storehouse" : "campfire", food);
-        logEvent(string(milled ? "Wheat milled (+" : "Wheat stored (+") + to_string(yield) + " food, " + to_string(food) + ")");
+        printf("WHEAT %s at %s - %s food: %d\n", milled ? "MILLED" : "STORED", milled ? "mill" : st ? "storehouse" : "campfire",
+               racePlurals[clampRace(b.race)], rs.food);
+        logEvent(string(milled ? "Wheat milled (+" : "Wheat stored (+") + to_string(yield) + " food, " + to_string(rs.food) + ")");
     } else {
         bool isWood = b.carryKind == carryWood;
-        (isWood ? wood : stone)++;
+        raceStock& rs = stockOf(b);   // RACE-F1: the hauler's race
+        bool tithe = false;           // every campfireTitheEvery-th wood deposit feeds the shared campfire pool instead
+        if (isWood && campfireWood < campfireWoodCap && ++campfireTitheCount >= campfireTitheEvery) {
+            campfireTitheCount = 0;
+            campfireWood++;
+            tithe = true;
+        } else (isWood ? rs.wood : rs.stone)++;
         storehouse* st = (b.race >= 0 && b.race < raceCount && stores[b.race].built) ? &stores[b.race] : nullptr;
         if (st) { st->stored++; st->flashFrames = storehouseFlashFrames; }
-        printf("%s DEPOSITED at %s - wood: %d stone: %d\n", isWood ? "WOOD" : "STONE",
-               st ? "storehouse" : "campfire", wood, stone);
+        printf("%s DEPOSITED at %s%s - %s wood: %d stone: %d, campfire wood: %d\n", isWood ? "WOOD" : "STONE",
+               st ? "storehouse" : "campfire", tithe ? " (campfire tithe)" : "", racePlurals[clampRace(b.race)], rs.wood, rs.stone, campfireWood);
     }
     b.carryKind = carryNone;
     b.target = targetNone;
@@ -4517,7 +4675,7 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
                                        [&](int k) { return !bushes[k].ripe || bushes[k].picking; }, &bushDSq);
             // need weighting: wood short of a house makes trees count as nearer. Scores are squared
             // distances divided by weight^2; not-found stays infinite so a boosted miss never wins.
-            float woodShort = clamp((float)(houseWoodCost - wood) / (float)houseWoodCost, 0.0f, 1.0f);
+            float woodShort = clamp((float)(houseWoodCost - stockOf(b).wood) / (float)houseWoodCost, 0.0f, 1.0f);   // RACE-F1: own race
             float treeW = clamp(1.0f + treeNeedBoost * woodShort, needWeightMin, needWeightMax);
             float rockW = clamp(1.0f, needWeightMin, needWeightMax);
             float bushW = clamp(1.0f, needWeightMin, needWeightMax);
@@ -4617,10 +4775,10 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
             b.chopping = true;
             if (workTick(b)) b.timer++;
             if (b.timer >= fishCatchTicks) {
-                food += fishFoodYield;
+                stockOf(b).food += fishFoodYield;   // RACE-F1: the angler's race
                 catchRings.push_back({fishPoseOf(b, sq).lineEnd + Vector2f(0.5f, 0.5f)});
                 quit();
-                printf("FISH CAUGHT - food: %d\n", food);
+                printf("FISH CAUGHT - %s food: %d\n", racePlurals[clampRace(b.race)], stockOf(b).food);
             }
             continue;
 	}
@@ -4658,7 +4816,7 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
                 bushes[i].ripe = bushes[i].picking = false;
                 bushes[i].regrow = 0;
                 bushshapes[i].setFillColor(bushBareColor);
-                printf("BERRIES PICKED - food: %d\n", food);
+                printf("BERRIES PICKED - %s food: %d\n", racePlurals[clampRace(b.race)], stockOf(b).food);
             }
             continue;
 	}
@@ -4685,7 +4843,7 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
                 swapRemove(stumps, i);
                 swapRemove(treeClaim, i);
                 startHaul(b, carryWood, stores);   // R29-F1: wood counts once it reaches the depot
-                printf("TREE DESTROYED - hauling wood (stock %d)\n", wood);
+                printf("TREE DESTROYED - hauling wood (stock %d)\n", stockOf(b).wood);
            		}
             break;
         	}
@@ -4712,7 +4870,7 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
 				swapRemove(octs, i);
 				swapRemove(rockClaim, i);
 				startHaul(b, carryStone, stores);  // R29-F1: stone counts once it reaches the depot
-				printf("ROCK DESTROYED - hauling stone (stock %d)\n", stone);
+				printf("ROCK DESTROYED - hauling stone (stock %d)\n", stockOf(b).stone);
 			}
 			break;
 		}
@@ -5037,6 +5195,11 @@ int main() {
     vector<CircleShape> bushshapes;
     spawnBushes(bushes, bushshapes, trees, tris, stumps);
     checkQuarters(trees, tris, stumps, rocks, octs, bushshapes);   // R30-F1: no quarter short of wood/stone
+    for (auto& s : stock) {   // RACE-F1: every race starts with at least startStock
+        s.wood = max(s.wood, startStock.wood);
+        s.stone = max(s.stone, startStock.stone);
+        s.food = max(s.food, startStock.food);
+    }
 
     VertexArray treeVerts(PrimitiveType::Triangles);
     VertexArray rainVerts(PrimitiveType::Triangles); // scratch buffer for drawRain, rebuilt every frame
@@ -5063,6 +5226,7 @@ int main() {
     FloatRect inspectRect;                // UIO-F2: last frame's inspect panel; empty when nothing is selected
     Lens lens = Lens::Off;                // UIO-F3: overlay lens, cycled with L
     FloatRect lensRect;                   // UIO-F3: last frame's lens legend; empty when off or hidden
+    FloatRect stockRect;                  // RACE-F1: last frame's race stock panel; empty when hidden
     VertexArray lensVerts(PrimitiveType::Triangles);
     VertexArray trailVerts(PrimitiveType::Triangles);
     VertexArray paveVerts(PrimitiveType::Triangles);   // cobbled cells (R20-F2), rebuilt only when a cell is paved
@@ -5105,6 +5269,7 @@ int main() {
                 // UIO-F2: then the inspect panel (consumes the press), then the world pick: barbs only, empty click deselects.
                 else if (inspectRect.size.x > 0 && inspectRect.contains(mui)) {}
                 else if (lensRect.size.x > 0 && lensRect.contains(mui)) {}   // UIO-F3: legend swallows clicks too
+                else if (stockRect.size.x > 0 && stockRect.contains(mui)) {} // RACE-F1: so does the stock panel
                 else if (mp->button == Mouse::Button::Left) {
                     if (!hudRect.contains(mui) && !tickerRect.contains(mui))
                         selectedBarbId = pickBarbAt(window.mapPixelToCoords(mp->position, worldView), tooltipPickRadius / zoom, barbs, squares);
@@ -5171,6 +5336,7 @@ int main() {
                 leaderWatchTick(barbs);   // R30-F2: leader death -> global weights + ticker line, same tick
                 councilTick(barbs);
                 starveDeathTick(barbs, squares, smoke, dwarfForge, stores, fields);   // R30-F5: last, once per tick
+                stockShortageTick(barbs);   // RACE-F1: after deaths, so an emptied race never announces
             }
         }
 
@@ -5307,7 +5473,8 @@ int main() {
             overHud = hudFontOk && window.hasFocus() && !panning && hudRect.contains(mscreen);
             bool overUi = overHud || tickerRect.contains(mscreen) || minimapRect(window).contains(mscreen)
                        || (inspectRect.size.x > 0 && inspectRect.contains(mscreen))
-                       || (lensRect.size.x > 0 && lensRect.contains(mscreen));
+                       || (lensRect.size.x > 0 && lensRect.contains(mscreen))
+                       || (stockRect.size.x > 0 && stockRect.contains(mscreen));
             if (window.hasFocus() && !panning && !overUi && mpx.x >= 0 && mpx.y >= 0 && mpx.x < (int)wsz.x && mpx.y < (int)wsz.y) {
                 Vector2f mworld = window.mapPixelToCoords(mpx, worldView);
                 hover = pickHover(mworld, tooltipPickRadius / zoom, barbs, squares, activeTrader, wolves, deers, deershape, rocks, octs, bushes, bushshapes, houses, houseshapes, fields);
@@ -5319,7 +5486,9 @@ int main() {
         if (hudFontOk) {
             window.setView(window.getDefaultView());
             hudValues hv{};
-            hv.wood = wood; hv.stone = stone; hv.food = food;
+            for (int r = 0; r < raceCount; r++) { hv.stock[r] = stock[r]; hv.members[r] = 0; }   // RACE-F1
+            for (auto& b : barbs) hv.members[clampRace(b.race)]++;
+            hv.campfireWood = campfireWood;
             for (auto& b : barbs) if (isHungry(b)) hv.hungry++;
             for (auto& b : barbs) (isGentry(b) ? hv.gentry : hv.commoners)++;
             hv.people = (int)barbs.size();
@@ -5339,7 +5508,8 @@ int main() {
             tickerRect = drawEvents(window, hudFont);
             drawMinimap(window, minimapVerts, worldView, barbs, squares, houses, houseshapes, stores);   // UIO-F1: after the HUD, under tooltips
             inspectRect = selIdx >= 0 ? drawInspectPanel(window, hudFont, barbs[selIdx], minimapRect(window)) : FloatRect();   // UIO-F2
-            lensRect = drawLensLegend(window, hudFont, lens, inspectRect, minimapRect(window), tickerRect);   // UIO-F3: after both, so it can dodge them
+            stockRect = drawStockPanel(window, hudFont, hv, inspectRect, minimapRect(window), tickerRect);   // RACE-F1: top-left, before the legend
+            lensRect = drawLensLegend(window, hudFont, lens, inspectRect, minimapRect(window), tickerRect, stockRect);   // UIO-F3: after both, so it can dodge them
             Vector2f mouse = window.mapPixelToCoords(Mouse::getPosition(window), window.getDefaultView());
             if (overHud) // full details hang just under the strip, beside the cursor
                 drawTooltip(window, hudFont, hudDetailText(hv),
