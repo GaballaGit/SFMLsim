@@ -515,6 +515,30 @@ const int storehouseFlashFrames = 18;      // deposit flash, ~0.3s (frames, froz
 const float storehouseFlashMix = 0.4f;     // peak blend toward white: subtle
 const Vector2f campfireDepotOffset(-10.0f, -2.0f); // fallback drop spot (hitbox top-left) just west of the stone ring
 
+// UI red (UIO-F1/F2/F3): one muted brick red for every "starving" mark in the UI (minimap dots, inspect panel, hunger lens)
+const Color uiStarvingRed = healthBarFillColor;
+// Minimap (UIO-F1): bottom-right 120px map of the whole 800x800 world, drawn after the HUD in the default (UI) view.
+// No trees: only barbs, houses and storehouses, plus the camera's viewport. Left-click recentres the camera.
+const float MM_SIZE = 120.0f;                 // outer size in screen px, border included
+const float MM_MARGIN = 8.0f;                 // gap from the window's bottom and right edges
+const float MM_BORDER_PX = 1.0f;              // drawn inward; the world maps onto the 118px inside it
+const Color MM_BG(10, 14, 12, 170);           // near-black like the HUD strip, translucent so the world shows through
+const Color MM_BORDER(70, 80, 66, 200);       // same dim green-grey as the HUD rim
+const float MM_BARB_PX = 1.0f;
+const float MM_HOUSE_PX = 2.0f;
+const float MM_STORE_PX = 3.0f;
+const Color MM_BARB_COLORS[raceCount] = {     // muted but lighter than the crate colours so 1px dots read on the backing
+    Color(214, 180, 136),                     // human: warm tan
+    Color(178, 174, 164),                     // dwarf: pale stone
+    Color(158, 198, 138),                     // elf: light sage
+};
+const Color MM_STORE_COLORS[raceCount] = {   // crates: the crate colours lifted ~30% toward white so they stand out from houses
+    Color(176, 151, 123),
+    Color(158, 155, 148),
+    Color(152, 170, 142),
+};
+const Color MM_VIEW_COLOR(235, 235, 225, 200); // thin near-white camera rect
+
 // Race quarters (R30-F1): each race's crate sits in its own quarter around the village, at least raceMinSeparation from
 // the others; that race's houses go within quarterHouseRadius of it. Trees/rocks are kept off each quarter like the
 // village clearing, lakes and bush clumps avoid it, and each quarter is topped up at startup if it is short of wood/stone.
@@ -2479,6 +2503,67 @@ FloatRect drawHud(RenderWindow& window, const Font& font, const hudValues& v) {
     return bar;
 }
 
+// UIO-F1: the minimap's outer rect in default-view (UI) coords; used for drawing, click tests and hover suppression
+FloatRect minimapRect(const RenderWindow& window) {
+    Vector2f ui = window.getDefaultView().getSize();
+    return FloatRect({floor(ui.x - MM_MARGIN - MM_SIZE), floor(ui.y - MM_MARGIN - MM_SIZE)}, {MM_SIZE, MM_SIZE});
+}
+float minimapScale() { return (MM_SIZE - 2 * MM_BORDER_PX) / worldSize; }   // screen px per world px
+Vector2f minimapToWorld(const RenderWindow& window, Vector2f ui) {
+    Vector2f inner = minimapRect(window).position + Vector2f(MM_BORDER_PX, MM_BORDER_PX);
+    return (ui - inner) / minimapScale();
+}
+
+void minimapDot(VertexArray& va, Vector2f inner, Vector2f world, float px, Color c) {
+    Vector2f p = inner + world * minimapScale() - Vector2f(px / 2, px / 2);
+    p = Vector2f(floor(p.x), floor(p.y));   // whole pixels so 1px dots stay crisp
+    float lo = MM_SIZE - 2 * MM_BORDER_PX - px;   // keep every dot inside the border
+    p.x = clamp(p.x, inner.x, inner.x + lo);
+    p.y = clamp(p.y, inner.y, inner.y + lo);
+    Vector2f q[4] = {p, p + Vector2f(px, 0.0f), p + Vector2f(px, px), p + Vector2f(0.0f, px)};
+    for (int k : {0, 1, 2, 0, 2, 3}) va.append(Vertex{q[k], c});
+}
+
+// UIO-F1: one pass each over houses, storehouses and barbs into a single vertex array (one draw); never touches trees.
+// Layers: backing + border, houses (2px, crate colour), storehouses (3px, lighter crate colour), barbs (1px race colour, red when starving),
+// then the camera viewport rect on top.
+void drawMinimap(RenderWindow& window, VertexArray& va, const View& worldView,
+                 const vector<barb>& barbs, const vector<RectangleShape>& squares,
+                 const vector<house>& houses, const vector<RectangleShape>& houseshapes,
+                 const storehouse (&stores)[raceCount]) {
+    window.setView(window.getDefaultView());
+    FloatRect r = minimapRect(window);
+    RectangleShape back(r.size);
+    back.setPosition(r.position);
+    back.setFillColor(MM_BG);
+    back.setOutlineThickness(-MM_BORDER_PX);
+    back.setOutlineColor(MM_BORDER);
+    window.draw(back);
+
+    Vector2f inner = r.position + Vector2f(MM_BORDER_PX, MM_BORDER_PX);
+    va.clear();
+    for (int i = 0; i < (int)houses.size(); i++)
+        minimapDot(va, inner, houseshapes[i].getPosition() + houseshapes[i].getSize() / 2.0f, MM_HOUSE_PX, storehouseColors[houses[i].race]);
+    for (int k = 0; k < raceCount; k++)
+        if (stores[k].built) minimapDot(va, inner, quarterCentre(k), MM_STORE_PX, MM_STORE_COLORS[k]);
+    for (int i = 0; i < (int)barbs.size(); i++)
+        minimapDot(va, inner, squares[i].getPosition() + squares[i].getSize() / 2.0f, MM_BARB_PX,
+                   isStarving(barbs[i]) ? uiStarvingRed : MM_BARB_COLORS[barbs[i].race]);
+    if (va.getVertexCount() > 0) window.draw(va);
+
+    float s = minimapScale(), innerSize = MM_SIZE - 2 * MM_BORDER_PX;
+    Vector2f tl = (worldView.getCenter() - worldView.getSize() / 2.0f) * s;
+    Vector2f br = (worldView.getCenter() + worldView.getSize() / 2.0f) * s;
+    tl = Vector2f(clamp(round(tl.x), 0.0f, innerSize), clamp(round(tl.y), 0.0f, innerSize));
+    br = Vector2f(clamp(round(br.x), 0.0f, innerSize), clamp(round(br.y), 0.0f, innerSize));
+    RectangleShape view(br - tl);
+    view.setPosition(inner + tl);
+    view.setFillColor(Color::Transparent);
+    view.setOutlineThickness(-1.0f);   // inward, so the rect never spills onto the border
+    view.setOutlineColor(MM_VIEW_COLOR);
+    window.draw(view);
+}
+
 void drawOverlay(RenderWindow& window, RectangleShape& shape, Color c) {
     shape.setFillColor(c);
     window.setView(window.getDefaultView());
@@ -4396,6 +4481,7 @@ int main() {
 
     VertexArray treeVerts(PrimitiveType::Triangles);
     VertexArray rainVerts(PrimitiveType::Triangles); // scratch buffer for drawRain, rebuilt every frame
+    VertexArray minimapVerts(PrimitiveType::Triangles); // UIO-F1: scratch buffer for drawMinimap's dots, rebuilt every frame
 
     RectangleShape dnc({800, 800});
 
@@ -4441,7 +4527,13 @@ int main() {
                 zoom = nz;
             }
             else if (const auto* mp = event->getIf<Event::MouseButtonPressed>()) {
-                if (mp->button == Mouse::Button::Middle) { panning = true; lastMouse = mp->position; }
+                // UIO-F1: minimap first; any press on it is consumed so nothing reaches the world.
+                // Left-click recentres; the per-frame clamp below keeps camCenter inside the map bounds.
+                Vector2f mui = window.mapPixelToCoords(mp->position, window.getDefaultView());
+                if (minimapRect(window).contains(mui)) {
+                    if (mp->button == Mouse::Button::Left) camCenter = minimapToWorld(window, mui);
+                }
+                else if (mp->button == Mouse::Button::Middle) { panning = true; lastMouse = mp->position; }
             }
             else if (const auto* mr = event->getIf<Event::MouseButtonReleased>()) {
                 if (mr->button == Mouse::Button::Middle) panning = false;
@@ -4626,7 +4718,7 @@ int main() {
             Vector2u wsz = window.getSize();
             Vector2f mscreen = window.mapPixelToCoords(mpx, window.getDefaultView());
             overHud = hudFontOk && window.hasFocus() && !panning && hudRect.contains(mscreen);
-            bool overUi = overHud || tickerRect.contains(mscreen);
+            bool overUi = overHud || tickerRect.contains(mscreen) || minimapRect(window).contains(mscreen);
             if (window.hasFocus() && !panning && !overUi && mpx.x >= 0 && mpx.y >= 0 && mpx.x < (int)wsz.x && mpx.y < (int)wsz.y) {
                 Vector2f mworld = window.mapPixelToCoords(mpx, worldView);
                 hover = pickHover(mworld, tooltipPickRadius / zoom, barbs, squares, activeTrader, wolves, deers, deershape, rocks, octs, bushes, bushshapes, houses, houseshapes);
@@ -4656,12 +4748,14 @@ int main() {
             for (int k = 0; k < techCount; k++) { hv.learned[k] = know.learned[k]; hv.pulse[k] = know.pulseFrames[k]; }
             hudRect = drawHud(window, hudFont, hv);
             tickerRect = drawEvents(window, hudFont);
+            drawMinimap(window, minimapVerts, worldView, barbs, squares, houses, houseshapes, stores);   // UIO-F1: after the HUD, under tooltips
             Vector2f mouse = window.mapPixelToCoords(Mouse::getPosition(window), window.getDefaultView());
             if (overHud) // full details hang just under the strip, beside the cursor
                 drawTooltip(window, hudFont, hudDetailText(hv),
                             Vector2f(mouse.x, hudRect.position.y + hudRect.size.y + tooltipEdgeMargin - tooltipOffset.y), hudRect, tickerRect);
             else if (hover) drawTooltip(window, hudFont, hover->label, mouse, hudRect, tickerRect);
         }
+        else drawMinimap(window, minimapVerts, worldView, barbs, squares, houses, houseshapes, stores);   // no font: still show the map
         eventTick();
         window.display();
         frameCount++;
