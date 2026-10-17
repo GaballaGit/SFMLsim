@@ -554,6 +554,33 @@ const Color inspectHealthFill(118, 172, 96);      // muted leaf green, distinct 
 const float selectRingRadius = 4.5f;          // world px around the barb's centre: clears the 2x4 body and 2px hats
 const float selectRingPx = 1.0f;              // screen px (scaled by zoom), thin like the hover outline
 const Color selectRingColor(240, 210, 90, 230);   // tooltip-outline yellow
+// Overlay lenses (UIO-F3): L cycles Off -> Hunger -> Race. Soft discs on the ground layer, under barbs and buildings;
+// only barbs, houses and storehouses are looped (never trees), culled to the camera. Legend panel top-left under the HUD.
+enum class Lens { Off, Hunger, Race };
+const char* const lensNames[] = {"Off", "Hunger", "Race"};
+const uint8_t lensCentreAlpha = 60;           // low-alpha tint at the disc centre...
+const uint8_t lensRimAlpha = 18;              // ...fading toward the rim so the ground still reads
+const int lensDiscSegments = 16;
+const float lensBarbRadius = 5.0f;            // world px: just past the 2-3px barb bodies and hats
+const float lensHouseRadius = 9.0f;           // around the 4px house plus its roof
+const float lensStoreRadius = 12.0f;          // around the 10px crate
+const Color lensFedColor(118, 186, 96);       // muted leaf green: just ate
+const Color lensHungryColor(214, 170, 84);    // muted ochre: at the hunger threshold
+// starving end of the gradient is uiStarvingRed (same red as the minimap and inspect panel)
+const Color lensRaceColors[raceCount] = {     // muted but distinct hues so quarters separate at a glance
+    Color(222, 150, 84),                      // human: amber
+    Color(140, 156, 214),                     // dwarf: steel blue
+    Color(120, 214, 196),                     // elf: pale teal (not grass green, so it reads on the background)
+};
+const float lensMargin = 8.0f;                // legend gap from the left edge and below the HUD strip
+const Vector2f lensPad(7.0f, 5.0f);
+const float lensRowGap = 3.0f;
+const float lensSwatchPx = 8.0f;              // legend colour square
+const float lensSwatchGap = 5.0f;             // swatch -> label
+const unsigned int lensFontSize = 12;         // same as the inspect panel and tooltips
+const Color lensTitleColor(240, 232, 205);    // inspect-name cream
+const Color lensTextColor(205, 200, 180);     // ticker cream
+const Color lensSwatchRim(20, 24, 20, 200);   // dark 1px rim so pale swatches don't bleed into the backing
 
 // Race quarters (R30-F1): each race's crate sits in its own quarter around the village, at least raceMinSeparation from
 // the others; that race's houses go within quarterHouseRadius of it. Trees/rocks are kept off each quarter like the
@@ -2690,6 +2717,109 @@ Color lerpColor(Color a, Color b, float t) {
     return Color((uint8_t)(a.r + (b.r - a.r) * t), (uint8_t)(a.g + (b.g - a.g) * t), (uint8_t)(a.b + (b.b - a.b) * t));
 }
 
+// UIO-F3: hunger gradient fed green -> ochre at the threshold -> uiStarvingRed once starving (over the grace period)
+Color lensHungerColor(const barb& b) {
+    if (isStarving(b)) return uiStarvingRed;
+    if (!isHungry(b)) return lerpColor(lensFedColor, lensHungryColor, clamp((float)b.hunger / max(1, hungerThresholdOf(b)), 0.0f, 1.0f));
+    return lerpColor(lensHungryColor, uiStarvingRed, clamp((float)b.starveTicks / starveGraceTicks, 0.0f, 1.0f));
+}
+
+// Soft disc as a triangle fan: lensCentreAlpha at the centre fading to lensRimAlpha at the rim. Skipped when off camera.
+void appendLensDisc(VertexArray& va, const FloatRect& cam, Vector2f c, float r, Color col) {
+    if (c.x + r < cam.position.x || c.x - r > cam.position.x + cam.size.x
+     || c.y + r < cam.position.y || c.y - r > cam.position.y + cam.size.y) return;
+    Color in = col, out = col;
+    in.a = lensCentreAlpha;
+    out.a = lensRimAlpha;
+    for (int s = 0; s < lensDiscSegments; s++) {
+        float a0 = 2.0f * 3.14159265f * s / lensDiscSegments, a1 = 2.0f * 3.14159265f * (s + 1) / lensDiscSegments;
+        va.append(Vertex{c, in});
+        va.append(Vertex{c + Vector2f(cos(a0), sin(a0)) * r, out});
+        va.append(Vertex{c + Vector2f(cos(a1), sin(a1)) * r, out});
+    }
+}
+
+// UIO-F3: ground-layer lens tints, drawn in the world view before the house slabs, so barbs and buildings sit on top.
+// Loops only barbs (Hunger) or houses + built storehouses (Race); never trees. One draw call.
+void drawLens(RenderWindow& window, VertexArray& va, const View& worldView, Lens lens,
+              const vector<barb>& barbs, const vector<RectangleShape>& squares,
+              const vector<house>& houses, const vector<RectangleShape>& houseshapes,
+              const storehouse (&stores)[raceCount]) {
+    if (lens == Lens::Off) return;
+    window.setView(worldView);
+    FloatRect cam(worldView.getCenter() - worldView.getSize() / 2.0f, worldView.getSize());
+    va.clear();
+    if (lens == Lens::Hunger) {
+        for (int i = 0; i < (int)barbs.size() && i < (int)squares.size(); i++)
+            appendLensDisc(va, cam, squares[i].getPosition() + squares[i].getSize() / 2.0f, lensBarbRadius, lensHungerColor(barbs[i]));
+    } else {
+        for (int i = 0; i < (int)houses.size() && i < (int)houseshapes.size(); i++)
+            appendLensDisc(va, cam, houseshapes[i].getPosition() + houseshapes[i].getSize() / 2.0f, lensHouseRadius, lensRaceColors[houses[i].race]);
+        for (int k = 0; k < raceCount; k++)
+            if (stores[k].built) appendLensDisc(va, cam, quarterCentre(k), lensStoreRadius, lensRaceColors[k]);
+    }
+    if (va.getVertexCount() > 0) window.draw(va);
+}
+
+// UIO-F3: lens name + colour legend, top-left just under the HUD strip (the inspect panel is top-right, the minimap
+// bottom-right, the ticker bottom-left). Skipped if a short/narrow window would make it touch any of them.
+FloatRect drawLensLegend(RenderWindow& window, const Font& font, Lens lens,
+                         const FloatRect& inspectR, const FloatRect& mmR, const FloatRect& tickerR) {
+    if (lens == Lens::Off) return FloatRect();
+    window.setView(window.getDefaultView());
+    struct row { string label; Color swatch; };
+    vector<row> rows;
+    if (lens == Lens::Hunger) rows = {{"Fed", lensFedColor}, {"Hungry", lensHungryColor}, {"Starving", uiStarvingRed}};
+    else for (int k = 0; k < raceCount; k++) rows.push_back({raceDefs[k].name, lensRaceColors[k]});
+
+    Text title(font, string("Lens: ") + lensNames[(int)lens] + "  [L]", lensFontSize);
+    Text ref(font, "Ag", lensFontSize);   // shared row height/baseline, like the inspect panel
+    FloatRect rb = ref.getLocalBounds();
+    float rowH = max(rb.size.y, lensSwatchPx);
+    float innerW = title.getLocalBounds().size.x;
+    vector<Text> labels;
+    for (auto& r : rows) {
+        labels.emplace_back(font, r.label, lensFontSize);
+        innerW = max(innerW, lensSwatchPx + lensSwatchGap + labels.back().getLocalBounds().size.x);
+    }
+    int n = 1 + (int)rows.size();
+    Vector2f size(round(innerW + 2 * lensPad.x), round(n * rowH + (n - 1) * lensRowGap + 2 * lensPad.y));
+    Vector2f pos(round(lensMargin), round(hudBarHeight + lensMargin));
+    FloatRect box(pos, size);
+    auto near = [&](const FloatRect& o) {   // touching or within lensMargin of another panel
+        if (o.size.x <= 0) return false;
+        FloatRect grown(o.position - Vector2f(lensMargin, lensMargin), o.size + Vector2f(2 * lensMargin, 2 * lensMargin));
+        return box.findIntersection(grown).has_value();
+    };
+    if (near(inspectR) || near(mmR) || near(tickerR)) return FloatRect();
+
+    RectangleShape panel(size);
+    panel.setPosition(pos);
+    panel.setFillColor(inspectPanelColor);
+    panel.setOutlineThickness(-1.0f);   // inward, so the panel stays exactly size
+    panel.setOutlineColor(inspectBorderColor);
+    window.draw(panel);
+
+    auto rowY = [&](int r) { return pos.y + lensPad.y + r * (rowH + lensRowGap); };
+    auto put = [&](Text& t, float tx, int r, Color c) {
+        t.setFillColor(c);
+        t.setPosition(Vector2f(round(tx - t.getLocalBounds().position.x), round(rowY(r) + (rowH - rb.size.y) / 2.0f - rb.position.y)));
+        window.draw(t);
+    };
+    float x = pos.x + lensPad.x;
+    put(title, x, 0, lensTitleColor);
+    RectangleShape sw({lensSwatchPx, lensSwatchPx});
+    sw.setOutlineThickness(-1.0f);
+    sw.setOutlineColor(lensSwatchRim);
+    for (int i = 0; i < (int)rows.size(); i++) {
+        sw.setFillColor(rows[i].swatch);   // full colour here: the world discs are the same hue at low alpha
+        sw.setPosition(Vector2f(x, round(rowY(i + 1) + (rowH - lensSwatchPx) / 2.0f)));
+        window.draw(sw);
+        put(labels[i], x + lensSwatchPx + lensSwatchGap, i + 1, lensTextColor);
+    }
+    return box;
+}
+
 void drawCampfire(RenderWindow& window, const campfire& f, int frame) {
     CircleShape ring(campfireStoneRadius);
     ring.setOrigin({campfireStoneRadius, campfireStoneRadius});
@@ -4592,6 +4722,9 @@ int main() {
     FloatRect hudRect;                    // last frame's HUD strip, same use
     int selectedBarbId = -1;              // UIO-F2: inspected barb (stable id, never an index); -1 = none
     FloatRect inspectRect;                // UIO-F2: last frame's inspect panel; empty when nothing is selected
+    Lens lens = Lens::Off;                // UIO-F3: overlay lens, cycled with L
+    FloatRect lensRect;                   // UIO-F3: last frame's lens legend; empty when off or hidden
+    VertexArray lensVerts(PrimitiveType::Triangles);
     VertexArray trailVerts(PrimitiveType::Triangles);
     VertexArray paveVerts(PrimitiveType::Triangles);   // cobbled cells (R20-F2), rebuilt only when a cell is paved
     vector<bird> birds;
@@ -4610,6 +4743,10 @@ int main() {
                 else if (kp->code == Keyboard::Key::Num2) simSpeed = 2;
                 else if (kp->code == Keyboard::Key::Num3) simSpeed = 4;
                 else if (kp->code == Keyboard::Key::Escape) selectedBarbId = -1;   // UIO-F2: deselect
+                else if (kp->code == Keyboard::Key::L) {   // UIO-F3: Off -> Hunger -> Race -> Off
+                    lens = lens == Lens::Off ? Lens::Hunger : lens == Lens::Hunger ? Lens::Race : Lens::Off;
+                    printf("Lens: %s\n", lensNames[(int)lens]);
+                }
             }
             else if (const auto* ms = event->getIf<Event::MouseWheelScrolled>()) {
                 float nz = clamp(zoom * (ms->delta > 0 ? zoomStep : 1.0f / zoomStep), minZoom, maxZoom);
@@ -4628,6 +4765,7 @@ int main() {
                 }
                 // UIO-F2: then the inspect panel (consumes the press), then the world pick: barbs only, empty click deselects.
                 else if (inspectRect.size.x > 0 && inspectRect.contains(mui)) {}
+                else if (lensRect.size.x > 0 && lensRect.contains(mui)) {}   // UIO-F3: legend swallows clicks too
                 else if (mp->button == Mouse::Button::Left) {
                     if (!hudRect.contains(mui) && !tickerRect.contains(mui))
                         selectedBarbId = pickBarbAt(window.mapPixelToCoords(mp->position, worldView), tooltipPickRadius / zoom, barbs, squares);
@@ -4732,7 +4870,8 @@ int main() {
         drawPaving(window, paveVerts);   // over the trail tint, under everything else
         drawQuarters(window, stores, zoom);   // R30-F1: ground marks, under lakes, houses and crates
         drawLakes(window);
-	
+        drawLens(window, lensVerts, worldView, lens, barbs, squares, houses, houseshapes, stores);   // UIO-F3: under rocks, buildings and barbs
+
 	for (auto& oct : octs)
 		window.draw(rockDrawShape(oct));
 
@@ -4823,7 +4962,8 @@ int main() {
             Vector2f mscreen = window.mapPixelToCoords(mpx, window.getDefaultView());
             overHud = hudFontOk && window.hasFocus() && !panning && hudRect.contains(mscreen);
             bool overUi = overHud || tickerRect.contains(mscreen) || minimapRect(window).contains(mscreen)
-                       || (inspectRect.size.x > 0 && inspectRect.contains(mscreen));
+                       || (inspectRect.size.x > 0 && inspectRect.contains(mscreen))
+                       || (lensRect.size.x > 0 && lensRect.contains(mscreen));
             if (window.hasFocus() && !panning && !overUi && mpx.x >= 0 && mpx.y >= 0 && mpx.x < (int)wsz.x && mpx.y < (int)wsz.y) {
                 Vector2f mworld = window.mapPixelToCoords(mpx, worldView);
                 hover = pickHover(mworld, tooltipPickRadius / zoom, barbs, squares, activeTrader, wolves, deers, deershape, rocks, octs, bushes, bushshapes, houses, houseshapes);
@@ -4855,6 +4995,7 @@ int main() {
             tickerRect = drawEvents(window, hudFont);
             drawMinimap(window, minimapVerts, worldView, barbs, squares, houses, houseshapes, stores);   // UIO-F1: after the HUD, under tooltips
             inspectRect = selIdx >= 0 ? drawInspectPanel(window, hudFont, barbs[selIdx], minimapRect(window)) : FloatRect();   // UIO-F2
+            lensRect = drawLensLegend(window, hudFont, lens, inspectRect, minimapRect(window), tickerRect);   // UIO-F3: after both, so it can dodge them
             Vector2f mouse = window.mapPixelToCoords(Mouse::getPosition(window), window.getDefaultView());
             if (overHud) // full details hang just under the strip, beside the cursor
                 drawTooltip(window, hudFont, hudDetailText(hv),
