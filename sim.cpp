@@ -538,6 +538,22 @@ const Color MM_STORE_COLORS[raceCount] = {   // crates: the crate colours lifted
     Color(152, 170, 142),
 };
 const Color MM_VIEW_COLOR(235, 235, 225, 200); // thin near-white camera rect
+// Inspect panel (UIO-F2): left-click a barb to select it; compact panel top-right under the HUD strip, ring on the barb.
+const float inspectMargin = 8.0f;             // gap from the right edge and below the HUD strip (same as MM_MARGIN)
+const Vector2f inspectPad(7.0f, 5.0f);
+const float inspectMinWidth = 120.0f;         // panel never narrower than this, so short names don't make a sliver
+const float inspectRowGap = 3.0f;             // vertical gap between rows
+const float inspectLabelGap = 6.0f;           // "Hunger"/"Health" label -> bar
+const unsigned int inspectFontSize = 12;      // same size as the tooltips
+const Color inspectPanelColor(10, 14, 12, 170);   // same translucent near-black backing as the minimap
+const Color inspectBorderColor(70, 80, 66, 200);  // same dim green-grey rim as the minimap
+const Color inspectNameColor(240, 232, 205);      // name a touch brighter than the body lines
+const Color inspectTextColor(205, 200, 180);      // ticker cream
+const Color inspectHungerFill(204, 168, 92);      // muted ochre while fed; uiStarvingRed once hungry
+const Color inspectHealthFill(118, 172, 96);      // muted leaf green, distinct from the red
+const float selectRingRadius = 4.5f;          // world px around the barb's centre: clears the 2x4 body and 2px hats
+const float selectRingPx = 1.0f;              // screen px (scaled by zoom), thin like the hover outline
+const Color selectRingColor(240, 210, 90, 230);   // tooltip-outline yellow
 
 // Race quarters (R30-F1): each race's crate sits in its own quarter around the village, at least raceMinSeparation from
 // the others; that race's houses go within quarterHouseRadius of it. Trees/rocks are kept off each quarter like the
@@ -2284,6 +2300,80 @@ optional<hoverHit> pickHover(Vector2f p, float radius, const vector<barb>& barbs
             return h;
         }
     return nullopt;
+}
+
+// UIO-F2: click pick, barbs only; nearest barb within radius (world px). Returns its id, or -1 for an empty click.
+int pickBarbAt(Vector2f p, float radius, const vector<barb>& barbs, const vector<RectangleShape>& squares) {
+    float bestSq = radius * radius;
+    int best = -1;
+    for (int i = 0; i < (int)squares.size() && i < (int)barbs.size(); i++) {
+        float dSq = rectDistSq(squares[i].getGlobalBounds(), p);
+        if (dSq <= bestSq) { bestSq = dSq; best = barbs[i].id; }
+    }
+    return best;
+}
+
+// UIO-F2: thin ring around the selected barb, drawn above the overlays (like the hover outline) so it reads at night
+void drawSelectRing(RenderWindow& window, const View& worldView, const RectangleShape& square, float zoom) {
+    window.setView(worldView);
+    CircleShape ring(selectRingRadius, 24);
+    ring.setOrigin({selectRingRadius, selectRingRadius});
+    ring.setPosition(square.getPosition() + square.getSize() / 2.0f);
+    ring.setFillColor(Color::Transparent);
+    ring.setOutlineThickness(selectRingPx / zoom);
+    ring.setOutlineColor(selectRingColor);
+    window.draw(ring);
+}
+
+// UIO-F2: compact inspect panel, top-right just under the HUD strip and always above the minimap.
+// Rows: name, race, job (red "Starving" when hungry), then Hunger and Health bars via drawBar. Returns the panel rect for clicks/hover.
+FloatRect drawInspectPanel(RenderWindow& window, const Font& font, const barb& b, const FloatRect& mmRect) {
+    window.setView(window.getDefaultView());
+    Vector2f win = window.getDefaultView().getSize();
+    bool hungry = isHungry(b);   // read once: drives both the job line and the hunger bar colour
+    Text name(font, b.name, inspectFontSize);
+    Text race(font, string("Race: ") + raceOf(b).name, inspectFontSize);
+    Text job(font, hungry ? string("Starving") : string("Job: ") + barbTaskName(b), inspectFontSize);
+    Text hungerL(font, "Hunger", inspectFontSize);
+    Text healthL(font, "Health", inspectFontSize);
+    Text ref(font, "Ag", inspectFontSize);   // one ascender+descender reference so every row shares a baseline and height
+    FloatRect rb = ref.getLocalBounds();
+    float rowH = max(rb.size.y, barSize.y + 2 * barFramePx);
+    float labelW = max(hungerL.getLocalBounds().size.x, healthL.getLocalBounds().size.x);
+    float barRowW = labelW + inspectLabelGap + barSize.x + 2 * barFramePx;
+    float innerW = max({name.getLocalBounds().size.x, race.getLocalBounds().size.x, job.getLocalBounds().size.x, barRowW,
+                        inspectMinWidth - 2 * inspectPad.x});
+    const int rows = 5;
+    Vector2f size(round(innerW + 2 * inspectPad.x), round(rows * rowH + (rows - 1) * inspectRowGap + 2 * inspectPad.y));
+    Vector2f pos(round(win.x - inspectMargin - size.x), round(hudBarHeight + inspectMargin));
+    if (mmRect.size.x > 0 && pos.y + size.y > mmRect.position.y - inspectMargin) return FloatRect();   // window too short: never cover the minimap
+
+    RectangleShape panel(size);
+    panel.setPosition(pos);
+    panel.setFillColor(inspectPanelColor);
+    panel.setOutlineThickness(-1.0f);   // inward, so the panel stays exactly size
+    panel.setOutlineColor(inspectBorderColor);
+    window.draw(panel);
+
+    float x = pos.x + inspectPad.x;
+    auto rowY = [&](int r) { return pos.y + inspectPad.y + r * (rowH + inspectRowGap); };
+    auto put = [&](Text& t, float tx, int r, Color c) {
+        t.setFillColor(c);
+        t.setPosition(Vector2f(round(tx - t.getLocalBounds().position.x), round(rowY(r) - rb.position.y)));
+        window.draw(t);
+    };
+    put(name, x, 0, inspectNameColor);
+    put(race, x, 1, inspectTextColor);
+    put(job, x, 2, hungry ? uiStarvingRed : inspectTextColor);
+    put(hungerL, x, 3, inspectTextColor);
+    put(healthL, x, 4, inspectTextColor);
+    // bars right-aligned in the panel, vertically centred on their label rows; pos passed to drawBar is the fill's top-left
+    float barX = pos.x + size.x - inspectPad.x - barFramePx - barSize.x;
+    float barDy = (rowH - barSize.y) / 2.0f;
+    float hungerFrac = (float)b.hunger / max(1, hungerThresholdOf(b));
+    drawBar(window, Vector2f(barX, rowY(3) + barDy), hungerFrac, hungry ? uiStarvingRed : inspectHungerFill);
+    drawBar(window, Vector2f(barX, rowY(4) + barDy), (float)b.health / barbMaxHealth, inspectHealthFill);
+    return FloatRect(pos, size);
 }
 
 // Hover-only household marks, drawn after the overlays like the hover outline
@@ -4500,6 +4590,8 @@ int main() {
     optional<trader> activeTrader;
     FloatRect tickerRect;                 // last frame's ticker strip, used to suppress hover over it
     FloatRect hudRect;                    // last frame's HUD strip, same use
+    int selectedBarbId = -1;              // UIO-F2: inspected barb (stable id, never an index); -1 = none
+    FloatRect inspectRect;                // UIO-F2: last frame's inspect panel; empty when nothing is selected
     VertexArray trailVerts(PrimitiveType::Triangles);
     VertexArray paveVerts(PrimitiveType::Triangles);   // cobbled cells (R20-F2), rebuilt only when a cell is paved
     vector<bird> birds;
@@ -4517,6 +4609,7 @@ int main() {
                 else if (kp->code == Keyboard::Key::Num1) simSpeed = 1;
                 else if (kp->code == Keyboard::Key::Num2) simSpeed = 2;
                 else if (kp->code == Keyboard::Key::Num3) simSpeed = 4;
+                else if (kp->code == Keyboard::Key::Escape) selectedBarbId = -1;   // UIO-F2: deselect
             }
             else if (const auto* ms = event->getIf<Event::MouseWheelScrolled>()) {
                 float nz = clamp(zoom * (ms->delta > 0 ? zoomStep : 1.0f / zoomStep), minZoom, maxZoom);
@@ -4532,6 +4625,12 @@ int main() {
                 Vector2f mui = window.mapPixelToCoords(mp->position, window.getDefaultView());
                 if (minimapRect(window).contains(mui)) {
                     if (mp->button == Mouse::Button::Left) camCenter = minimapToWorld(window, mui);
+                }
+                // UIO-F2: then the inspect panel (consumes the press), then the world pick: barbs only, empty click deselects.
+                else if (inspectRect.size.x > 0 && inspectRect.contains(mui)) {}
+                else if (mp->button == Mouse::Button::Left) {
+                    if (!hudRect.contains(mui) && !tickerRect.contains(mui))
+                        selectedBarbId = pickBarbAt(window.mapPixelToCoords(mp->position, worldView), tooltipPickRadius / zoom, barbs, squares);
                 }
                 else if (mp->button == Mouse::Button::Middle) { panning = true; lastMouse = mp->position; }
             }
@@ -4711,6 +4810,11 @@ int main() {
         for (int k = 0; k < techCount; k++)
             if (know.pulseFrames[k] > 0 && !paused) know.pulseFrames[k]--;   // know-how pip flash (R20-F1)
 
+        // UIO-F2: resolve the selection once per frame; a vanished barb (died/removed) clears it
+        int selIdx = findBarbById(barbs, selectedBarbId);
+        if (selIdx < 0) { selectedBarbId = -1; inspectRect = FloatRect(); }
+        if (selIdx >= 0 && selIdx < (int)squares.size()) drawSelectRing(window, worldView, squares[selIdx], zoom);
+
         optional<hoverHit> hover;
         bool overHud = false;
         {
@@ -4718,7 +4822,8 @@ int main() {
             Vector2u wsz = window.getSize();
             Vector2f mscreen = window.mapPixelToCoords(mpx, window.getDefaultView());
             overHud = hudFontOk && window.hasFocus() && !panning && hudRect.contains(mscreen);
-            bool overUi = overHud || tickerRect.contains(mscreen) || minimapRect(window).contains(mscreen);
+            bool overUi = overHud || tickerRect.contains(mscreen) || minimapRect(window).contains(mscreen)
+                       || (inspectRect.size.x > 0 && inspectRect.contains(mscreen));
             if (window.hasFocus() && !panning && !overUi && mpx.x >= 0 && mpx.y >= 0 && mpx.x < (int)wsz.x && mpx.y < (int)wsz.y) {
                 Vector2f mworld = window.mapPixelToCoords(mpx, worldView);
                 hover = pickHover(mworld, tooltipPickRadius / zoom, barbs, squares, activeTrader, wolves, deers, deershape, rocks, octs, bushes, bushshapes, houses, houseshapes);
@@ -4749,6 +4854,7 @@ int main() {
             hudRect = drawHud(window, hudFont, hv);
             tickerRect = drawEvents(window, hudFont);
             drawMinimap(window, minimapVerts, worldView, barbs, squares, houses, houseshapes, stores);   // UIO-F1: after the HUD, under tooltips
+            inspectRect = selIdx >= 0 ? drawInspectPanel(window, hudFont, barbs[selIdx], minimapRect(window)) : FloatRect();   // UIO-F2
             Vector2f mouse = window.mapPixelToCoords(Mouse::getPosition(window), window.getDefaultView());
             if (overHud) // full details hang just under the strip, beside the cursor
                 drawTooltip(window, hudFont, hudDetailText(hv),
