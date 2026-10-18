@@ -588,6 +588,36 @@ const float garrisonRoofTintAmount = 0.3f;    // ...by this much: subtle
 const int garrisonPipMax = 3;                 // 1px pips above the roof, one per sheltering barb, capped
 const float garrisonPipGap = 1.0f;            // px between pips, and between the pip row and the top of the roof/chimney
 
+// Leader's Keep (R31-F1): in the Town era each race with a standing crate raises one slate-grey keep just below it,
+// built by a barb of that race (buildOneOff, jobKeep). The spot is reserved from the start (forgeClear), like the huts.
+const int keepStoneCost = 2 * shrineStoneCost;   // ~2x a shrine stone
+const int keepStoneReserve = houseStoneCost + tradeStoneCost; // only paid from stone above this: paving's house reserve + one trade lot
+const int keepBuildTicks = 2 * houseBuildTicks;  // a bigger job than a house
+const Vector2f keepSize(14.0f, 12.0f);           // whole silhouette, battlements included
+const Vector2f keepCrateOffset(-2.0f, 19.0f);    // keep top-left relative to the crate: below it; the banner stays clear of the crate's clear zone
+const float keepMerlonW = 2.0f;                  // merlons and crenels both 2px wide: merlons at x 0, 4, 8, 12
+const float keepMerlonH = 2.0f;                  // top 2 rows are the battlements
+const Vector2f keepGatePos(5.0f, 7.0f);          // dark 4x5 gate, centred on the 14px front, on the ground line
+const Vector2f keepGateSize(4.0f, 5.0f);
+const float keepPoleH = 5.0f;                    // banner pole rises this far above the top-right merlon
+const Vector2f keepPolePos(keepSize.x - 1.0f, -keepPoleH); // 1px pole on the right column of the last merlon
+const Vector2f keepFlagSize(3.0f, 2.0f);         // flies right from the pole top
+const Vector2f keepLeaderPipPos(6.0f, 1.0f);     // in the centre crenel, on the wall walk: inside the silhouette, never above a roof
+const Vector2f keepStandOffset(6.0f, keepSize.y); // builder hitbox top-left relative to the keep: just below the gate
+const float keepStandRoomPx = 6.0f;              // reserved below the keep for the stand spot: tallest barb body (5) + 1
+const float keepClearPx = 3.0f;                  // houses, shrines, plots and blinks keep this far from the keep zone
+const float keepRoadPadPx = 1.0f;                // quarter roads keep this far from the keep zone
+const Color keepStoneColor(104, 110, 122);       // opaque cool slate: lighter than the translucent paving, cooler than rocks/dwarf crate/mill
+const Color keepPlinthColor(56, 60, 70);         // 1px darker ground row along the bottom
+const Color keepGateColor(20, 20, 26);
+const Color keepPoleColor(112, 96, 74);          // weathered wood
+const Color keepBannerColors[raceCount] = {      // saturated, unlike the muted crates (indexed by barbRace)
+    Color(206, 58, 44),                          // human: red
+    Color(60, 102, 220),                         // dwarf: blue
+    Color(46, 176, 96),                          // elf: green
+};
+const Color keepLeaderPipColor = crownColor;     // bright crown gold, not the dimmer bell gold of the garrison pips
+
 // UI red (UIO-F1/F2/F3): one muted brick red for every "starving" mark in the UI (minimap dots, inspect panel, hunger lens)
 const Color uiStarvingRed = healthBarFillColor;
 // Minimap (UIO-F1): bottom-right 120px map of the whole 800x800 world, drawn after the HUD in the default (UI) view.
@@ -844,8 +874,8 @@ const int spearKnapFrames = 8;                // crafter's knapping hand ticks u
 // Build jobs: which structure a barb's movingbspot/building belongs to. jobNone = no job, or a house (buildhouse()).
 // jobSpear is a craft, not a structure: it uses movingbspot (so no other system grabs the barb) but never building/timer.
 // jobPave (R20-F2) is run by paveTick(): movingbspot while walking, building/timer while laying the cobbles.
-enum buildJob {jobNone, jobShrine, jobSmoke, jobStall, jobForge, jobField, jobSpear, jobPave, jobStore, jobMill, buildJobCount};
-const int buildJobTicks[buildJobCount] = {houseBuildTicks, shrineBuildTicks, smokehouseBuildTicks, stallBuildTicks, forgeBuildTicks, fieldBuildTicks, spearCraftTicks, paveTicks, storehouseBuildTicks, millBuildTicks};
+enum buildJob {jobNone, jobShrine, jobSmoke, jobStall, jobForge, jobField, jobSpear, jobPave, jobStore, jobMill, jobKeep, buildJobCount};
+const int buildJobTicks[buildJobCount] = {houseBuildTicks, shrineBuildTicks, smokehouseBuildTicks, stallBuildTicks, forgeBuildTicks, fieldBuildTicks, spearCraftTicks, paveTicks, storehouseBuildTicks, millBuildTicks, keepBuildTicks};
 // Game animals share the deer code (deers/deershape vectors); per-species numbers live in speciesDefs below.
 // Sprite offsets are relative to the logic shape (body = hitbox), written for an animal facing right.
 enum animalSpecies {speciesDeer, speciesRabbit, speciesCount};
@@ -1143,12 +1173,38 @@ bool smokehouseClear(const FloatRect& r) {
     return true;
 }
 
+// R31-F1: one per race (index = barbRace). x,y = keep top-left, fixed at startup by placeQuarters(); id is stable, from
+// nextKeepId, given when the keep stands. keepQueued[r] (a builder holds jobKeep for it) and keepReservedStone[r] are
+// always set together on claim and cleared together on completion or cancelKeep(). Never torn down (outlives any leader).
+struct keep {int id = -1; int race = -1; int x = 0, y = 0; bool built = false;};
+keep keeps[raceCount];
+int nextKeepId = 0;
+bool keepQueued[raceCount] = {false, false, false};
+int keepReservedStone[raceCount] = {0, 0, 0};
+int keepBuilderId[raceCount] = {-1, -1, -1};
+
+// R31-F1: race k's keep footprint: banner pole/flag above, the silhouette, and its builder's stand spot below
+FloatRect keepZone(int k) {
+    return FloatRect(Vector2f((float)keeps[k].x, (float)keeps[k].y - keepPoleH),
+                     Vector2f(keepSize.x + keepFlagSize.x, keepPoleH + keepSize.y + keepStandRoomPx));
+}
+
+// R31-F1: false if r comes within keepClearPx of any race's keep zone (reserved from the start, built or not)
+bool keepClear(const FloatRect& r) {
+    for (int k = 0; k < raceCount; k++) {
+        FloatRect z = keepZone(k);
+        FloatRect zone(z.position - Vector2f(keepClearPx, keepClearPx), z.size + Vector2f(2 * keepClearPx, 2 * keepClearPx));
+        if (r.findIntersection(zone).has_value()) return false;
+    }
+    return true;
+}
+
 // False if r comes within forgeClearPx of the forge footprint (reserved from the start, built or not).
 // R29-F1: also keeps the storehouse spots clear, so every placement that avoids the forge avoids them too.
-// INBOX2-F1: and every race's smokehouse spot.
+// INBOX2-F1: and every race's smokehouse spot. R31-F1: and every race's keep spot.
 bool forgeClear(const FloatRect& r) {
     FloatRect zone(forgePos - Vector2f(forgeClearPx, forgeClearPx), forgeParts[0].size + Vector2f(2 * forgeClearPx, 2 * forgeClearPx));
-    return !r.findIntersection(zone).has_value() && storehouseClear(r) && smokehouseClear(r);
+    return !r.findIntersection(zone).has_value() && storehouseClear(r) && smokehouseClear(r) && keepClear(r);
 }
 
 // R30-F1: race quarters
@@ -1201,6 +1257,8 @@ void placeQuarters() {
             Vector2f c(villageCenter.x + cos(a) * r, villageCenter.y + sin(a) * r);
             storehousePos[k] = snapPx(c - storehouseSize / 2.0f);
             smokehousePos[k] = storehousePos[k] + smokehouseCrateOffset;   // INBOX2-F1: hut beside the crate
+            Vector2f kp = storehousePos[k] + keepCrateOffset;              // R31-F1: keep below the crate
+            keeps[k] = keep{-1, k, (int)kp.x, (int)kp.y, false};
         }
     };
     bool ok = false;
@@ -3482,6 +3540,11 @@ void buildhouse(vector<barb>& barbs,vector<RectangleShape>& squares, vector<hous
                 FloatRect pad(h.position - Vector2f(smokehouseRoadPadPx, smokehouseRoadPadPx), h.size + Vector2f(2 * smokehouseRoadPadPx, 2 * smokehouseRoadPadPx));
                 if (segmentHitsRect(qc, Vector2f(tx + 2.0f, ty + 2.0f), pad)) continue;
             }
+            {   // R31-F1: nor its own race's keep
+                FloatRect z = keepZone(b.race);
+                FloatRect pad(z.position - Vector2f(keepRoadPadPx, keepRoadPadPx), z.size + Vector2f(2 * keepRoadPadPx, 2 * keepRoadPadPx));
+                if (segmentHitsRect(qc, Vector2f(tx + 2.0f, ty + 2.0f), pad)) continue;
+            }
             raceStock& rs = stockOf(b);
             b.reservedwood = true;
             b.reservedstone = canAfford(rs, houseWoodCost, houseStoneCost) ? houseStoneCost : 0; // 0 stone -> plain house
@@ -4688,6 +4751,95 @@ void leaderWatchTick(const vector<barb>& barbs) {
         if (raceElected[r] && findBarbById(barbs, raceLeaderId[r]) < 0) loseLeader(r);
 }
 
+// R31-F1: the one undo for a queued keep: refunds the reserved stone to the race and clears the guard with it, so the
+// race can queue again. No-op if the keep stands or nothing is queued.
+void cancelKeep(int r) {
+    if (r < 0 || r >= raceCount || keeps[r].built || !keepQueued[r]) return;
+    stock[r].stone += keepReservedStone[r];
+    printf("KEEP CANCELLED - %s, %d stone refunded\n", raceDefs[r].name, keepReservedStone[r]);
+    keepReservedStone[r] = 0;
+    keepQueued[r] = false;
+    keepBuilderId[r] = -1;
+}
+
+// R31-F1: runs after buildmills(). From the Town era, each race with a standing crate raises one keep at its reserved
+// spot through buildOneOff() by a barb of that race. The claim sets keepQueued[r] (buildOneOff's claimed flag) and moves
+// keepStoneCost into keepReservedStone[r] in the same step, and only from stone above keepStoneReserve. If the builder is
+// lost (death or shelter -> releaseBarbWork) the stone is refunded via cancelKeep(). Keeps are independent per race.
+void buildkeeps(vector<barb>& barbs, vector<RectangleShape>& squares, const storehouse (&stores)[raceCount]) {
+    for (int r = 0; r < raceCount; r++) {
+        keep& kp = keeps[r];
+        if (kp.built) continue;
+        if (keepQueued[r]) {   // builder lost without releaseBarbWork() (should not happen): refund and free the guard
+            int i = findBarbById(barbs, keepBuilderId[r]);
+            if (i < 0 || barbs[i].jobKind != jobKeep || barbs[i].race != r) cancelKeep(r);
+        }
+        if (!keepQueued[r] && (currentEra < eraTown || !stores[r].built)) continue;
+        bool done = buildOneOff(barbs, squares, keepQueued[r], jobKeep, Vector2f((float)kp.x, (float)kp.y) + keepStandOffset, "KEEP",
+            [&](const barb& b) {
+                FloatRect z = keepZone(r);
+                if (!storehouseClear(z) || !smokehouseClear(z) || !lakeClear(z))
+                    return -1;   // fixed offset from the crate: only trips if the layout constants are moved onto it
+                if (!canAfford(stock[r], 0, keepStoneCost + keepStoneReserve)) return -1;
+                spend(stock[r], 0, keepStoneCost);   // reserved together with keepQueued (set by buildOneOff on return 1)
+                keepReservedStone[r] = keepStoneCost;
+                keepBuilderId[r] = b.id;
+                return 1;
+            }, r);
+        if (!done) continue;
+        kp.built = true;
+        kp.id = nextKeepId++;
+        keepReservedStone[r] = 0;
+        keepQueued[r] = false;
+        keepBuilderId[r] = -1;
+        printf("---KEEP BUILT--- %s, id %d (%d stone)\n", raceDefs[r].name, kp.id, keepStoneCost);
+        logRaceEvent(string(racePlurals[r]) + " raise a keep", r);
+    }
+}
+
+// R31-F1: 14x12 slate keep: 4 merlons over a solid wall, a 1px dark plinth, a dark gate, and the race's saturated banner
+// on a 1px pole above the right merlon. While the race has a leader, one gold pip stands in the centre crenel.
+// Drawn just after the houses, under barbs.
+void drawKeeps(RenderWindow& window) {
+    RectangleShape r;
+    for (int k = 0; k < raceCount; k++) {
+        const keep& kp = keeps[k];
+        if (!kp.built) continue;
+        Vector2f o((float)kp.x, (float)kp.y);
+        r.setFillColor(keepStoneColor);
+        r.setSize(Vector2f(keepSize.x, keepSize.y - keepMerlonH));
+        r.setPosition(o + Vector2f(0.0f, keepMerlonH));
+        window.draw(r);
+        r.setSize(Vector2f(keepMerlonW, keepMerlonH));
+        for (float x = 0.0f; x + keepMerlonW <= keepSize.x; x += 2 * keepMerlonW) {
+            r.setPosition(o + Vector2f(x, 0.0f));
+            window.draw(r);
+        }
+        r.setFillColor(keepPlinthColor);
+        r.setSize(Vector2f(keepSize.x, 1.0f));
+        r.setPosition(o + Vector2f(0.0f, keepSize.y - 1.0f));
+        window.draw(r);
+        r.setFillColor(keepGateColor);
+        r.setSize(keepGateSize);
+        r.setPosition(o + keepGatePos);
+        window.draw(r);
+        r.setFillColor(keepPoleColor);
+        r.setSize(Vector2f(1.0f, keepPoleH));
+        r.setPosition(o + keepPolePos);
+        window.draw(r);
+        r.setFillColor(keepBannerColors[k]);
+        r.setSize(keepFlagSize);
+        r.setPosition(o + keepPolePos + Vector2f(1.0f, 0.0f));
+        window.draw(r);
+        if (raceElected[k]) {
+            r.setFillColor(keepLeaderPipColor);
+            r.setSize(Vector2f(1.0f, 1.0f));
+            r.setPosition(o + keepLeaderPipPos);
+            window.draw(r);
+        }
+    }
+}
+
 // INBOX-F1: the release half of removeBarb(), shared with bellTick() so a barb taking shelter frees exactly what a dead one does
 void releaseBarbWork(barb& b, smokehouseSet& sh, forge& fg, storehouse (&stores)[raceCount], fieldGrid& fields) {
     if (b.deertargeting) clearHunt(b);
@@ -4715,6 +4867,7 @@ void releaseBarbWork(barb& b, smokehouseSet& sh, forge& fg, storehouse (&stores)
             break;
         case jobPave:  clearPave(b); break;
         case jobSpear: clearSpearCraft(b); break;
+        case jobKeep:  if (b.race >= 0 && b.race < raceCount && keepBuilderId[b.race] == b.id) cancelKeep(b.race); break;   // R31-F1: refund, can requeue
         default: break;
     }
     b.jobKind = jobNone;
@@ -6043,6 +6196,7 @@ int main() {
                 buildstorehouses(barbs, squares, houses, stores);
                 buildfield(barbs, squares, houses, shrines, stores, fields);
                 buildmills(barbs, squares, fields);   // FARM-F2
+                buildkeeps(barbs, squares, stores);   // R31-F1: Town era
                 craftspear(barbs, squares, dwarfForge);
                 minematerials(squares, barbs, tris, stumps, trees, octs, rocks, bushes, bushshapes, catchRings, fields, stores, dwarfForge);
                 barbmove(squares, barbs);
@@ -6131,6 +6285,7 @@ int main() {
 		}
 	}
 	drawHouses(window, houses, houseshapes);
+	drawKeeps(window);   // R31-F1
 	drawShrines(window, shrines);
 	drawSmokehouse(window, smoke, stores);
 	drawStall(window, activeTrader);
