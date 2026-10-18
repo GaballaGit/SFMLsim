@@ -761,10 +761,12 @@ const Color knowPipEmptyColor(78, 86, 74);    // dim grey-green rim, same family
 const Color steelToolColor(178, 186, 198);    // Hand Axe head: cool pale steel, clear of chop green and bird blue-white
 
 // Flint spears (R20-F3): an idle barb walks to the campfire and knaps a spear; spear holders hit game animals harder
-const int spearWoodCost = 2;                  // paid on completion, not on claim
+const int spearWoodCost = 2;                  // POL-F3: paid up front at claim from the crafter's race stock
 const int spearStoneCost = 1;
+const int spearRefundWood = spearWoodCost;    // POL-F3: returned by refundSpear() when a paid craft is aborted
+const int spearRefundStone = spearStoneCost;
 const int spearCraftTicks = 300;              // ~5s at 1x; counted in barb.spearTimer, never barb.timer
-const int spearBarbsPerSpear = 3;             // at most 1 spear (held or being made) per this many barbs
+const int spearBarbsPerSpear = 3;             // POL-F3: per race, at most 1 spear (held or being made) per this many of its barbs
 const int spearHitDamage = 15;                // replaces animalHitDamage (5) for a barb holding a spear
 const Vector2f spearStandOffset(-1.0f, 9.0f); // crafter hitbox top-left relative to the campfire centre: just below the stone ring
 const int spearShaftPx = 5;                   // diagonal shaft pixels beside the body, leaning right 1px every 2 rows
@@ -1302,6 +1304,7 @@ struct barb {
     councilDecree lastVote = decreeNone; // ballot from the latest dawn; lives in the struct so it is dropped with the barb
     bool hasSpear = false;       // R20-F3: kept for life; cleared only in makeBarb()
     int spearTimer = 0;          // R20-F3: craft progress while jobKind == jobSpear; separate from timer; cleared by clearSpearCraft()
+    bool spearPaid = false;      // POL-F3: craft cost already taken from the race stock; cleared only by refundSpear() or on completion
     const char* name = "";       // R25-F1: points into barbNames (no heap strings); set in makeBarb()
     barbTrait trait = traitSwift; // R25-F1: rolled once in makeBarb()
     bool shinobi = false;        // R25-F2: Sasuke; set once in makeBarb()
@@ -3784,8 +3787,30 @@ void buildmills(vector<barb>& barbs, vector<RectangleShape>& squares, const fiel
     }
 }
 
-// R20-F3: every way out of a spear craft (finished, unaffordable, interrupted) clears the same barb fields
+// POL-F3: the single refund path. Every abort of a paid spear craft (death, interrupt, reassignment) ends here;
+// returns the up-front cost to the crafter's race stock exactly once. No-op if nothing is owed.
+void refundSpear(barb& b) {
+    if (!b.spearPaid) return;
+    b.spearPaid = false;
+    raceStock& rs = stockOf(b);
+    rs.wood += spearRefundWood;
+    rs.stone += spearRefundStone;
+    printf("SPEAR REFUNDED - barb %d, %s +%d wood +%d stone\n", b.id, racePlurals[clampRace(b.race)], spearRefundWood, spearRefundStone);
+    logEvent(string(b.name) + "'s spear refunded");
+}
+
+// POL-F3: spears held or being made by race r (the per-race cap counts both)
+int spearsOfRace(const vector<barb>& barbs, int r) {
+    int n = 0;
+    for (auto& b : barbs)
+        if (b.race == r && (b.hasSpear || b.jobKind == jobSpear)) n++;
+    return n;
+}
+
+// R20-F3: every way out of a spear craft (finished, interrupted, removed) clears the same barb fields.
+// POL-F3: refunds via refundSpear() first; the finish path clears spearPaid beforehand so nothing is returned.
 void clearSpearCraft(barb& b) {
+    refundSpear(b);
     b.jobKind = jobNone;
     b.moving = b.movingbspot = b.building = false;
     b.spearTimer = 0;
@@ -3795,35 +3820,53 @@ void clearSpearCraft(barb& b) {
 }
 
 // Runs after buildfield(). One crafter at a time: an idle barb without a spear walks to the campfire and knaps for
-// spearCraftTicks (in spearTimer, never timer). Wood and stone are checked on claim but paid only on completion;
-// if they ran out meanwhile the craft is dropped. Spears (held + in progress) are capped at 1 per spearBarbsPerSpear barbs.
+// spearCraftTicks (in spearTimer, never timer). POL-F3: spears (held + in progress) are capped per race at 1 per
+// spearBarbsPerSpear of its barbs; the race with the fewest spears per barb goes first. The cost is paid at claim
+// (spearPaid) and any abort is refunded by refundSpear(); completion never needs materials.
 void craftspear(vector<barb>& barbs, vector<RectangleShape>& squares) {
-    int spears = 0, crafter = -1;
+    int crafter = -1;
     for (int i = 0; i < (int)barbs.size(); i++) {
-        if (barbs[i].hasSpear) spears++;
         if (barbs[i].jobKind == jobSpear) crafter = i;
+        else if (barbs[i].spearPaid) refundSpear(barbs[i]);   // reassigned without going through clearSpearCraft
     }
     Vector2f stand = villageCenter + spearStandOffset;
     if (crafter < 0) {
-        if ((spears + 1) * spearBarbsPerSpear > (int)barbs.size()) return;
-        for (auto& b : barbs) {
-            if (b.hasSpear || b.jobKind != jobNone || b.deertargeting || b.chopping || b.timer > 0
-                || b.moving || b.movingbspot || b.building) continue;
-            if (!canAfford(stockOf(b), spearWoodCost, spearStoneCost)) continue;   // RACE-F1: the crafter's race pays
-            b.jobKind = jobSpear;
-            b.target = targetNone;
-            b.targetx = (int)stand.x;
-            b.targety = (int)stand.y;
-            b.moving = b.movingbspot = true;
-            b.spearTimer = 0;
-            printf("SPEAR CLAIMED - barb %d (%d/%d spears)\n", b.id, spears, (int)barbs.size() / spearBarbsPerSpear);
-            return;
+        int members[raceCount] = {}, spears[raceCount] = {};
+        for (auto& b : barbs) members[clampRace(b.race)]++;
+        for (int r = 0; r < raceCount; r++) spears[r] = spearsOfRace(barbs, r);
+        bool tried[raceCount] = {};
+        for (int pass = 0; pass < raceCount; pass++) {
+            int pick = -1;   // fewest spears per barb among races under their cap that can pay
+            for (int r = 0; r < raceCount; r++) {
+                if (tried[r] || members[r] == 0) continue;
+                if ((spears[r] + 1) * spearBarbsPerSpear > members[r]) continue;
+                if (!canAfford(stockOfRace(r), spearWoodCost, spearStoneCost)) continue;
+                if (pick < 0 || spears[r] * members[pick] < spears[pick] * members[r]) pick = r;
+            }
+            if (pick < 0) return;
+            tried[pick] = true;
+            for (auto& b : barbs) {
+                if (b.race != pick || b.hasSpear || b.jobKind != jobNone || b.deertargeting || b.chopping || b.timer > 0
+                    || b.moving || b.movingbspot || b.building) continue;
+                spend(stockOfRace(pick), spearWoodCost, spearStoneCost);   // POL-F3: paid up front by the crafter's race
+                b.spearPaid = true;
+                b.jobKind = jobSpear;
+                b.target = targetNone;
+                b.targetx = (int)stand.x;
+                b.targety = (int)stand.y;
+                b.moving = b.movingbspot = true;
+                b.spearTimer = 0;
+                printf("SPEAR CLAIMED - barb %d, %s %d/%d spears (paid %d wood, %d stone)\n", b.id, racePlurals[pick],
+                       spears[pick] + 1, members[pick] / spearBarbsPerSpear, spearWoodCost, spearStoneCost);
+                logEvent(string(b.name) + " begins a spear");
+                return;
+            }
         }
         return;
     }
     barb& b = barbs[crafter];
     auto& sq = squares[crafter];
-    if (!b.movingbspot) { clearSpearCraft(b); return; }   // something else took the barb: release the job
+    if (!b.movingbspot) { clearSpearCraft(b); return; }   // interrupt: something else took the barb; clearSpearCraft refunds
     Vector2f pos  = sq.getPosition();
     Vector2f diff = Vector2f(b.targetx, b.targety) - pos;
     float dSq = diff.x * diff.x + diff.y * diff.y;
@@ -3838,16 +3881,10 @@ void craftspear(vector<barb>& barbs, vector<RectangleShape>& squares) {
     b.moving = false;   // standing at the fire: no walking bob while knapping
     if (workTick(b)) b.spearTimer++;
     if (b.spearTimer < spearCraftTicks) return;
-    raceStock& rs = stockOf(b);
-    if (!canAfford(rs, spearWoodCost, spearStoneCost)) {
-        printf("SPEAR ABANDONED - barb %d, no materials (%s wood: %d stone: %d)\n", b.id, racePlurals[clampRace(b.race)], rs.wood, rs.stone);
-        clearSpearCraft(b);
-        return;
-    }
-    spend(rs, spearWoodCost, spearStoneCost);
+    b.spearPaid = false;   // POL-F3: cost was taken at claim; finishing consumes it, so clearSpearCraft refunds nothing
     b.hasSpear = true;
     clearSpearCraft(b);
-    printf("---SPEAR MADE--- barb %d (%d wood, %d stone)\n", b.id, spearWoodCost, spearStoneCost);
+    printf("---SPEAR MADE--- barb %d, %s\n", b.id, racePlurals[clampRace(b.race)]);
     logEvent("Flint spear made");
 }
 
@@ -3986,7 +4023,8 @@ void makeBarb(Vector2i pos, vector<barb>& barbs, vector<RectangleShape>& squares
                                              : (barbRace)uniform_int_distribution<int>(0, raceCount - 1)(gen);
     b.hasSpear = false;   // R20-F3: every new barb starts unarmed with no craft in progress
     b.spearTimer = 0;
-    b.trait = (barbTrait)uniform_int_distribution<int>(0, traitCount - 1)(gen);   // R25-F1
+    b.spearPaid = false;  // POL-F3
+    b.trait =(barbTrait)uniform_int_distribution<int>(0, traitCount - 1)(gen);   // R25-F1
     if (!sasukeTaken && homeHouse < 0) {   // R25-F2: the first founder is Sasuke (no table name is spent)
         sasukeTaken = true;
         b.shinobi = true;
@@ -4307,6 +4345,7 @@ void removeBarb(vector<barb>& barbs, vector<RectangleShape>& squares, int i,
     stockOf(b).stone += b.reservedstone;                    // house foundation or shrine stone
     b.reservedwood = false;
     b.reservedstone = 0;
+    refundSpear(b);                              // POL-F3: paid spear craft goes back to its race before the swapRemove
     switch (b.jobKind) {                         // claims paid at claim time stay spent; the next builder pays again
         case jobSmoke: if (!sh.built) sh.claimed = false; break;
         case jobForge: if (!fg.built) fg.claimed = false; break;
