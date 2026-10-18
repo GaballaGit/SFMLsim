@@ -225,6 +225,14 @@ const float eventStripMinWidth = 150.0f;
 const Color eventTextColor(205, 200, 180);
 const uint8_t eventTextAlpha = 220;
 const uint8_t eventStripAlpha = 90;
+// POL-F2: lines about one race's barbs are tinted by race. Brighter than lensRaceColors so 12px text reads on the
+// translucent black strip; hues kept apart from ticker cream, dusk blue and the brick-red shortage/birth lines.
+const Color raceEventColors[raceCount] = {
+    Color(236, 190, 104),                     // human: warm gold
+    Color(206, 168, 236),                     // dwarf: pale lavender (redder than dusk blue)
+    Color(146, 224, 140),                     // elf: bright mint
+};
+const int raceEventFadeTicks = 60;        // race lines hold at full opacity, then fade over the last ~1s of eventFadeTicks
 
 const float tooltipPickRadius = 7.0f;     // screen px around the cursor that counts as a hover hit
 const float tooltipOutlinePx = 1.0f;      // highlight outline width in screen px (scaled by zoom)
@@ -1401,15 +1409,29 @@ struct wolf {
 char tradeMsg[64] = "";
 int tradeMsgTimer = 0;
 
-struct gameEvent {string text; int age = 0; Color tint = Color::Transparent;};   // tint.a == 0: normal ticker colour
+// tint.a == 0: normal ticker colour. POL-F2: text is the base text (names copied in, never a barb index/pointer);
+// count > 1 renders as " xN"; quickFade lines (race-tinted) fade over the last raceEventFadeTicks only.
+struct gameEvent {string text; int age = 0; Color tint = Color::Transparent; int count = 1; bool quickFade = false;};
 deque<gameEvent> events;
 int foodFlashFrames = 0;   // >0: the newest ticker line (a paid birth) is tinted birthFlashColor
 
-void logEvent(const string& text, Color tint = Color::Transparent) {
+void pushEvent(const string& text, Color tint, bool quickFade) {
     foodFlashFrames = 0;   // any newer line ends the flash, so it never lands on the wrong line
-    events.push_back({text, 0, tint});
+    if (!events.empty() && events.back().text == text && events.back().tint == tint) {   // POL-F2: base text + tint
+        events.back().count++;
+        events.back().age = 0;   // repeated: stays up as long as a fresh line would
+        return;
+    }
+    events.push_back({text, 0, tint, 1, quickFade});
     while ((int)events.size() > eventMaxLines) events.pop_front();
 }
+
+void logEvent(const string& text, Color tint = Color::Transparent) { pushEvent(text, tint, false); }
+
+// POL-F2: a line about race r's barbs, tinted with that race's ticker colour
+void logRaceEvent(const string& text, int r) { pushEvent(text, raceEventColors[clampRace(r)], true); }
+
+string eventText(const gameEvent& e) { return e.count > 1 ? e.text + " x" + to_string(e.count) : e.text; }
 
 // Know-how (R20-F1): one unit of practice; at the threshold the tech is learned once, with a ticker line
 void practice(techId t) {
@@ -1429,8 +1451,9 @@ void eventTick() {
 }
 
 uint8_t eventFade(const gameEvent& e, uint8_t full) {
-    if (e.age <= eventHoldTicks) return full;
-    float f = 1.0f - (float)(e.age - eventHoldTicks) / (eventFadeTicks - eventHoldTicks);
+    int hold = e.quickFade ? eventFadeTicks - raceEventFadeTicks : eventHoldTicks;
+    if (e.age <= hold) return full;
+    float f = 1.0f - (float)(e.age - hold) / (eventFadeTicks - hold);
     return (uint8_t)(full * clamp(f, 0.0f, 1.0f));
 }
 
@@ -1442,7 +1465,7 @@ FloatRect drawEvents(RenderWindow& window, const Font& font) {
     float width = eventStripMinWidth;
     uint8_t newest = 0;
     for (auto& e : events) {
-        Text t(font, e.text, eventFontSize);
+        Text t(font, eventText(e), eventFontSize);
         FloatRect lb = t.getLocalBounds();
         width = max(width, lb.position.x + lb.size.x + 2 * eventPad.x);
         newest = max(newest, eventFade(e, eventStripAlpha));
@@ -1454,7 +1477,7 @@ FloatRect drawEvents(RenderWindow& window, const Font& font) {
     strip.setFillColor(Color(0, 0, 0, newest));
     window.draw(strip);
     for (int i = 0; i < (int)events.size(); i++) {
-        Text t(font, events[i].text, eventFontSize);
+        Text t(font, eventText(events[i]), eventFontSize);
         Color c = events[i].tint.a > 0 ? events[i].tint : eventTextColor;   // R26-F1: dusk line in night blue
         if (foodFlashFrames > 0 && i == (int)events.size() - 1) {
             float f = (float)foodFlashFrames / birthFlashFrames;   // 1 -> 0: eases back to the normal colour
@@ -1597,8 +1620,8 @@ void deerkilling(vector<deer>& deers, vector<RectangleShape>& deershape, vector<
 					rs.food += yield + smoked;
 					if (smoked > 0) sh.boostTicks = smokeBoostTicks;   // puff burst over the hut
 					printf("%s KILLED%s - %s food: %d (+%d, +%d smoked)\n", name, speared ? " (spear)" : "", racePlurals[clampRace(b.race)], rs.food, yield, smoked);
-					logEvent(string(name) + (speared ? " speared (+" : " killed (+") + to_string(yield) + " food"
-					         + (smoked > 0 ? ", +" + to_string(smoked) + " smoked" : string()) + ", " + to_string(rs.food) + ")");
+					logRaceEvent(string(b.name) + (speared ? " speared a " : " killed a ") + name + " (+" + to_string(yield) + " food"
+					         + (smoked > 0 ? ", +" + to_string(smoked) + " smoked" : string()) + ", " + to_string(rs.food) + ")", b.race);
 					break;
 				}
 			}
@@ -2047,7 +2070,7 @@ void hungerTick(vector<barb>& barbs) {
         if (!isHungry(b)) {
             b.hunger++;
             if (isHungry(b) && stockOf(b).food <= 0 && hungryLogCooldown == 0) {
-                logEvent(string("A barb is hungry - no food (") + racePlurals[clampRace(b.race)] + ")");
+                logRaceEvent(string(b.name) + " is hungry - no food (" + racePlurals[clampRace(b.race)] + ")", b.race);
                 hungryLogCooldown = eventHungryCooldownTicks;
             }
         }
@@ -2414,7 +2437,8 @@ void traderTick(optional<trader>& tr) {
         else if (lots > 0) snprintf(tradeMsg, sizeof(tradeMsg), "%s traded: -%d stone +%d wood", racePlurals[tr_r], lots * tradeStoneCost, lots * tradeWoodGain);
         else          snprintf(tradeMsg, sizeof(tradeMsg), "Trader: no stone to buy");
         tradeMsgTimer = tradeMsgTicks;
-        logEvent(tradeMsg);
+        if (lots > 0) logRaceEvent(tradeMsg, tr_r);   // POL-F2: tinted by the race that traded
+        else          logEvent(tradeMsg);
         printf("TRADE - %s, %d stone for %d wood - stone: %d wood: %d\n", racePlurals[tr_r], lots * tradeStoneCost, lots * tradeWoodGain, rs.stone, rs.wood);
         t.phase = trader::Trading;
         t.timer = 0;
@@ -3855,7 +3879,7 @@ void refundSpear(barb& b) {
     rs.wood += spearRefundWood;
     rs.stone += spearRefundStone;
     printf("SPEAR REFUNDED - barb %d, %s +%d wood +%d stone\n", b.id, racePlurals[clampRace(b.race)], spearRefundWood, spearRefundStone);
-    logEvent(string(b.name) + "'s spear refunded");
+    logRaceEvent(string(b.name) + "'s spear refunded", b.race);
 }
 
 // POL-F3: spears held or being made by race r (the per-race cap counts both)
@@ -3917,7 +3941,7 @@ void craftspear(vector<barb>& barbs, vector<RectangleShape>& squares) {
                 b.spearTimer = 0;
                 printf("SPEAR CLAIMED - barb %d, %s %d/%d spears (paid %d wood, %d stone)\n", b.id, racePlurals[pick],
                        spears[pick] + 1, members[pick] / spearBarbsPerSpear, spearWoodCost, spearStoneCost);
-                logEvent(string(b.name) + " begins a spear");
+                logRaceEvent(string(b.name) + " begins a spear", b.race);
                 return;
             }
         }
@@ -3944,7 +3968,7 @@ void craftspear(vector<barb>& barbs, vector<RectangleShape>& squares) {
     b.hasSpear = true;
     clearSpearCraft(b);
     printf("---SPEAR MADE--- barb %d, %s\n", b.id, racePlurals[clampRace(b.race)]);
-    logEvent("Flint spear made");
+    logRaceEvent(string(b.name) + " made a flint spear", b.race);
 }
 
 void fieldTick(fieldGrid& fields) {
