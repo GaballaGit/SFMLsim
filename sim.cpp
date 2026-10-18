@@ -783,7 +783,8 @@ const int spearStoneCost = 1;
 const int spearRefundWood = spearWoodCost;    // POL-F3: returned by refundSpear() when a paid craft is aborted
 const int spearRefundStone = spearStoneCost;
 const int spearCraftTicks = 300;              // ~5s at 1x; counted in barb.spearTimer, never barb.timer
-const int spearBarbsPerSpear = 3;             // POL-F3: per race, at most 1 spear (held or being made) per this many of its barbs
+const int spearForgeTicks = spearCraftTicks / 2; // POL-F5a: dwarves with a built forge knap at it in half the time
+const int spearBarbsPerSpear = 3;            // POL-F3: per race, at most 1 spear (held or being made) per this many of its barbs
 const int spearHitDamage = 15;                // replaces animalHitDamage (5) for a barb holding a spear
 const Vector2f spearStandOffset(-1.0f, 9.0f); // crafter hitbox top-left relative to the campfire centre: just below the stone ring
 const int spearShaftPx = 5;                   // diagonal shaft pixels beside the body, leaning right 1px every 2 rows
@@ -1057,7 +1058,9 @@ bool hasStall = false;      // market stall standing: traderTick() allows stallE
 bool stallClaimed = false;  // a builder is on the stall
 int stallBonusLots = 0;     // extra lots the stall added to the current visit; drawn as crates while the trader is Trading
 struct forge {bool built = false; bool claimed = false;}; // the one dwarf forge; claimed = a builder is on it
-int forgeEmberFrames = 0;   // >0 = ember glows hot; set when a dwarf mines a rock, counted down per drawn frame
+// POL-F5a: the single forge gate (shared with forge phase 2): race r works at the forge only if it is dwarves and it is built
+bool forgeActive(const forge& fg, int r) { return r == raceDwarf && fg.built; }
+int forgeEmberFrames = 0;  // >0 = ember glows hot; set when a dwarf mines a rock, counted down per drawn frame
 // R29-F1: one per race (index = barbRace), held in a fixed array in main; built is the validity flag haulers check
 struct storehouse {bool built = false; bool claimed = false; int stored = 0; int flashFrames = 0;}; // flashFrames: deposit flash, per drawn frame
 
@@ -1322,6 +1325,7 @@ struct barb {
     bool hasSpear = false;       // R20-F3: kept for life; cleared only in makeBarb()
     int spearTimer = 0;          // R20-F3: craft progress while jobKind == jobSpear; separate from timer; cleared by clearSpearCraft()
     bool spearPaid = false;      // POL-F3: craft cost already taken from the race stock; cleared only by refundSpear() or on completion
+    bool spearAtForge = false;   // POL-F5a: this craft is at the forge (forgeActive at claim); cleared by clearSpearCraft()
     const char* name = "";       // R25-F1: points into barbNames (no heap strings); set in makeBarb()
     barbTrait trait = traitSwift; // R25-F1: rolled once in makeBarb()
     bool shinobi = false;        // R25-F2: Sasuke; set once in makeBarb()
@@ -3971,6 +3975,7 @@ void clearSpearCraft(barb& b) {
     b.jobKind = jobNone;
     b.moving = b.movingbspot = b.building = false;
     b.spearTimer = 0;
+    b.spearAtForge = false;   // POL-F5a
     b.stepTimer = 0;
     b.targetx = b.targety = -1;
     dropCarry(b);   // R29-F1
@@ -3980,7 +3985,8 @@ void clearSpearCraft(barb& b) {
 // spearCraftTicks (in spearTimer, never timer). POL-F3: spears (held + in progress) are capped per race at 1 per
 // spearBarbsPerSpear of its barbs; the race with the fewest spears per barb goes first. The cost is paid at claim
 // (spearPaid) and any abort is refunded by refundSpear(); completion never needs materials.
-void craftspear(vector<barb>& barbs, vector<RectangleShape>& squares) {
+// POL-F5a: dwarves with a built forge (forgeActive) knap at the forge stand spot in spearForgeTicks instead.
+void craftspear(vector<barb>& barbs, vector<RectangleShape>& squares, const forge& fg) {
     int crafter = -1;
     for (int i = 0; i < (int)barbs.size(); i++) {
         if (barbs[i].jobKind == jobSpear) crafter = i;
@@ -4009,12 +4015,15 @@ void craftspear(vector<barb>& barbs, vector<RectangleShape>& squares) {
                 b.spearPaid = true;
                 b.jobKind = jobSpear;
                 b.target = targetNone;
-                b.targetx = (int)stand.x;
-                b.targety = (int)stand.y;
+                b.spearAtForge = forgeActive(fg, pick);   // POL-F5a
+                Vector2f spot = b.spearAtForge ? forgePos + forgeStandOffset : stand;
+                b.targetx = (int)spot.x;
+                b.targety = (int)spot.y;
                 b.moving = b.movingbspot = true;
                 b.spearTimer = 0;
-                printf("SPEAR CLAIMED - barb %d, %s %d/%d spears (paid %d wood, %d stone)\n", b.id, racePlurals[pick],
-                       spears[pick] + 1, members[pick] / spearBarbsPerSpear, spearWoodCost, spearStoneCost);
+                printf("SPEAR CLAIMED - barb %d, %s %d/%d spears (paid %d wood, %d stone)%s\n", b.id, racePlurals[pick],
+                       spears[pick] + 1, members[pick] / spearBarbsPerSpear, spearWoodCost, spearStoneCost,
+                       b.spearAtForge ? " at the forge" : "");
                 logRaceEvent(string(b.name) + " begins a spear", b.race);
                 return;
             }
@@ -4024,6 +4033,12 @@ void craftspear(vector<barb>& barbs, vector<RectangleShape>& squares) {
     barb& b = barbs[crafter];
     auto& sq = squares[crafter];
     if (!b.movingbspot) { clearSpearCraft(b); return; }   // interrupt: something else took the barb; clearSpearCraft refunds
+    if (b.spearAtForge && !forgeActive(fg, b.race)) {      // POL-F5a: forge gone mid-craft -> refund (via refundSpear) and free the barb
+        printf("SPEAR ABORTED - barb %d, forge lost\n", b.id);
+        clearSpearCraft(b);   // refundSpear() + clears moving/movingbspot/building
+        b.chopping = false;
+        return;
+    }
     Vector2f pos  = sq.getPosition();
     Vector2f diff = Vector2f(b.targetx, b.targety) - pos;
     float dSq = diff.x * diff.x + diff.y * diff.y;
@@ -4037,7 +4052,7 @@ void craftspear(vector<barb>& barbs, vector<RectangleShape>& squares) {
     }
     b.moving = false;   // standing at the fire: no walking bob while knapping
     if (workTick(b)) b.spearTimer++;
-    if (b.spearTimer < spearCraftTicks) return;
+    if (b.spearTimer < (b.spearAtForge ? spearForgeTicks : spearCraftTicks)) return;
     b.spearPaid = false;   // POL-F3: cost was taken at claim; finishing consumes it, so clearSpearCraft refunds nothing
     b.hasSpear = true;
     clearSpearCraft(b);
@@ -4181,6 +4196,7 @@ void makeBarb(Vector2i pos, vector<barb>& barbs, vector<RectangleShape>& squares
     b.hasSpear = false;   // R20-F3: every new barb starts unarmed with no craft in progress
     b.spearTimer = 0;
     b.spearPaid = false;  // POL-F3
+    b.spearAtForge = false;   // POL-F5a
     b.trait =(barbTrait)uniform_int_distribution<int>(0, traitCount - 1)(gen);   // R25-F1
     if (!sasukeTaken && homeHouse < 0) {   // R25-F2: the first founder is Sasuke (no table name is spent)
         sasukeTaken = true;
@@ -5506,7 +5522,7 @@ int main() {
                 buildstorehouses(barbs, squares, houses, stores);
                 buildfield(barbs, squares, houses, shrines, stores, fields);
                 buildmills(barbs, squares, fields);   // FARM-F2
-                craftspear(barbs, squares);
+                craftspear(barbs, squares, dwarfForge);
                 minematerials(squares, barbs, tris, stumps, trees, octs, rocks, bushes, bushshapes, catchRings, fields, stores);
                 barbmove(squares, barbs);
                 shinobiTick(barbs, squares, houseshapes, octs, shinobiPuffs);
