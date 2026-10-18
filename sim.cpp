@@ -9,6 +9,7 @@
 #include <string>
 #include <limits>
 #include <unordered_map>
+#include <array>
 
 using namespace sf;
 using namespace std;
@@ -458,13 +459,17 @@ const Vector2f shrineStandOffset(3.0f, -6.0f); // slab top-left relative to the 
 const Color shrineSlabColor(138, 136, 128); // warm stone grey: lighter than rocks (125), clear of wolf blue-grey
 const Color shrineCapColor(214, 192, 118); // pale gold: not mine orange, lamp amber, hover gold or hungry tan
 
-// Smokehouse: at most one; once standing, every barb kill of a deer or rabbit yields extra food
+// Smokehouse (INBOX2-F1): one per race, beside its crate, built by a barb of that race once the crate stands; once
+// standing, that race's own kills of a deer or rabbit yield extra food (other races' kills don't)
 const int smokehouseWoodCost = 20;
 const int smokehouseStoneCost = 4;
-const int smokehouseFoodBonus = 1;         // extra food per deer/rabbit kill (wolf kills still give none)
-const int smokehouseMinHouses = 1;         // the first home comes before the smokehouse
+const int smokehouseFoodBonus = 1;         // extra food per own-race deer/rabbit kill (wolf kills still give none)
+const int smokehouseMinHouses = 1;         // the race's first home comes before its smokehouse
 const int smokehouseBuildTicks = 600;      // same work as a house
-const Vector2f smokehousePos(384.0f, 406.0f); // hut top-left: fixed spot just south-west of the campfire, inside the clearing
+// Hut top-left relative to the crate top-left: above the crate's left half, 4px of grass between hut and lid, clear of
+// the bell marker (top-right) and the crate stand spot (left side). Set per race in placeQuarters().
+const Vector2f smokehouseCrateOffset(-2.0f, -9.0f);
+const float smokehouseRoadPadPx = 1.0f;    // quarter roads keep this far from the hut footprint (incl. chimney)
 const Vector2f smokehouseSize(6.0f, 5.0f);
 const float smokehouseRoofH = 2.0f;        // top 2 rows are roof, bottom 3 are wall
 const Vector2f smokehouseDoorPos(1.0f, 3.0f);  // 1x2 door, relative to hut top-left
@@ -472,17 +477,18 @@ const Vector2f smokehouseDoorSize(1.0f, 2.0f);
 const Vector2f smokehouseChimneyPos(4.0f, -2.0f); // 1x2 chimney poking up from the right of the roof
 const Vector2f smokehouseChimneySize(1.0f, 2.0f);
 const Vector2f smokehouseStandOffset(-3.0f, 1.0f); // builder's spot relative to the hut: stands at its left wall
-const float smokehouseClearPx = 4.0f;      // shrines keep this far from the hut (and its smoke)
+const float smokehouseClearPx = 4.0f;      // houses, shrines, plots and blinks keep this far from every hut (and its chimney)
 const Color smokehouseWallColor(88, 70, 54);   // dark smoked timber: darker than house tan, still clear of the ground
 const Color smokehouseRoofColor(58, 44, 36);
 const Color smokehouseDoorColor(30, 22, 16);
 const Color smokehouseChimneyColor(110, 106, 100);
 const Color smokeColor(176, 174, 168);     // pale grey puffs
-const uint8_t smokeAlpha = 150;            // starting alpha; each puff fades to 0 as it rises
-const int smokeCycleFrames = 180;          // one puff in flight per cycle normally (~3s): sparse
-const int smokePuffsIdle = 1;
-const int smokePuffsBoost = 3;             // a burst right after a bonus kill so the effect reads on screen
-const int smokeBoostTicks = 360;           // sim ticks the burst lasts after a bonus kill
+// INBOX2-F1: no idle smoke; a race's hut puffs only right after one of its own smoked kills
+const uint8_t smokeAlpha = 110;            // faint starting alpha; each puff fades to 0 as it rises
+const int smokePuffLifeFrames = 90;        // ~1.5s per puff (drawn frames, frozen while paused)
+const int smokePuffCount = 2;              // short: two puffs per smoked kill
+const int smokePuffStaggerFrames = 30;     // second puff leaves the chimney 0.5s after the first
+const int smokePuffFrames = smokePuffLifeFrames + (smokePuffCount - 1) * smokePuffStaggerFrames; // whole burst
 const float smokeRisePx = 12.0f;
 const float smokeDriftPx = 3.0f;           // leans east as it rises
 const float smokePuffPx = 2.0f;            // 2x2 puff, shrinks to 1x1 in the upper half
@@ -502,12 +508,13 @@ const Color stallCounterColor(128, 92, 58);
 const Color stallGoodsWoodColor(214, 160, 90); // 1px crates on the counter while a bonus trade is under way
 const Color stallGoodsStoneColor(170, 170, 160);
 
-// Smokehouse roof takes the colour of the village's majority race (by house builders); tie or no houses = default brown
-const Color smokehouseRoofRaceColors[raceCount] = {   // human, dwarf, elf (indexed by barbRace)
+// Each race's smokehouse roof takes its race's muted colour (INBOX2-F1)
+const Color smokehouseRoofRaceColors[] = {   // human, dwarf, elf (indexed by barbRace)
     smokehouseRoofColor,
     Color(72, 70, 66),                         // dark stone grey
     Color(66, 82, 62),                         // dark sage
 };
+static_assert(size(smokehouseRoofRaceColors) == raceCount, "one smokehouse roof colour per race");
 
 // Dwarf forge: at most one, built by an idle dwarf once dwarves have built enough houses
 const int forgeWoodCost = 10;
@@ -515,9 +522,9 @@ const int forgeStoneCost = 8;              // the forge is where stone goes; hou
 const int forgeMinDwarfHouses = 2;
 const int forgeBuildTicks = 600;           // same work as a house
 const int houseBuildTicks = 600;
-const Vector2f forgePos(375.0f, 393.0f);   // forge top-left: west of the campfire, clear of the smokehouse smoke column
+const Vector2f forgePos(375.0f, 393.0f);   // forge top-left: west of the campfire
 const Vector2f forgeStandOffset(-3.0f, 1.0f); // builder's spot relative to the forge: stands at its left wall
-const float forgeClearPx = 3.0f;           // houses, shrines and the smokehouse keep this far from the forge footprint
+const float forgeClearPx = 3.0f;           // houses and shrines keep this far from the forge footprint
 struct forgePart {Vector2f pos, size; Color color;};
 const int forgePartCount = 4;
 const forgePart forgeParts[forgePartCount] = {   // drawn in order, offsets from forgePos
@@ -550,6 +557,7 @@ const int storehouseMinRaceHouses = 1;     // a race builds its storehouse once 
 const int storehouseBuildTicks = 600;      // same work as a house
 const Vector2f storehouseSize(10.0f, 10.0f);
 Vector2f storehousePos[raceCount];         // crate top-left, indexed by barbRace; set once at startup by placeQuarters() (R30-F1)
+Vector2f smokehousePos[raceCount];         // INBOX2-F1: hut top-left = storehousePos + smokehouseCrateOffset, set with the crates
 const Vector2f storehouseStandOffset(-4.0f, 3.0f); // builder/hauler hitbox top-left relative to the crate: at its left side
 const Vector2f traderStoreOffset(storehouseSize.x + 1.0f, 3.0f); // POL-F4: trader top-left relative to the crate: its right side
 const float storehouseClearPx = 3.0f;      // houses, shrines, the field and blinks keep this far from crate + stand spot
@@ -1092,7 +1100,10 @@ struct house {int x, y; bool hasFoundation = false; int id = -1; barbRace race =
 int nextHouseId = 0;   // assigned only in buildhouse(); never reused, so ids survive any swapRemove
 struct shrine {int x, y; int id = -1;};  // x,y = slab top-left; id: stable, from nextShrineId (refer to shrines by id, never index)
 int nextShrineId = 0;  // assigned only in buildshrine(); at most maxShrines are ever standing
-struct smokehouse {bool built = false; bool claimed = false; int boostTicks = 0;}; // the one smokehouse; claimed = a builder is on it
+// INBOX2-F1: one per race (index = barbRace), held in a fixed array in main; claimed = a builder of that race is on it;
+// puffFrames > 0 = a smoked kill's puff burst is in flight (drawn frames, frozen while paused)
+struct smokehouse {bool built = false; bool claimed = false; int puffFrames = 0;};
+using smokehouseSet = array<smokehouse, raceCount>;
 bool hasStall = false;      // market stall standing: traderTick() allows stallExtraLots more lots
 bool stallClaimed = false;  // a builder is on the stall
 int stallBonusLots = 0;     // extra lots the stall added to the current visit; drawn as crates while the trader is Trading
@@ -1116,11 +1127,28 @@ bool storehouseClear(const FloatRect& r) {
     return true;
 }
 
+// INBOX2-F1: race k's hut footprint including the chimney poking above the roof
+FloatRect smokehouseRect(int k) {
+    return FloatRect(smokehousePos[k] + Vector2f(0.0f, smokehouseChimneyPos.y),
+                     Vector2f(smokehouseSize.x, smokehouseSize.y - smokehouseChimneyPos.y));
+}
+
+// INBOX2-F1: false if r comes within smokehouseClearPx of any race's hut (reserved from the start, built or not)
+bool smokehouseClear(const FloatRect& r) {
+    for (int k = 0; k < raceCount; k++) {
+        FloatRect h = smokehouseRect(k);
+        FloatRect zone(h.position - Vector2f(smokehouseClearPx, smokehouseClearPx), h.size + Vector2f(2 * smokehouseClearPx, 2 * smokehouseClearPx));
+        if (r.findIntersection(zone).has_value()) return false;
+    }
+    return true;
+}
+
 // False if r comes within forgeClearPx of the forge footprint (reserved from the start, built or not).
 // R29-F1: also keeps the storehouse spots clear, so every placement that avoids the forge avoids them too.
+// INBOX2-F1: and every race's smokehouse spot.
 bool forgeClear(const FloatRect& r) {
     FloatRect zone(forgePos - Vector2f(forgeClearPx, forgeClearPx), forgeParts[0].size + Vector2f(2 * forgeClearPx, 2 * forgeClearPx));
-    return !r.findIntersection(zone).has_value() && storehouseClear(r);
+    return !r.findIntersection(zone).has_value() && storehouseClear(r) && smokehouseClear(r);
 }
 
 // R30-F1: race quarters
@@ -1172,6 +1200,7 @@ void placeQuarters() {
             float a = a0 + 6.2831853f * k / raceCount;
             Vector2f c(villageCenter.x + cos(a) * r, villageCenter.y + sin(a) * r);
             storehousePos[k] = snapPx(c - storehouseSize / 2.0f);
+            smokehousePos[k] = storehousePos[k] + smokehouseCrateOffset;   // INBOX2-F1: hut beside the crate
         }
     };
     bool ok = false;
@@ -1638,7 +1667,7 @@ void validateDeerTargets(vector<barb>& barbs, const vector<deer>& deers) {
 		if (b.deertargeting && findDeerById(deers, b.targetDeerId) == -1) clearHunt(b);
 }
 
-void deerkilling(vector<deer>& deers, vector<RectangleShape>& deershape, vector<barb>& barbs, vector<RectangleShape>& squares, smokehouse& sh) {
+void deerkilling(vector<deer>& deers, vector<RectangleShape>& deershape, vector<barb>& barbs, vector<RectangleShape>& squares, smokehouseSet& sh) {
 	const float deerInfluenceDSq = 625.0f;
 	validateDeerTargets(barbs, deers);
 	for (int i = 0; i < (int)deers.size(); ) {
@@ -1685,10 +1714,11 @@ void deerkilling(vector<deer>& deers, vector<RectangleShape>& deershape, vector<
 					swapRemove(deers, i);      // d and ds are invalid from here on
 					swapRemove(deershape, i);
 					removed = true;
-					int smoked = sh.built ? smokehouseFoodBonus : 0;
+					bool ownHut = b.race >= 0 && b.race < raceCount && sh[b.race].built;   // INBOX2-F1: only the hunter's own race's hut
+					int smoked = ownHut ? smokehouseFoodBonus : 0;
 					raceStock& rs = stockOf(b);   // RACE-F1: the hunter's race eats it
 					rs.food += yield + smoked;
-					if (smoked > 0) sh.boostTicks = smokeBoostTicks;   // puff burst over the hut
+					if (smoked > 0) sh[b.race].puffFrames = smokePuffFrames;   // short faint puff over that race's hut
 					printf("%s KILLED%s - %s food: %d (+%d, +%d smoked)\n", name, speared ? " (spear)" : "", racePlurals[clampRace(b.race)], rs.food, yield, smoked);
 					logRaceEvent(string(b.name) + (speared ? " speared a " : " killed a ") + name + " (+" + to_string(yield) + " food"
 					         + (smoked > 0 ? ", +" + to_string(smoked) + " smoked" : string()) + ", " + to_string(rs.food) + ")", b.race);
@@ -3447,6 +3477,11 @@ void buildhouse(vector<barb>& barbs,vector<RectangleShape>& squares, vector<hous
             if (!lakeClear(FloatRect(Vector2f(tx - 3.0f, ty - 3.0f), houseSlabSize))) continue;  // same footprint, no houses in the water
             if (!fieldsClear(fields, FloatRect(Vector2f(tx - 3.0f, ty - 3.0f), houseSlabSize))) continue; // nor on a wheat plot
             if (!roadClearOfFields(fields, qc, Vector2f(tx + 2.0f, ty + 2.0f))) continue; // FARM-F1: its road can't cross one
+            {   // INBOX2-F1: nor its own race's smokehouse
+                FloatRect h = smokehouseRect(b.race);
+                FloatRect pad(h.position - Vector2f(smokehouseRoadPadPx, smokehouseRoadPadPx), h.size + Vector2f(2 * smokehouseRoadPadPx, 2 * smokehouseRoadPadPx));
+                if (segmentHitsRect(qc, Vector2f(tx + 2.0f, ty + 2.0f), pad)) continue;
+            }
             raceStock& rs = stockOf(b);
             b.reservedwood = true;
             b.reservedstone = canAfford(rs, houseWoodCost, houseStoneCost) ? houseStoneCost : 0; // 0 stone -> plain house
@@ -3541,10 +3576,8 @@ void buildshrine(vector<barb>& barbs, vector<RectangleShape>& squares, const vec
                     Vector2f d = p - Vector2f((float)s.x, (float)s.y);
                     if (d.x * d.x + d.y * d.y < shrineMinSpacing * shrineMinSpacing) found = false;
                 }
-                FloatRect hutClear(smokehousePos + smokehouseChimneyPos - Vector2f(smokehouseClearPx, smokehouseClearPx),
-                                   Vector2f(smokehouseSize.x, smokehouseSize.y - smokehouseChimneyPos.y) + Vector2f(2 * smokehouseClearPx, 2 * smokehouseClearPx));
                 FloatRect stoneRect(p - Vector2f(0.0f, shrineCapH), shrineSlabSize + Vector2f(0.0f, shrineCapH));
-                if (stoneRect.findIntersection(hutClear).has_value()) found = false; // keep the smokehouse spot free
+                if (!smokehouseClear(stoneRect)) found = false;                     // keep every race's smokehouse spot free
                 if (!forgeClear(stoneRect)) found = false;                          // and the forge spot
                 if (!lakeClear(stoneRect)) found = false;
                 if (!fieldsClear(fields, stoneRect)) found = false;
@@ -3620,13 +3653,15 @@ void drawShrines(RenderWindow& window, const vector<shrine>& shrines) {
 // this tick (colony-wide condition unmet), 0 to skip this barb, 1 to claim (ready() spends any cost before returning 1).
 // Once claimed, only the builder holding `kind` is advanced. Returns true on the tick the structure is finished;
 // the builder's jobKind and build flags are reset on that path.
+// INBOX2-F1: onlyRace >= 0 limits both the claim and the builder to that race (per-race structures sharing one job kind).
 template <class ReadyFn>
 bool buildOneOff(vector<barb>& barbs, vector<RectangleShape>& squares, bool& claimed, buildJob kind,
-                 Vector2f stand, const char* name, ReadyFn ready) {
+                 Vector2f stand, const char* name, ReadyFn ready, int onlyRace = -1) {
     for (int i = 0; i < (int)squares.size() && i < (int)barbs.size(); i++) {
         auto& sq = squares[i];
         auto& b  = barbs[i];
         if (b.garrisoned) continue;   // INBOX-F1: bellTick() owns this barb
+        if (onlyRace >= 0 && b.race != onlyRace) continue;
         if (!claimed) {
             if (b.jobKind != jobNone || b.chopping || b.timer > 0 || b.moving || b.movingbspot || b.building) continue;
             int r = ready(b);
@@ -3664,78 +3699,87 @@ bool buildOneOff(vector<barb>& barbs, vector<RectangleShape>& squares, bool& cla
     return false;
 }
 
-// Runs after buildshrine(). One builder ever: claimed is set on the claim and stays set once the hut stands.
+// Runs after buildshrine(). INBOX2-F1: one hut per race, built only once that race's crate stands (its quarter is
+// live) and it has smokehouseMinHouses of its own houses; a builder of that race claims it and its race pays.
+// Huts are independent, so several races can build at once. claimed stays set once a hut stands.
 // Houses keep first call on stone; wood is whatever buildhouse() left this tick.
-void buildsmokehouse(vector<barb>& barbs, vector<RectangleShape>& squares, const vector<house>& houses, smokehouse& sh) {
-    if (sh.boostTicks > 0) sh.boostTicks--;
-    if (sh.built) return;
-    bool done = buildOneOff(barbs, squares, sh.claimed, jobSmoke, smokehousePos + smokehouseStandOffset, "SMOKEHOUSE",
-        [&](const barb& b) {
-            if ((int)houses.size() < smokehouseMinHouses) return -1;
-            if (!forgeClear(FloatRect(smokehousePos + smokehouseChimneyPos, Vector2f(smokehouseSize.x, smokehouseSize.y - smokehouseChimneyPos.y))))
-                return -1;   // fixed spots: only trips if the layout constants are moved onto the forge
-            raceStock& rs = stockOf(b);   // RACE-F1: the builder's race pays
-            if (!canAfford(rs, smokehouseWoodCost, smokehouseStoneCost + houseStoneCost)) return 0;
-            spend(rs, smokehouseWoodCost, smokehouseStoneCost);
-            return 1;
-        });
-    if (!done) return;
-    sh.built = true;
-    printf("---SMOKEHOUSE BUILT--- +%d food per deer/rabbit kill\n", smokehouseFoodBonus);
-    logEvent("Smokehouse built (+" + to_string(smokehouseFoodBonus) + " food per kill)");
-}
-
-// Race with strictly the most houses; a tie for first (or no houses) gives raceHuman, the default style
-barbRace majorityRace(const vector<house>& houses) {
-    int n[raceCount] = {};
-    for (auto& h : houses) n[h.race]++;
-    int best = -1, bestN = 0;
-    bool tie = false;
+void buildsmokehouse(vector<barb>& barbs, vector<RectangleShape>& squares, const vector<house>& houses,
+                     const storehouse (&stores)[raceCount], smokehouseSet& sh) {
     for (int r = 0; r < raceCount; r++) {
-        if (n[r] > bestN) { best = r; bestN = n[r]; tie = false; }
-        else if (n[r] == bestN && bestN > 0) tie = true;
+        smokehouse& hut = sh[r];
+        if (hut.built || !stores[r].built) continue;
+        if (hut.claimed) {   // builder lost without releaseBarbWork() (should not happen): free the claim
+            bool held = false;
+            for (auto& b : barbs) if (b.jobKind == jobSmoke && b.race == r) held = true;
+            if (!held) hut.claimed = false;
+        }
+        bool done = buildOneOff(barbs, squares, hut.claimed, jobSmoke, smokehousePos[r] + smokehouseStandOffset, "SMOKEHOUSE",
+            [&](const barb&) {
+                int raceHouses = 0;
+                for (auto& h : houses) if (h.race == r) raceHouses++;
+                if (raceHouses < smokehouseMinHouses) return -1;
+                if (!storehouseClear(smokehouseRect(r)) || !lakeClear(smokehouseRect(r)))
+                    return -1;   // fixed offset from the crate: only trips if the layout constants are moved onto it
+                if (!canAfford(stock[r], smokehouseWoodCost, smokehouseStoneCost + houseStoneCost)) return -1;
+                spend(stock[r], smokehouseWoodCost, smokehouseStoneCost);   // RACE-F1: the race's own stock
+                return 1;
+            }, r);
+        if (!done) continue;
+        hut.built = true;
+        printf("---SMOKEHOUSE BUILT--- %s: +%d food per own deer/rabbit kill\n", raceDefs[r].name, smokehouseFoodBonus);
+        logRaceEvent(string(racePlurals[r]) + " build a smokehouse (+" + to_string(smokehouseFoodBonus) + " food per kill)", r);
     }
-    return (best < 0 || tie) ? raceHuman : (barbRace)best;
 }
 
-// Dark 6x5 hut: 2 roof rows over 3 wall rows, a 1x2 door and a grey 1x2 chimney. Drawn with the shrines.
-// Only the roof is tinted to the majority race's colour.
-void drawSmokehouse(RenderWindow& window, const smokehouse& sh, const vector<house>& houses) {
-    if (!sh.built) return;
-    RectangleShape r(smokehouseSize);
-    r.setPosition(smokehousePos);
-    r.setFillColor(smokehouseWallColor);
-    window.draw(r);
-    r.setSize(Vector2f(smokehouseSize.x, smokehouseRoofH));
-    r.setFillColor(smokehouseRoofRaceColors[majorityRace(houses)]);
-    window.draw(r);
-    r.setSize(smokehouseDoorSize);
-    r.setPosition(smokehousePos + smokehouseDoorPos);
-    r.setFillColor(smokehouseDoorColor);
-    window.draw(r);
-    r.setSize(smokehouseChimneySize);
-    r.setPosition(smokehousePos + smokehouseChimneyPos);
-    r.setFillColor(smokehouseChimneyColor);
-    window.draw(r);
+// Dark 6x5 hut: 2 roof rows over 3 wall rows, a 1x2 door and a grey 1x2 chimney. Drawn with the crates.
+// INBOX2-F1: one per race with a standing crate; the roof takes that race's muted colour.
+void drawSmokehouse(RenderWindow& window, const smokehouseSet& sh, const storehouse (&stores)[raceCount]) {
+    RectangleShape r;
+    for (int k = 0; k < raceCount; k++) {
+        if (!sh[k].built || !stores[k].built) continue;
+        r.setSize(smokehouseSize);
+        r.setPosition(smokehousePos[k]);
+        r.setFillColor(smokehouseWallColor);
+        window.draw(r);
+        r.setSize(Vector2f(smokehouseSize.x, smokehouseRoofH));
+        r.setFillColor(smokehouseRoofRaceColors[k]);
+        window.draw(r);
+        r.setSize(smokehouseDoorSize);
+        r.setPosition(smokehousePos[k] + smokehouseDoorPos);
+        r.setFillColor(smokehouseDoorColor);
+        window.draw(r);
+        r.setSize(smokehouseChimneySize);
+        r.setPosition(smokehousePos[k] + smokehouseChimneyPos);
+        r.setFillColor(smokehouseChimneyColor);
+        window.draw(r);
+    }
 }
 
-// Sparse puffs rising from the chimney and fading out; a short burst of extra puffs after a bonus kill.
-// Drawn above the trees and under the day/night overlay.
-void drawSmoke(RenderWindow& window, const smokehouse& sh, int frame) {
-    if (!sh.built) return;
-    int puffs = sh.boostTicks > 0 ? smokePuffsBoost : smokePuffsIdle;
-    Vector2f top = smokehousePos + smokehouseChimneyPos;   // chimney top-left
+// INBOX2-F1: no idle smoke. After one of a race's own smoked kills, its chimney lets out smokePuffCount faint puffs,
+// staggered, each rising and fading over smokePuffLifeFrames. A race without a hut draws nothing. Aged per drawn
+// frame (frozen while paused). Drawn above the trees and under the day/night overlay.
+void drawSmoke(RenderWindow& window, smokehouseSet& sh, bool paused) {
     RectangleShape p;
-    for (int k = 0; k < puffs; k++) {
-        float t = (float)((frame + k * smokeCycleFrames / puffs) % smokeCycleFrames) / smokeCycleFrames;
-        float sz = t < 0.5f ? smokePuffPx : 1.0f;
-        Vector2f at(top.x - (sz - 1.0f) * 0.5f + smokeDriftPx * t, top.y - sz - smokeRisePx * t);
-        p.setSize(Vector2f(sz, sz));
-        p.setPosition(Vector2f(floor(at.x), floor(at.y)));
-        Color c = smokeColor;
-        c.a = (uint8_t)(smokeAlpha * (1.0f - t));
-        p.setFillColor(c);
-        window.draw(p);
+    for (int k = 0; k < raceCount; k++) {
+        smokehouse& hut = sh[k];
+        if (!hut.built) { hut.puffFrames = 0; continue; }
+        if (hut.puffFrames <= 0) continue;
+        int elapsed = smokePuffFrames - hut.puffFrames;
+        Vector2f top = smokehousePos[k] + smokehouseChimneyPos;   // chimney top-left
+        for (int n = 0; n < smokePuffCount; n++) {
+            int age = elapsed - n * smokePuffStaggerFrames;
+            if (age < 0 || age >= smokePuffLifeFrames) continue;
+            float t = (float)age / smokePuffLifeFrames;
+            float sz = t < 0.5f ? smokePuffPx : 1.0f;
+            Vector2f at(top.x - (sz - 1.0f) * 0.5f + smokeDriftPx * t, top.y - sz - smokeRisePx * t);
+            p.setSize(Vector2f(sz, sz));
+            p.setPosition(Vector2f(floor(at.x), floor(at.y)));
+            Color c = smokeColor;
+            c.a = (uint8_t)(smokeAlpha * (1.0f - t));
+            p.setFillColor(c);
+            window.draw(p);
+        }
+        if (!paused) hut.puffFrames--;
     }
 }
 
@@ -4645,7 +4689,7 @@ void leaderWatchTick(const vector<barb>& barbs) {
 }
 
 // INBOX-F1: the release half of removeBarb(), shared with bellTick() so a barb taking shelter frees exactly what a dead one does
-void releaseBarbWork(barb& b, smokehouse& sh, forge& fg, storehouse (&stores)[raceCount], fieldGrid& fields) {
+void releaseBarbWork(barb& b, smokehouseSet& sh, forge& fg, storehouse (&stores)[raceCount], fieldGrid& fields) {
     if (b.deertargeting) clearHunt(b);
     dropCarry(b);
     if (b.reservedwood) stockOf(b).wood += houseWoodCost;   // house claim walked to but never built: back to its race's stock
@@ -4654,7 +4698,7 @@ void releaseBarbWork(barb& b, smokehouse& sh, forge& fg, storehouse (&stores)[ra
     b.reservedstone = 0;
     refundSpear(b);                              // POL-F3: paid spear craft goes back to its race before the swapRemove
     switch (b.jobKind) {                         // claims paid at claim time stay spent; the next builder pays again
-        case jobSmoke: if (!sh.built) sh.claimed = false; break;
+        case jobSmoke: if (b.race >= 0 && b.race < raceCount && !sh[b.race].built) sh[b.race].claimed = false; break;   // INBOX2-F1: own race's hut
         case jobForge: if (!fg.built) fg.claimed = false; break;
         case jobStall: if (!hasStall) stallClaimed = false; break;
         case jobStore: if (b.race >= 0 && b.race < raceCount && !stores[b.race].built) stores[b.race].claimed = false; break;
@@ -4682,7 +4726,7 @@ void releaseBarbWork(barb& b, smokehouse& sh, forge& fg, storehouse (&stores)[ra
 // reserved house/shrine materials, one-off build claims, paving/spear jobs, the crown), then swapRemoves barbs and
 // squares at the same index. Callers removing several must go in descending index order.
 void removeBarb(vector<barb>& barbs, vector<RectangleShape>& squares, int i,
-                smokehouse& sh, forge& fg, storehouse (&stores)[raceCount], fieldGrid& fields) {
+                smokehouseSet& sh, forge& fg, storehouse (&stores)[raceCount], fieldGrid& fields) {
     barb& b = barbs[i];
     releaseBarbWork(b, sh, fg, stores, fields);   // garrison state (INBOX-F1) lives in the struct and goes with the swapRemove
     if (isLeader(b)) loseLeader(b.race);
@@ -4696,7 +4740,7 @@ void removeBarb(vector<barb>& barbs, vector<RectangleShape>& squares, int i,
 // R30-F5: end of tick. Every barb at 0 hp is collected first, then removed once each, highest index first, so a
 // swapRemove only ever pulls in a living barb from the back and the lower dead indices stay valid.
 void starveDeathTick(vector<barb>& barbs, vector<RectangleShape>& squares,
-                     smokehouse& sh, forge& fg, storehouse (&stores)[raceCount], fieldGrid& fields) {
+                     smokehouseSet& sh, forge& fg, storehouse (&stores)[raceCount], fieldGrid& fields) {
     vector<int> deadIds;
     for (auto& b : barbs) if (b.health <= 0) deadIds.push_back(b.id);
     if (deadIds.empty()) return;
@@ -4737,7 +4781,7 @@ void ungarrison(barb& b) {
 // Garrisoning drops the barb's work through releaseBarbWork() (and frees the tree/rock/bush it was working); haulers finish
 // their trip first. Every garrisoned barb's house is re-resolved by id each tick; a missing house releases the barb.
 void bellTick(vector<barb>& barbs, vector<RectangleShape>& squares, const vector<house>& houses, const vector<RectangleShape>& houseshapes,
-              const vector<wolf>& wolves, storehouse (&stores)[raceCount], smokehouse& sh, forge& fg, fieldGrid& fields,
+              const vector<wolf>& wolves, storehouse (&stores)[raceCount], smokehouseSet& sh, forge& fg, fieldGrid& fields,
               vector<tree>& trees, const vector<CircleShape>& tris, vector<rock>& rocks, const vector<CircleShape>& octs,
               vector<bush>& bushes) {
     for (int r = 0; r < raceCount; r++) {
@@ -5593,8 +5637,8 @@ void treespawn(vector<tree>& trees, vector<CircleShape>& tris, vector<RectangleS
 }
 
 // 2-3 ponds away from the village, apart from each other. Startup trees (trees/tris/stumps) and rocks (rocks/octs)
-// in or touching a lake are removed together. Fixed village spots (smokehouse, stall, forge) are inside the
-// lakeVillageMinDist ring, so they never need a lake check. Shore points are cached here for angling.
+// in or touching a lake are removed together. Fixed village spots (stall, forge) are inside the
+// lakeVillageMinDist ring, and the race smokehouses sit inside the dry quarters, so they never need a lake check. Shore points are cached here for angling.
 void spawnLakes(vector<tree>& trees, vector<CircleShape>& tris, vector<RectangleShape>& stumps, vector<rock>& rocks, vector<CircleShape>& octs) {
     uniform_int_distribution<int> count(lakeCountMin, lakeCountMax);
     uniform_int_distribution<int> pickSize(0, lakeSizeCount - 1);
@@ -5846,7 +5890,7 @@ int main() {
     vector<RectangleShape> houseshapes;
     vector<shrine> shrines;
     shrines.reserve(maxShrines);
-    smokehouse smoke;
+    smokehouseSet smoke;   // INBOX2-F1: one per race, indexed by barbRace
     forge dwarfForge;
     storehouse stores[raceCount];   // R29-F1: one per race, indexed by barbRace
     fieldGrid fields;   // FARM-F1: fields[race][k], each race's wheat plots beside its storehouse
@@ -5993,7 +6037,7 @@ int main() {
             for (int rep = 0; rep < simSpeed; rep++) {
                 buildhouse(barbs, squares, houses, houseshapes, fields);
                 buildshrine(barbs, squares, houses, shrines, fields);
-                buildsmokehouse(barbs, squares, houses, smoke);
+                buildsmokehouse(barbs, squares, houses, stores, smoke);
                 buildstall(barbs, squares);
                 buildforge(barbs, squares, houses, dwarfForge);
                 buildstorehouses(barbs, squares, houses, stores);
@@ -6088,7 +6132,7 @@ int main() {
 	}
 	drawHouses(window, houses, houseshapes);
 	drawShrines(window, shrines);
-	drawSmokehouse(window, smoke, houses);
+	drawSmokehouse(window, smoke, stores);
 	drawStall(window, activeTrader);
 	drawForge(window, dwarfForge, frameCount, forgeBonusPending(barbs, dwarfForge));
 	if (forgeEmberFrames > 0 && !paused) forgeEmberFrames--;
@@ -6114,7 +6158,7 @@ int main() {
         drawBarbs(window, barbs, squares, frameCount, zoom);
 	if (activeTrader) drawSnapped(window, activeTrader->shape);
 	drawTrees(window, tris, treeVerts);
-	drawSmoke(window, smoke, frameCount);
+	drawSmoke(window, smoke, paused);   // INBOX2-F1: per-race puffs, only after own smoked kills
 	drawMillPuffs(window);   // FARM-F2: above the trees, under the overlay
 	drawForgeSparks(window, paused);   // POL-F5b: above barbs and trees so the sparks read, under the overlay
 	drawBirds(window, birds, birdShape, frameCount);
