@@ -131,6 +131,11 @@ const Color crownColor(250, 208, 64);     // bright gold: off the body, so it ne
 enum leaderNeed { needWood, needStone, needFood, needCount, needNone = needCount };
 const char* const leaderNeedNames[needCount] = {"wood", "stone", "food"};
 const float leaderNeedMult = 1.25f;       // matching weight multiplier, re-clamped to [needWeightMin, needWeightMax]
+// Leader orders (INBOX-F2b): at dawn the leader hands its need to idle same-race barbs as individual orders
+const float orderRaceShare = 0.6f;        // at most this share of the race (leader included in the count) holds an order
+const int orderDays = 1;                  // an order expires after this many in-game days (counted in ticks)
+const float orderPipMinZoom = 3.0f;       // pips show for every ordered barb at/above this zoom; below it, only on hover
+const Vector2f orderPipSize(2.0f, 1.0f);  // 2x1 tick centred under the feet (below the health bar when that shows)
 
 // Sasuke the Shinobi (R25-F2): the first founder; fast, and blinks a few px when idle
 const char* const shinobiName = "Sasuke";      // not in barbNames, so nobody else can roll it
@@ -1380,6 +1385,8 @@ struct barb {
     workMem mem[memSpotCount];   // INBOX-F2: recent work spots, [0] newest; reset in makeBarb(), moves with the struct on swapRemove
     bool memReturn = false;      // INBOX-F2: a trip just ended (deposit or pick); the next search tries mem[] first
     bool memShared = false;      // INBOX-F2: already shared a fresh spot this trip
+    leaderNeed order = needNone; // INBOX-F2b: leader's individual order; needNone = no order. Never touches garrison state
+    int orderTicks = 0;          // INBOX-F2b: ticks until the order expires; reset in makeBarb()
 };
 bool barbHidden(const barb& b) { return b.garrisoned && b.garrisonInside; }   // INBOX-F1
 
@@ -2579,6 +2586,7 @@ void traderTick(optional<trader>& tr, const vector<barb>& barbs, const storehous
 struct hoverHit {string label; optional<RectangleShape> rect; optional<CircleShape> circle;
                  int homeOfBarb = -1;     // hovered barb's home house id -> outline that house
                  int hoveredHouse = -1;   // hovered house id -> pip over each resident
+                 int hoveredBarb = -1;    // INBOX-F2b: hovered barb id -> its order pip shows at any zoom
                  optional<Color> tint;}; // POL-F1: ledger outline + text colour (default tooltip colours when unset)
 
 int spearsOfRace(const vector<barb>& barbs, int r);   // POL-F3, defined with craftspear
@@ -2635,8 +2643,12 @@ optional<hoverHit> pickHover(Vector2f p, float radius, const vector<barb>& barbs
                 label += ", of house " + to_string(b.homeHouse + 1) + ", " + to_string(kin) + " kin";
             }
             if (isLeader(b) && raceNeed[b.race] != needNone) label += string("\nNeeds: ") + leaderNeedNames[raceNeed[b.race]];   // R30-F2
+            if (b.order != needNone)   // INBOX-F2b: hours rounded up so a live order never reads 0h
+                label += string("\nOrder: ") + leaderNeedNames[b.order] + " (" +
+                         to_string((b.orderTicks + ticksPerGameHour - 1) / ticksPerGameHour) + "h left)";
             hoverHit h{label, squares[i], nullopt};
             h.homeOfBarb = b.homeHouse;
+            h.hoveredBarb = b.id;   // INBOX-F2b: order pip
             return h;
         }
     if (tr && near(tr->shape)) {
@@ -2779,6 +2791,30 @@ FloatRect drawInspectPanel(RenderWindow& window, const Font& font, const barb& b
     drawBar(window, Vector2f(barX, rowY(3) + barDy), hungerFrac, hungry ? uiStarvingRed : inspectHungerFill);
     drawBar(window, Vector2f(barX, rowY(4) + barDy), (float)b.health / barbMaxHealth, inspectHealthFill);
     return FloatRect(pos, size);
+}
+
+// INBOX-F2b: 2x1 job pip under an ordered barb's feet, in the task colour of the ordered job (same colours as the work
+// stripe). Every ordered barb at orderPipMinZoom and above; below that only the hovered one. Drawn after the overlays like
+// the ballot pips so the colour reads true; indoor or sheltering barbs show none.
+void drawOrderPips(RenderWindow& window, const View& worldView, float zoom, int hoveredBarb,
+                   const vector<barb>& barbs, const vector<RectangleShape>& squares) {
+    bool all = zoom >= orderPipMinZoom;
+    if (!all && hoveredBarb < 0) return;
+    window.setView(worldView);
+    const Color pipColors[needCount] = {barbChopColor, barbMineColor, barbPickColor};   // indexed like leaderNeed
+    RectangleShape pip(orderPipSize);
+    for (int i = 0; i < (int)squares.size() && i < (int)barbs.size(); i++) {
+        const barb& b = barbs[i];
+        if (b.order == needNone || b.garrisoned) continue;
+        if (!all && b.id != hoveredBarb) continue;
+        Vector2f base = snapPx(squares[i].getPosition());
+        float feet = base.y + squares[i].getSize().y;
+        bool barShown = zoom >= healthBarMinZoom && b.health < barbMaxHealth;   // same test as drawBarbs: sit one row under it
+        float y = feet + healthBarGap + (barShown ? 1.0f + healthBarGap : 0.0f);
+        pip.setFillColor(pipColors[b.order]);
+        pip.setPosition(Vector2f(base.x + floor((raceOf(b).bodySize.x - orderPipSize.x) / 2.0f), y));
+        window.draw(pip);
+    }
 }
 
 // Hover-only household marks, drawn after the overlays like the hover outline
@@ -4297,6 +4333,8 @@ void makeBarb(Vector2i pos, vector<barb>& barbs, vector<RectangleShape>& squares
     b.spearAtForge = false;   // POL-F5a
     for (auto& m : b.mem) m = workMem{};   // INBOX-F2: a newborn remembers no spots
     b.memReturn = b.memShared = false;
+    b.order = needNone;   // INBOX-F2b: a newborn holds no order
+    b.orderTicks = 0;
     b.trait =(barbTrait)uniform_int_distribution<int>(0, traitCount - 1)(gen);   // R25-F1
     if (!sasukeTaken && homeHouse < 0) {   // R25-F2: the first founder is Sasuke (no table name is spent)
         sasukeTaken = true;
@@ -4859,10 +4897,55 @@ void rankRaceNeed(const vector<barb>& barbs, int r) {
            best == needNone ? "none" : leaderNeedNames[best]);
 }
 
+// INBOX-F2b: idle = no work, build, hunt, haul or job claim. Garrisoned barbs are never idle, so an order never touches shelter
+bool orderIdle(const barb& b) {
+    return !b.garrisoned && !b.chopping && !b.building && !b.movingbspot && !b.deertargeting && b.jobKind == jobNone && b.carryKind == carryNone;
+}
+
+// INBOX-F2b: right after the leader names its need, it hands that need as an individual order to idle members (not
+// itself), at most orderRaceShare of the race. The race's old orders are cleared first, so no order outlives a day.
+void issueOrders(vector<barb>& barbs, int r) {
+    int members = 0;
+    vector<int> idle;
+    for (int i = 0; i < (int)barbs.size(); i++) {
+        barb& b = barbs[i];
+        if (b.race != r) continue;
+        members++;
+        b.order = needNone;
+        b.orderTicks = 0;
+        if (!isLeader(b) && orderIdle(b)) idle.push_back(i);
+    }
+    if (raceNeed[r] == needNone || idle.empty()) return;
+    int cap = min((int)idle.size(), (int)(members * orderRaceShare));
+    if (cap <= 0) return;
+    shuffle(idle.begin(), idle.end(), gen);
+    for (int k = 0; k < cap; k++) {
+        barbs[idle[k]].order = raceNeed[r];
+        barbs[idle[k]].orderTicks = orderDays * 24 * ticksPerGameHour;
+    }
+    printf("LEADER ORDERS - %s leader orders %d of %d (%d idle) to gather %s\n", racePlurals[r], cap, members, (int)idle.size(),
+           leaderNeedNames[raceNeed[r]]);
+    logEvent(string(racePlurals[r]) + " leader sends " + to_string(cap) + " for " + leaderNeedNames[raceNeed[r]]);
+}
+
+// INBOX-F2b: every tick. Orders run out after orderDays, and lapse at once if the race has no leader any more
+void orderTick(vector<barb>& barbs) {
+    for (auto& b : barbs) {
+        if (b.order == needNone) continue;
+        bool leaderless = b.race < 0 || b.race >= raceCount || !raceElected[b.race];
+        if (--b.orderTicks <= 0 || leaderless) {
+            printf("ORDER ENDED - barb %d (%s) %s order for %s\n", b.id, racePlurals[clampRace(b.race)],
+                   leaderless ? "lost its leader's" : "finished its", leaderNeedNames[b.order]);
+            b.order = needNone;
+            b.orderTicks = 0;
+        }
+    }
+}
+
 void leaderTick(vector<barb>& barbs) {
     for (int r = 0; r < raceCount; r++) {
         if (raceElected[r] && findBarbById(barbs, raceLeaderId[r]) < 0) loseLeader(r);   // leader gone: no leader, may elect again
-        if (raceElected[r]) { rankRaceNeed(barbs, r); continue; }
+        if (raceElected[r]) { rankRaceNeed(barbs, r); issueOrders(barbs, r); continue; }   // INBOX-F2b
         vector<int> members;
         for (int i = 0; i < (int)barbs.size(); i++) if (barbs[i].race == r) members.push_back(i);
         if ((int)members.size() < electionThreshold) continue;
@@ -4886,6 +4969,7 @@ void leaderTick(vector<barb>& barbs) {
             printf("ELECTION - %s crown %s, barb %d (%s approve)\n", racePlurals[r], who.c_str(), cand.id, tally.c_str());
             logEvent(string(racePlurals[r]) + " crown " + who + " (" + tally + " approve)");
             rankRaceNeed(barbs, r);   // R30-F2: the new leader names a need this same dawn
+            issueOrders(barbs, r);    // INBOX-F2b: and hands out orders for it
         } else {
             printf("ELECTION - %s: no consensus on %s, barb %d (%s approve)\n", racePlurals[r], who.c_str(), cand.id, tally.c_str());
             logEvent(string(racePlurals[r]) + ": no consensus (" + tally + ")");
@@ -5227,6 +5311,12 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
             float treeScore = bestTree != -1 ? treeDSq / (treeW * treeW) : notFound;
             float rockScore = bestRock != -1 ? rockDSq / (rockW * rockW) : notFound;
             float bushScore = bestBush != -1 ? bushDSq / (bushW * bushW) : notFound;
+            // INBOX-F2b: an ordered barb takes its ordered resource whenever one is in reach (-1 beats any real score);
+            // with none in reach it falls back to the normal weighted pick, so an order never strands a barb
+            bool orderHit = false;
+            if (b.order == needWood  && bestTree != -1) { treeScore = -1.0f; orderHit = true; }
+            if (b.order == needStone && bestRock != -1) { rockScore = -1.0f; orderHit = true; }
+            if (b.order == needFood  && bestBush != -1) { bushScore = -1.0f; orderHit = true; }
             // a rock wins only when strictly better, as when trees were scanned first; a bush likewise
             bestIsRock = bestRock != -1 && rockScore < treeScore;
             bool bestIsBush = bestBush != -1 && bushScore < (bestIsRock ? rockScore : treeScore);
@@ -5245,6 +5335,7 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
                     bestField = k;
                 }
             }
+            if (b.order == needFood && bestField >= 0 && bestBush == -1) { fieldScore = -1.0f; orderHit = true; }   // INBOX-F2b: wheat is food too
             if (bestField >= 0 && fieldScore < min(min(treeScore, rockScore), bushScore) && b.moving==false) {
                 Vector2f wp = fieldWorkSpot(fields[b.race][bestField]);
                 b.targetx = (int)wp.x;
@@ -5259,6 +5350,7 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
             bool memStale = false;
             memKind freshKind = memNone;   // the spot this barb heads for this tick, shared if a stale one was just dropped
             Vector2f freshPos;
+            if (orderHit) b.memReturn = false;   // INBOX-F2b: a live order outranks spot memory
             if (b.memReturn && !b.moving && !b.deertargeting) {
                 b.memReturn = false;
                 for (int k = 0; k < memSpotCount && b.mem[k].kind != memNone && !b.moving; ) {
@@ -5934,6 +6026,7 @@ int main() {
                 paveTick(barbs, squares);
                 leaderWatchTick(barbs);   // R30-F2: leader death -> global weights + ticker line, same tick
                 councilTick(barbs);
+                orderTick(barbs);   // INBOX-F2b: after leaderWatchTick, so a dead leader's orders lapse the same tick
                 starveDeathTick(barbs, squares, smoke, dwarfForge, stores, fields);   // R30-F5: last, once per tick
                 stockShortageTick(barbs);   // RACE-F1: after deaths, so an emptied race never announces
             }
@@ -6082,6 +6175,7 @@ int main() {
                 if (hover) drawHoverOutline(window, worldView, *hover, zoom);
                 if (hover) drawHousehold(window, worldView, *hover, zoom, barbs, squares, houses, houseshapes);
             }
+            drawOrderPips(window, worldView, zoom, hover ? hover->hoveredBarb : -1, barbs, squares);   // INBOX-F2b: before the HUD
         }
 
         if (hudFontOk) {
