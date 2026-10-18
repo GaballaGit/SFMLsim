@@ -629,6 +629,24 @@ const Color keepPipColor(206, 220, 238);         // pale blue-white, distinct fr
 const Vector2f keepDroopSize(2.0f, 3.0f);        // limp banner hanging beside the pole when the keep is empty
 const Vector2f keepDroopOffset(1.0f, 1.0f);      // relative to the pole top: just right of the pole, a px below the top
 static_assert(keepSlotMax <= 4 * 2, "one pip per slot: 4 columns x 2 rows");
+// Curtain Wall and Gate (R31-F2): cosmetic only (no collision or pathing). Once a race's keep stands, a ring of
+// wallSlots arc slots centred on the keep gets one 2px-thick stone segment every wallRiseTicks, growing out from both
+// sides of a wallGateSlots-wide gate gap that faces the campfire. A slot whose arc would touch a building, plot, rock,
+// bush, lake, paved cell, the map edge or another quarter is skipped for good; trees on an accepted arc are felled once.
+const float wallRingRadius = 44.0f;              // around the keep centre (20px below the crate centre): clears the hut's 4px zone above the
+                                                 // crate by 3px; the far arc reaches about the quarter clearing edge (63)
+const int wallSlots = 15;
+const int wallGateSlots = 3;                     // the gap, centred on the campfire bearing
+const int wallSegMax = 12;
+static_assert(wallSegMax + wallGateSlots == wallSlots, "every non-gate slot holds one segment");
+const float wallThickPx = 2.0f;                  // same as a barb
+const float wallSeamPx = 2.0f;                   // arc length left open between neighbouring segments
+const int wallRiseTicks = ticksPerMinute / 2;    // one segment per 30 s at 1x: a full wall in ~6 min
+const Color wallStoneColor(64, 70, 68);          // opaque, low-contrast grey-green stone: darker than the keep and paving
+const Color wallRainColor(50, 56, 58);           // wet stone while raining (global flag, no per-segment state)
+const Color wallFlashColor(118, 122, 114);       // the newest segment starts toward this...
+const float wallFlashStrength = 0.35f;           // ...by this much, fading linearly to nothing
+const int wallFlashTicks = 40;                   // ~0.7 s at 1x, timed from the race's last placement tick
 
 // UI red (UIO-F1/F2/F3): one muted brick red for every "starving" mark in the UI (minimap dots, inspect panel, hunger lens)
 const Color uiStarvingRed = healthBarFillColor;
@@ -1198,6 +1216,16 @@ int keepBuilderId[raceCount] = {-1, -1, -1};
 // ungarrison() removes, plus bellTick()'s per-tick validation against live barbs.
 vector<int> keepSlots[raceCount];
 
+// R31-F2: one curtain-wall segment; x,y = arc midpoint (world px), slot = ring slot (0 = gate centre). Cosmetic only.
+struct wallseg {int id = -1; int race = -1; int x = 0, y = 0; int slot = 0;};
+vector<wallseg> wallsegs;
+int nextWallSegId = 0;
+int wallClock = 0;                        // sim ticks counted by wallTick(): the flash timestamp base
+int wallNextOrder[raceCount] = {0, 0, 0}; // next index into the rise order (wallSegMax = all slots tried)
+int wallTimer[raceCount] = {0, 0, 0};
+int wallFlashTick[raceCount] = {-wallFlashTicks, -wallFlashTicks, -wallFlashTicks};  // wallClock of the last placement
+int wallFlashSegId[raceCount] = {-1, -1, -1};
+
 // R31-F1: race k's keep footprint: banner pole/flag above, the silhouette, and its builder's stand spot below
 FloatRect keepZone(int k) {
     return FloatRect(Vector2f((float)keeps[k].x, (float)keeps[k].y - keepPoleH),
@@ -1275,7 +1303,11 @@ void placeQuarters() {
             Vector2f kp = storehousePos[k] + keepCrateOffset;              // R31-F1: keep below the crate
             keeps[k] = keep{-1, k, (int)kp.x, (int)kp.y, false};
             keepSlots[k].clear();                                          // R31-F3
+            wallNextOrder[k] = wallTimer[k] = 0;                           // R31-F2
+            wallFlashTick[k] = -wallFlashTicks;
+            wallFlashSegId[k] = -1;
         }
+        wallsegs.clear();
     };
     bool ok = false;
     for (int t = 0; t < quarterPlaceTries && !ok; t++) {
@@ -4870,6 +4902,126 @@ void drawKeeps(RenderWindow& window, const vector<barb>& barbs) {
     }
 }
 
+// R31-F2: keep centre, the campfire bearing the gate faces, and the 2x2 block top-lefts tracing slot s's arc
+Vector2f wallCentre(int r) { return Vector2f((float)keeps[r].x, (float)keeps[r].y) + keepSize / 2.0f; }
+void wallArcBlocks(int r, int s, vector<Vector2f>& out) {
+    out.clear();
+    Vector2f kc = wallCentre(r);
+    float gate = atan2(villageCenter.y - kc.y, villageCenter.x - kc.x);
+    float mid = gate + 6.2831853f * s / wallSlots;
+    float half = (6.2831853f / wallSlots - wallSeamPx / wallRingRadius) / 2.0f;
+    int n = max(2, (int)ceil(2.0f * half * wallRingRadius) + 1);   // about one sample per px of arc: no holes in the run
+    for (int k = 0; k < n; k++) {
+        float a = mid - half + 2.0f * half * k / (n - 1);
+        Vector2f p = kc + Vector2f(cos(a), sin(a)) * wallRingRadius;
+        out.push_back(snapPx(p - Vector2f(wallThickPx, wallThickPx) / 2.0f));
+    }
+}
+
+// R31-F2: rise order: slots beside the gate first, alternating sides, ending opposite the gate
+int wallOrderSlot(int i) { return i % 2 == 0 ? wallGateSlots / 2 + 1 + i / 2 : wallSlots - wallGateSlots / 2 - 1 - i / 2; }
+
+// R31-F2: once per tick. For each race with a built keep, every wallRiseTicks tries the next slots in rise order until
+// one fits (blocked slots are skipped for good). All overlap checks and the one-off tree felling happen only here, at
+// placement; nothing scans per tick. Cosmetic: segments never block movement or placement.
+void wallTick(vector<barb>& barbs, vector<tree>& trees, vector<CircleShape>& tris, vector<RectangleShape>& stumps,
+              const vector<CircleShape>& octs, const vector<CircleShape>& bushshapes, const vector<RectangleShape>& houseshapes,
+              const vector<shrine>& shrines, const fieldGrid& fields) {
+    wallClock++;
+    static vector<Vector2f> blocks;
+    for (int r = 0; r < raceCount; r++) {
+        if (!keeps[r].built || wallNextOrder[r] >= wallSegMax) continue;
+        if (++wallTimer[r] < wallRiseTicks) continue;
+        wallTimer[r] = 0;
+        while (wallNextOrder[r] < wallSegMax) {
+            int s = wallOrderSlot(wallNextOrder[r]++);
+            wallArcBlocks(r, s, blocks);
+            bool ok = true;
+            for (auto& bp : blocks) {
+                FloatRect br(bp, Vector2f(wallThickPx, wallThickPx));
+                Vector2f c = bp + Vector2f(wallThickPx, wallThickPx) / 2.0f;
+                if (bp.x < 0.0f || bp.y < hudBarHeight || bp.x + wallThickPx > worldSize || bp.y + wallThickPx > worldSize) ok = false;
+                for (int q = 0; ok && q < raceCount; q++) {   // never into another race's quarter
+                    Vector2f d = c - quarterCentre(q);
+                    if (q != r && d.x * d.x + d.y * d.y < quarterClearRadius * quarterClearRadius) ok = false;
+                }
+                Vector2f dv = c - villageCenter;
+                if (ok && dv.x * dv.x + dv.y * dv.y < clearRadiusSq) ok = false;
+                if (ok && (!forgeClear(br) || !lakeClear(br) || !fieldsClear(fields, br))) ok = false;   // forge, crates, huts, keeps, plots, mills
+                if (ok && br.findIntersection(FloatRect(stallPos, stallSize)).has_value()) ok = false;
+                for (int i = 0; ok && i < (int)houseshapes.size(); i++) {
+                    Vector2f hc = houseshapes[i].getPosition() + houseshapes[i].getSize() / 2.0f;
+                    if (br.findIntersection(FloatRect(hc - houseSlabSize / 2.0f, houseSlabSize)).has_value()) ok = false;
+                }
+                for (int i = 0; ok && i < (int)shrines.size(); i++)
+                    if (br.findIntersection(FloatRect(Vector2f((float)shrines[i].x, (float)shrines[i].y - shrineCapH),
+                                                      shrineSlabSize + Vector2f(0.0f, shrineCapH))).has_value()) ok = false;
+                for (int i = 0; ok && i < (int)octs.size(); i++)
+                    if (br.findIntersection(octs[i].getGlobalBounds()).has_value()) ok = false;
+                for (int i = 0; ok && i < (int)bushshapes.size(); i++)
+                    if (br.findIntersection(bushshapes[i].getGlobalBounds()).has_value()) ok = false;
+                for (int k = 0; ok && k < 4; k++) {   // paved cells under any corner
+                    int cell = trailCell(bp + Vector2f(k % 2 ? wallThickPx - 0.01f : 0.0f, k / 2 ? wallThickPx - 0.01f : 0.0f));
+                    if (cell >= 0 && trailPaved[cell]) ok = false;
+                }
+                if (!ok) break;
+            }
+            if (!ok) {
+                printf("Wall slot %d skipped - %s (blocked)\n", s, raceDefs[r].name);
+                continue;
+            }
+            for (int i = (int)tris.size() - 1; i >= 0; i--) {   // fell trees on the arc, once
+                FloatRect tb = tris[i].getGlobalBounds();
+                bool hit = false;
+                for (auto& bp : blocks)
+                    if (tb.findIntersection(FloatRect(bp, Vector2f(wallThickPx, wallThickPx))).has_value()) { hit = true; break; }
+                if (!hit) continue;
+                Vector2f p = tris[i].getPosition();
+                int tix = (int)(p.x + 8), tiy = (int)(p.y + 15);   // same stand spot the clearing pass in main drops
+                for (auto& b : barbs) {
+                    if (!b.garrisoned && b.target != targetBush && b.targetx == tix && b.targety == tiy) {
+                        b.moving = b.chopping = false;
+                        b.timer  = 0;
+                        b.targetx = b.targety = -1;
+                    }
+                }
+                swapRemove(tris, i); swapRemove(stumps, i); swapRemove(trees, i);
+            }
+            Vector2f m = blocks[blocks.size() / 2] + Vector2f(wallThickPx, wallThickPx) / 2.0f;
+            wallsegs.push_back(wallseg{nextWallSegId++, r, (int)m.x, (int)m.y, s});
+            wallFlashTick[r] = wallClock;
+            wallFlashSegId[r] = wallsegs.back().id;
+            printf("---WALL SEGMENT--- %s, slot %d at %d,%d (%d tried of %d)\n", raceDefs[r].name, s, (int)m.x, (int)m.y,
+                   wallNextOrder[r], wallSegMax);
+            break;
+        }
+        if (wallNextOrder[r] >= wallSegMax) {
+            int built = 0;
+            for (auto& w : wallsegs) if (w.race == r) built++;
+            printf("---CURTAIN WALL DONE--- %s, %d of %d segments\n", raceDefs[r].name, built, wallSegMax);
+            if (built > 0) logRaceEvent(string(racePlurals[r]) + " finish a curtain wall", r);
+        }
+    }
+}
+
+// R31-F2: drawn right after the trails, under paving, quarter marks, buildings and barbs. Opaque 2x2 blocks, so
+// overlapping samples never stack alpha. Wet tone while raining; the race's newest segment flashes faintly for
+// wallFlashTicks after it rises.
+void drawWalls(RenderWindow& window, VertexArray& va) {
+    va.clear();
+    static vector<Vector2f> blocks;
+    Color base = raining ? wallRainColor : wallStoneColor;
+    for (auto& w : wallsegs) {
+        Color col = base;
+        int age = wallClock - wallFlashTick[w.race];
+        if (w.id == wallFlashSegId[w.race] && age >= 0 && age < wallFlashTicks)
+            col = lerpColor(base, wallFlashColor, wallFlashStrength * (1.0f - (float)age / wallFlashTicks));
+        wallArcBlocks(w.race, w.slot, blocks);
+        for (auto& bp : blocks) pushQuad(va, bp, Vector2f(wallThickPx, wallThickPx), col);
+    }
+    if (va.getVertexCount() > 0) window.draw(va);
+}
+
 // INBOX-F1: the release half of removeBarb(), shared with bellTick() so a barb taking shelter frees exactly what a dead one does
 void releaseBarbWork(barb& b, smokehouseSet& sh, forge& fg, storehouse (&stores)[raceCount], fieldGrid& fields) {
     if (b.deertargeting) clearHunt(b);
@@ -6189,6 +6341,7 @@ int main() {
     VertexArray lensVerts(PrimitiveType::Triangles);
     VertexArray trailVerts(PrimitiveType::Triangles);
     VertexArray paveVerts(PrimitiveType::Triangles);   // cobbled cells (R20-F2), rebuilt only when a cell is paved
+    VertexArray wallVerts(PrimitiveType::Triangles);   // R31-F2: scratch buffer for drawWalls, rebuilt every frame
     vector<bird> birds;
     Vector2f birdHeading(1.0f, 0.0f);
     RectangleShape birdShape;
@@ -6270,6 +6423,7 @@ int main() {
                 buildfield(barbs, squares, houses, shrines, stores, fields);
                 buildmills(barbs, squares, fields);   // FARM-F2
                 buildkeeps(barbs, squares, stores);   // R31-F1: Town era
+                wallTick(barbs, trees, tris, stumps, octs, bushshapes, houseshapes, shrines, fields);   // R31-F2: cosmetic curtain walls
                 craftspear(barbs, squares, dwarfForge);
                 minematerials(squares, barbs, tris, stumps, trees, octs, rocks, bushes, bushshapes, catchRings, fields, stores, dwarfForge);
                 barbmove(squares, barbs);
@@ -6336,6 +6490,7 @@ int main() {
         window.clear(Color(4, 20, 14)); //bg color
         window.setView(worldView);
         drawTrails(window, trailVerts);
+        drawWalls(window, wallVerts);    // R31-F2: under paving, quarter marks, buildings and barbs
         drawPaving(window, paveVerts);   // over the trail tint, under everything else
         drawQuarters(window, stores, zoom);   // R30-F1: ground marks, under lakes, houses and crates
         drawLakes(window);
