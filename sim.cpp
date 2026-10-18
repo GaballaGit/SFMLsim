@@ -318,6 +318,11 @@ const float deerFleeEdgeMargin = 4.0f;     // flee targets stay this far inside 
 
 const float barbWorkSearchRadius = 25.0f;  // barbs only notice trees/rocks within this many px (findNearest)
 const float noSearchRadius = numeric_limits<float>::infinity(); // findNearest with no distance limit
+const int memSpotCount = 3;                // INBOX-F2: work spots a barb remembers (fixed array, [0] = most recent)
+const float memSpotRadius = 25.0f;         // a remembered spot is live while a free tree/rock/ripe bush of its kind stands within this
+const float memMergeRadius = 12.0f;        // a new spot this close to a remembered one of the same kind refreshes it instead
+const float memShareRadius = 40.0f;        // a fresh spot is shared only with a same-race barb within this many px...
+const int memShareMax = 1;                 // ...and with at most this many of them, once per barb per trip
 const Vector2f treeWorkOffset(8.0f, 15.0f); // where a barb stands to chop a tree, relative to its shape
 const Vector2f rockWorkOffset(6.0f, 10.0f); // where a barb stands to mine a rock, relative to its shape
 const float treeNeedBoost = 1.0f;          // tree weight rises up to 1 + this as wood falls from houseWoodCost to 0
@@ -1328,6 +1333,8 @@ bool lakeClear(const FloatRect& r, const Vector2f* pathFrom = nullptr) {
 
 // Work target of a barb. targetNone with a set targetx is a tree (or a hunt/wander/build spot, which own their flags).
 enum targetKind {targetNone, targetBush, targetRock, targetLake, targetField, targetDepot}; // targetDepot: hauling a load (R29-F1)
+enum memKind {memNone, memTree, memRock, memBush};   // INBOX-F2
+struct workMem {Vector2f pos; memKind kind = memNone;};   // pos = the work spot a barb stood on; validated by position, never an index
 enum carryLoad {carryNone, carryWood, carryStone, carryWheat};   // R29-F1: what a hauler holds; set only while target == targetDepot
 // FARM-F2: carryWheat is a reaped sheaf headed for the race's mill (storehouse/campfire if none). It lives in the same
 // carryKind field, so every carryLoad reset (dropCarry, deposit, removeBarb) clears it too.
@@ -1370,6 +1377,9 @@ struct barb {
     bool garrisoned = false;     // INBOX-F1: exclusive state owned by bellTick(); every other per-tick loop skips the barb
     bool garrisonInside = false; // INBOX-F1: reached the doorstep and hidden inside (not drawn, not pickable)
     int garrisonHouseId = -1;    // INBOX-F1: house.id (stable, never an index); validated every tick
+    workMem mem[memSpotCount];   // INBOX-F2: recent work spots, [0] newest; reset in makeBarb(), moves with the struct on swapRemove
+    bool memReturn = false;      // INBOX-F2: a trip just ended (deposit or pick); the next search tries mem[] first
+    bool memShared = false;      // INBOX-F2: already shared a fresh spot this trip
 };
 bool barbHidden(const barb& b) { return b.garrisoned && b.garrisonInside; }   // INBOX-F1
 
@@ -4285,6 +4295,8 @@ void makeBarb(Vector2i pos, vector<barb>& barbs, vector<RectangleShape>& squares
     b.spearTimer = 0;
     b.spearPaid = false;  // POL-F3
     b.spearAtForge = false;   // POL-F5a
+    for (auto& m : b.mem) m = workMem{};   // INBOX-F2: a newborn remembers no spots
+    b.memReturn = b.memShared = false;
     b.trait =(barbTrait)uniform_int_distribution<int>(0, traitCount - 1)(gen);   // R25-F1
     if (!sasukeTaken && homeHouse < 0) {   // R25-F2: the first founder is Sasuke (no table name is spent)
         sasukeTaken = true;
@@ -5007,6 +5019,46 @@ void buildWorkClaims(const vector<barb>& barbs, const vector<CircleShape>& tris,
     }
 }
 
+// INBOX-F2: drop mem[k], shifting the older spots up so [0] stays the newest
+void memDrop(barb& b, int k) {
+    for (int i = k; i + 1 < memSpotCount; i++) b.mem[i] = b.mem[i + 1];
+    b.mem[memSpotCount - 1] = workMem{};
+}
+
+// INBOX-F2: remember spot p as the newest; a same-kind spot within memMergeRadius is refreshed (moved to [0]), else the oldest falls off
+void memRecord(barb& b, memKind kind, Vector2f p) {
+    for (int k = 0; k < memSpotCount; k++) {
+        Vector2f d = b.mem[k].pos - p;
+        if (b.mem[k].kind == kind && d.x * d.x + d.y * d.y < memMergeRadius * memMergeRadius) { memDrop(b, k); break; }
+    }
+    for (int i = memSpotCount - 1; i > 0; i--) b.mem[i] = b.mem[i - 1];
+    b.mem[0] = workMem{p, kind};
+}
+
+// INBOX-F2: a trip ends (load deposited or bush picked): the next search heads back to mem[0] and may share again
+void memEndTrip(barb& b) {
+    b.memReturn = true;
+    b.memShared = false;
+}
+
+// INBOX-F2: hand fresh spot p to the nearest same-race barbs within memShareRadius of barbs[j], at most memShareMax of
+// them. Sheltering barbs are skipped. Marks the sharer so it shares once per trip.
+void memShare(vector<barb>& barbs, const vector<RectangleShape>& squares, int j, memKind kind, Vector2f p) {
+    barb& b = barbs[j];
+    b.memShared = true;
+    Vector2f from = squares[j].getPosition();
+    for (int n = 0; n < memShareMax; n++) {
+        int k = findNearest(from, memShareRadius, (int)barbs.size(),
+                            [&](int i) { return squares[i].getPosition(); },
+                            [&](int i) { const barb& o = barbs[i];
+                                         return i == j || o.race != b.race || o.garrisoned || o.health <= 0
+                                             || (o.mem[0].kind == kind && o.mem[0].pos == p); });   // already told
+        if (k == -1) break;
+        memRecord(barbs[k], kind, p);
+        printf("SPOT SHARED - %s tells %s of a %s\n", b.name, barbs[k].name, kind == memTree ? "grove" : kind == memRock ? "rock" : "bush");
+    }
+}
+
 // Every way out of a crop harvest (berry bush or wheat field) clears the same barb fields
 void clearHarvest(barb& b) {
     b.moving = b.chopping = false;
@@ -5115,6 +5167,7 @@ void haulTick(barb& b, RectangleShape& sq, storehouse (&stores)[raceCount], cons
     b.moving = false;
     b.stepTimer = 0;
     b.targetx = b.targety = -1;
+    memEndTrip(b);   // INBOX-F2
 }
 
 void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<CircleShape>& tris, vector<RectangleShape>& stumps, vector<tree>& trees, vector<CircleShape>& octs, vector<rock>& rocks,
@@ -5200,6 +5253,54 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
                 b.target = targetField;
                 fieldTaken[b.race][bestField] = true;
             }
+            // INBOX-F2: a trip just ended, so head back to the newest remembered spot that still holds a free resource of
+            // its kind (looked up by position and live state, never a stored index). Stale spots are dropped; with none
+            // left the normal search below runs as before.
+            bool memStale = false;
+            memKind freshKind = memNone;   // the spot this barb heads for this tick, shared if a stale one was just dropped
+            Vector2f freshPos;
+            if (b.memReturn && !b.moving && !b.deertargeting) {
+                b.memReturn = false;
+                for (int k = 0; k < memSpotCount && b.mem[k].kind != memNone && !b.moving; ) {
+                    const workMem m = b.mem[k];
+                    int hit = -1;
+                    if (m.kind == memTree)
+                        hit = findNearest(m.pos, memSpotRadius, (int)trees.size(),
+                                          [&](int i) { return tris[i].getPosition() + treeWorkOffset; },
+                                          [&](int i) { return trees[i].dying || (treeClaim[i] != -1 && treeClaim[i] != j); });
+                    else if (m.kind == memRock)
+                        hit = findNearest(m.pos, memSpotRadius, (int)rocks.size(),
+                                          [&](int i) { return octs[i].getPosition() + rockWorkOffset; },
+                                          [&](int i) { return rocks[i].dying || (rockClaim[i] != -1 && rockClaim[i] != j); });
+                    else
+                        hit = findNearest(m.pos, memSpotRadius, (int)bushes.size(),
+                                          [&](int i) { return bushWorkSpot(bushshapes[i]); },
+                                          [&](int i) { return !bushes[i].ripe || bushes[i].picking; });
+                    if (hit == -1) { memDrop(b, k); memStale = true; continue; }   // stale: cleared, [k] now holds the next
+                    if (m.kind == memTree) {
+                        Vector2f tp = tris[hit].getPosition();
+                        b.targetx = (int)(tp.x + 8);
+                        b.targety = (int)(tp.y + 15);
+                        b.target = targetNone;
+                        treeClaim[hit] = j;
+                    } else if (m.kind == memRock) {
+                        Vector2f rp = octs[hit].getPosition();
+                        b.targetx = (int)(rp.x + 6);
+                        b.targety = (int)(rp.y + 10);
+                        b.target = targetRock;
+                        rockClaim[hit] = j;
+                    } else {
+                        Vector2f wp = bushWorkSpot(bushshapes[hit]);
+                        b.targetx = (int)wp.x;
+                        b.targety = (int)wp.y;
+                        b.target = targetBush;
+                        b.targetBush = hit;
+                    }
+                    b.moving = true;   // every branch below needs !moving, so the remembered spot holds
+                    freshKind = m.kind;
+                    freshPos = Vector2f(b.targetx, b.targety);
+                }
+            }
             if (bestIsBush && b.moving==false) {
                 Vector2f wp = bushWorkSpot(bushshapes[bestBush]);
                 b.targetx = (int)wp.x;
@@ -5207,6 +5308,8 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
                 b.moving  = true;
                 b.target = targetBush;
                 b.targetBush = bestBush;
+                freshKind = memBush;   // INBOX-F2
+                freshPos = wp;
             }
             if (best != -1 && !bestIsBush && !bestIsRock && b.moving==false) {
                 Vector2f tp = tris[best].getPosition();
@@ -5215,6 +5318,8 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
                 b.moving  = true;
                 b.target = targetNone;
                 treeClaim[best] = j;
+                freshKind = memTree;   // INBOX-F2
+                freshPos = Vector2f(b.targetx, b.targety);
             }
 	    if (best != -1 && !bestIsBush && bestIsRock && b.moving==false) {
 		    Vector2f rp = octs[best].getPosition();
@@ -5223,7 +5328,10 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
 		    b.moving = true;
 		    b.target = targetRock;
 		    rockClaim[best] = j;
+		    freshKind = memRock;   // INBOX-F2
+		    freshPos = Vector2f(b.targetx, b.targety);
         }
+            if (memStale && freshKind != memNone && !b.memShared) memShare(barbs, squares, j, freshKind, freshPos);   // INBOX-F2
             // Nothing to chop, mine or pick in reach: walk to the nearest free shore point and fish
             if (best == -1 && !bestIsBush && !b.moving && !b.deertargeting) {
                 Vector2f size = sq.getSize();
@@ -5300,6 +5408,8 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
                 bushes[i].ripe = bushes[i].picking = false;
                 bushes[i].regrow = 0;
                 bushshapes[i].setFillColor(bushBareColor);
+                memRecord(b, memBush, wp);   // INBOX-F2: picking food ends the trip on the spot
+                memEndTrip(b);
                 printf("BERRIES PICKED - %s food: %d\n", racePlurals[clampRace(b.race)], stockOf(b).food);
             }
             continue;
@@ -5322,6 +5432,7 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
             if (workTick(b)) b.timer++;
             if (b.timer >= chopTicks()) {
                 practice(techHandAxe);
+                memRecord(b, memTree, Vector2f((int)tix, (int)tiy));   // INBOX-F2: by position; the tree index dies with the swapRemove
                 swapRemove(trees,  i);
                 swapRemove(tris,   i);
                 swapRemove(stumps, i);
@@ -5350,6 +5461,7 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
 			if (b.timer >= mineTicks(b)) {           // dwarves finish rocks faster
 				practice(techPickwork);
 				if (b.race == raceDwarf) forgeEmberFrames = forgeEmberBoostFrames; // forge ember flares (drawn only once built)
+				memRecord(b, memRock, Vector2f((int)rix, (int)riy));   // INBOX-F2
 				swapRemove(rocks, i);
 				swapRemove(octs, i);
 				swapRemove(rockClaim, i);
