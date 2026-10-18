@@ -639,12 +639,15 @@ const Color stockEmptyRaceColor(120, 118, 108); // a race with no living members
 // Race quarters (R30-F1): each race's crate sits in its own quarter around the village, at least raceMinSeparation from
 // the others; that race's houses go within quarterHouseRadius of it. Trees/rocks are kept off each quarter like the
 // village clearing, lakes and bush clumps avoid it, and each quarter is topped up at startup if it is short of wood/stone.
-const float raceMinSeparation = 150.0f;      // min distance between two races' crates (startup check)
-const float quarterMinRadius = 130.0f;       // crate centre distance from the campfire
-const float quarterMaxRadius = 160.0f;
+// INBOX-F3 wider quarters: on the 800 map with 3 races the 120 deg split gives crates >= 165*sqrt(3) ~ 286 apart and
+// quarter edges >= 200+63 from the map edge/HUD, so quarterLayoutOk() always passes and the fallback should never fire.
+const float raceMinSeparation = 185.0f;      // min distance between two races' crates (startup check)
+const float quarterMinRadius = 165.0f;       // crate centre distance from the campfire
+const float quarterMaxRadius = 200.0f;
 const int quarterPlaceTries = 50;            // random layouts tried before the fixed fallback layout
-const float quarterHouseRadius = 45.0f;      // house spot within this of the crate centre
-const float quarterClearRadius = 52.0f;      // trees/rocks cleared within this (house spot 45 + 5px slab half + 2)
+const float quarterHouseRadius = 56.0f;      // house spot within this of the crate centre (+25% over R30-F1's 45)
+const float quarterClearMargin = 7.0f;       // clearing reaches past the house disc: 5px slab half + 2
+const float quarterClearRadius = quarterHouseRadius + quarterClearMargin; // trees/rocks cleared within this
 const float quarterResourceRadius = 140.0f;  // startup resource check: trees/rocks between the clearing and this radius
 const int quarterMinTrees = 25;              // fewer than this nearby -> plant more (expected ~140 at 2000 trees)
 const int quarterMinRocks = 3;               // fewer than this nearby -> place more (expected ~7 at 100 rocks)
@@ -1134,7 +1137,9 @@ bool quarterLayoutOk() {
 
 // Places the crates once, before anything else is spawned: a random rotation/radius of an even 3-way split, checked by
 // quarterLayoutOk(); if no try passes, the fixed layout (human north, others 120 deg apart) is used. Builds the rings.
+bool quarterFallbackUsed = false;   // INBOX-F3: set by placeQuarters() when the fixed layout was used
 void placeQuarters() {
+    quarterFallbackUsed = false;
     uniform_real_distribution<float> ang(0.0f, 6.2831853f), rad(quarterMinRadius, quarterMaxRadius);
     auto layout = [](float a0, float r) {
         for (int k = 0; k < raceCount; k++) {
@@ -1151,6 +1156,7 @@ void placeQuarters() {
     if (!ok) {
         layout(-1.5707963f, (quarterMinRadius + quarterMaxRadius) / 2.0f);
         printf("Race quarters: random layout failed the check, using the fixed layout (%s)\n", quarterLayoutOk() ? "ok" : "STILL FAILS");
+        quarterFallbackUsed = true;   // INBOX-F3: main logs one ticker line per layout
     }
     for (int k = 0; k < raceCount; k++)
         printf("Race quarter %s: crate at (%.0f, %.0f)\n", raceDefs[k].name, storehousePos[k].x, storehousePos[k].y);
@@ -5399,6 +5405,7 @@ int main() {
     barbs.reserve(numbarbs);
     squares.reserve(numbarbs);
     placeQuarters();  // R30-F1: crates first, so founders, lakes and bushes can use the quarters
+    if (quarterFallbackUsed) logEvent("Quarters: random layout failed, fixed layout used");   // INBOX-F3: once per layout
     {
         uniform_int_distribution<int> d(-30, 30);   // R30-F1: founders start around their own race's crate
         int founded[raceCount] = {};
