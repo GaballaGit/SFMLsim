@@ -801,7 +801,8 @@ const uint8_t fishRingMaxAlpha = 150;      // fades linearly to 0
 // Farming (R19-F3): 8x8 wheat plots, sown once by an idle barb, then regrowing forever.
 // Ripe is derived from growth (no stored flag); no scarecrow. The harvest shares harvestTick() with berry picking.
 // Race farmsteads (FARM-F1): each race sows fieldsPerRace plots beside its own storehouse; only that race sows/reaps them.
-constexpr int fieldsPerRace = 1;
+// R32-F1 Mill Fields: plot k (k > 0) unlocks at fieldMinHouses*k+1 homes and is sown in a fixed slot beside the mill.
+constexpr int fieldsPerRace = 3;
 const Vector2f fieldSize(8.0f, 8.0f);
 const float fieldBorderPx = 1.0f;          // race-tinted frame drawn outside the soil (10x10 overall)
 const int fieldWoodCost = 6;               // cheap: fences and a hoe
@@ -866,6 +867,13 @@ constexpr int millPuffDots = 5;               // 1px dots drifting out from the 
 constexpr float millPuffSpreadPx = 4.0f;      // how far the dots drift by the end of the puff
 constexpr Color millPuffColor(236, 230, 214); // flour white
 constexpr uint8_t millPuffAlpha = 110;        // faint at the start, fading to 0
+// R32-F1 Mill Fields: soil top-left of plot k relative to the mill body top-left, for a mill standing right of plot 0
+// (side +1). Both extra plots stack on the far side of the mill from plot 0, one above and one below the sail hub;
+// mirrored across the hub for side -1. x = 19: the plot zone's left edge just touches the mill zone (sail + clear px).
+// y = -11 / 12: the two plot zones touch each other, centred on the mill body. Index 0 is unused (plot 0 is placed freely).
+constexpr Vector2f fieldSlotOffsets[fieldsPerRace] = {{0.0f, 0.0f}, {19.0f, -11.0f}, {19.0f, 12.0f}};
+constexpr float millDoorLanePx = 12.0f;       // kept free below the mill stand spot: the haulers' approach to the door
+constexpr int fieldStaggerStages = 1;         // a replanted plot lies fallow until it is this many stages off its siblings
 
 // Know-how discoveries (R20-F1): practice counters unlock one-off speedups
 const int treeChopTicks = 180;                // base work ticks to fell one tree
@@ -1362,6 +1370,10 @@ struct plot {
     FloatRect rect;         // soil, 8x8
     RectangleShape shape;   // soil fill + race-tinted outline frame
     int growth = 0;
+    int fallow = 0;         // R32-F1: ticks left before growth resumes after a sow/reap (staggers the race's plots)
+    bool reserved = false;  // R32-F1: plot k > 0 only: slot beside the mill held since plot 0 was placed (until placed)
+    bool slotLogged = false; // R32-F1: "slot blocked" printed once
+    Vector2f slotPos;       // R32-F1: that slot's soil top-left
 };
 using fieldGrid = plot[raceCount][fieldsPerRace];
 
@@ -1369,6 +1381,22 @@ bool fieldRipe(const plot& fp) { return fp.built && fp.growth >= wheatGrowTicks(
 
 // 0..2 growing stages, fieldGrowStages = ripe
 int fieldStage(const plot& fp) { return fieldRipe(fp) ? fieldGrowStages : fp.growth * fieldGrowStages / wheatGrowTicks(); }
+
+// R32-F1: restart plot k of a race's row (just sown or reaped) at growth 0. If a growing sibling is less than
+// fieldStaggerStages stages ahead of it (effective growth = growth - fallow), it lies fallow until it is that far behind,
+// so the race's plots show different stages. Ripe siblings are skipped: they restart (and re-stagger) once reaped.
+void replantField(plot (&row)[fieldsPerRace], int k) {
+    int step = wheatGrowTicks() * fieldStaggerStages / fieldGrowStages;
+    int delay = 0;
+    for (int pass = 0; pass < fieldsPerRace; pass++)
+        for (int j = 0; j < fieldsPerRace; j++) {
+            if (j == k || !row[j].built || fieldRipe(row[j])) continue;
+            int g = row[j].growth - row[j].fallow;
+            if (abs(g + delay) < step) delay = step - g;
+        }
+    row[k].growth = 0;
+    row[k].fallow = delay;
+}
 
 Vector2f fieldWorkSpot(const plot& fp) { return fp.rect.position + fieldStandOffset; }
 
@@ -1379,9 +1407,17 @@ FloatRect fieldZone(Vector2f pos) {
                      Vector2f(fieldSize.x + 2 * pad, fieldStandOffset.y + fieldZoneBelowPx + fieldClearPx + pad));
 }
 
-// False if r touches the reserved plot zone (always true before a spot is chosen)
+// R32-F1: soil top-left of the zone a plot holds: its spot once placed, else its reserved mill slot. False if neither.
+bool plotHeldAt(const plot& fp, Vector2f& pos) {
+    if (fp.placed) { pos = fp.rect.position; return true; }
+    if (fp.reserved) { pos = fp.slotPos; return true; }
+    return false;
+}
+
+// False if r touches the reserved plot zone (always true before a spot is chosen or a slot reserved)
 bool fieldClear(const plot& fp, const FloatRect& r) {
-    return !fp.placed || !r.findIntersection(fieldZone(fp.rect.position)).has_value();
+    Vector2f pos;
+    return !plotHeldAt(fp, pos) || !r.findIntersection(fieldZone(pos)).has_value();
 }
 
 // FARM-F2: one windmill per race in a fixed array (index = barbRace; never removed, so no index goes stale).
@@ -1414,6 +1450,20 @@ Vector2f millSpotBeside(Vector2f plotPos, int side) {
     float edge = side > 0 ? plotPos.x + fieldSize.x + fieldBorderPx + millGapPx + (millSailLen - millHubOffset.x)
                           : plotPos.x - fieldBorderPx - millGapPx - (millHubOffset.x + millSailLen);
     return Vector2f(edge, plotPos.y);
+}
+
+// R32-F1: soil top-left of plot k's slot beside a mill at millPos; side as in millSpotBeside (mill right of plot 0 = +1).
+// Side -1 mirrors the offset across the sail hub, so the extra plots always stand on the far side from plot 0.
+Vector2f fieldSlotPos(Vector2f millPos, int side, int k) {
+    Vector2f o = fieldSlotOffsets[k];
+    if (side < 0) o.x = 2.0f * millHubOffset.x - fieldSize.x - o.x;
+    return millPos + o;
+}
+
+// R32-F1: the haulers' lane below a mill's door: door width padded by millClearPx, from the door down past the stand spot
+FloatRect millDoorLane(Vector2f millPos) {
+    Vector2f lo = millPos + millDoorPos - Vector2f(millClearPx, 0.0f);
+    return FloatRect(lo, Vector2f(millDoorSize.x + 2 * millClearPx, millStandOffset.y + fieldZoneBelowPx + millDoorLanePx - millDoorPos.y));
 }
 
 // FARM-F1: false if r touches any race's reserved plot zone. FARM-F2: or any reserved mill zone.
@@ -2833,10 +2883,20 @@ optional<hoverHit> pickHover(Vector2f p, float radius, const vector<barb>& barbs
             return h;
         }
     }
-    auto farmLine = [&](int r) {   // FARM-F2: "mill: built/none, plots n/cap" for race r
+    auto plotState = [&](int r, int k) {   // R32-F1: one plot's state, for the per-plot list
+        const plot& fp = fields[r][k];
+        if (fp.built) return fp.fallow > 0 ? string("fallow") : fieldRipe(fp) ? string("ripe")
+                                           : to_string(fp.growth * 100 / wheatGrowTicks()) + "% grown";
+        if (fp.claimed) return string("being sown");
+        if (k > 0 && mills[r].placed && !fp.placed && !fp.reserved) return string("no room");
+        return "unsown (needs " + to_string(fieldMinHouses * k + 1) + (fieldMinHouses * k + 1 == 1 ? " home)" : " homes)");
+    };
+    auto farmLine = [&](int r) {   // FARM-F2: "mill: built/none, plots n/cap" for race r; R32-F1: then one line per plot
         int sown = 0;
         for (auto& fp : fields[r]) if (fp.built) sown++;
-        return string("mill: ") + (mills[r].built ? "built" : "none") + ", plots " + to_string(sown) + "/" + to_string(fieldsPerRace);
+        string s = string("mill: ") + (mills[r].built ? "built" : "none") + ", plots " + to_string(sown) + "/" + to_string(fieldsPerRace);
+        for (int k = 0; k < fieldsPerRace; k++) s += "\n  plot " + to_string(k + 1) + ": " + plotState(r, k);
+        return s;
     };
     for (int r = 0; r < raceCount; r++) {   // FARM-F2: a standing mill shows its race and the farmstead line
         if (!mills[r].built) continue;
@@ -2848,8 +2908,8 @@ optional<hoverHit> pickHover(Vector2f p, float radius, const vector<barb>& barbs
         for (int k = 0; k < fieldsPerRace; k++) {
             const plot& fp = fields[r][k];
             if (!fp.built || !near(fp.shape)) continue;
-            string growth = fieldRipe(fp) ? "ripe" : to_string(fp.growth * 100 / wheatGrowTicks()) + "% grown";
-            return hoverHit{string(raceDefs[r].name) + " wheat field: " + growth + "; " + farmLine(r), fp.shape, nullopt};
+            return hoverHit{string(raceDefs[r].name) + " wheat field " + to_string(k + 1) + ": " + plotState(r, k) + "\n" + farmLine(r),
+                            fp.shape, nullopt};
         }
     return nullopt;
 }
@@ -3544,8 +3604,10 @@ bool nearestQuarterHouse(int r, const vector<house>& houses, Vector2f& best) {
 // FARM-F1: false if a quarter road from a to b would cross any reserved plot zone (FARM-F2: or mill zone)
 bool roadClearOfFields(const fieldGrid& fields, Vector2f a, Vector2f b) {
     for (int q = 0; q < raceCount; q++) {
-        for (int k = 0; k < fieldsPerRace; k++)
-            if (fields[q][k].placed && segmentHitsRect(a, b, fieldZone(fields[q][k].rect.position))) return false;
+        for (int k = 0; k < fieldsPerRace; k++) {
+            Vector2f pos;   // R32-F1: reserved mill slots too
+            if (plotHeldAt(fields[q][k], pos) && segmentHitsRect(a, b, fieldZone(pos))) return false;
+        }
         if (mills[q].placed && segmentHitsRect(a, b, millZone(mills[q].pos))) return false;   // FARM-F2
     }
     return true;
@@ -4097,8 +4159,35 @@ bool fieldInClearing(const FloatRect& zone, int r) {
 // Reserved from then on via fieldsClear(); buildhouse() keeps new roads off it.
 // FARM-F2: with withMill (the race's first plot), the race's mill spot beside the plot (right, else left) must pass the
 // same checks; both are reserved together, so the mill always stands at a fixed offset from its plot.
-bool placeField(plot& fp, int r, const vector<barb>& barbs, const vector<house>& houses, const vector<shrine>& shrines,
-                const fieldGrid& fields, bool withMill) {
+// R32-F1: plot 0's mill side also reserves the slots of plots k > 0 (fieldSlotPos) that pass zoneOk, stay off road-tier
+// trail cells, plot 0, the mill and its door lane; a side where every slot passes is preferred. Plot k > 0 is then
+// placed only in its reserved slot (checked again with zoneOk); a blocked or never-reserved slot fails, with no random spot.
+
+// R32-F1: false if zone covers a road-tier (worn or cobbled) trail cell
+bool zoneOffRoads(const FloatRect& zone) {
+    int x0 = max(0, (int)(zone.position.x / trailCellSize)), y0 = max(0, (int)(zone.position.y / trailCellSize));
+    int x1 = min(trailGridN - 1, (int)((zone.position.x + zone.size.x) / trailCellSize));
+    int y1 = min(trailGridN - 1, (int)((zone.position.y + zone.size.y) / trailCellSize));
+    for (int cy = y0; cy <= y1; cy++)
+        for (int cx = x0; cx <= x1; cx++)
+            if (trailTier[cy * trailGridN + cx] == 2) return false;
+    return true;
+}
+
+void setPlotSpot(plot& fp, int r, Vector2f pos) {
+    fp.placed = true;
+    fp.reserved = false;   // the placed spot holds the zone from now on
+    fp.rect = FloatRect(pos, fieldSize);
+    fp.shape.setSize(fieldSize);
+    fp.shape.setPosition(pos);
+    fp.shape.setFillColor(fieldSoilColor);
+    fp.shape.setOutlineColor(fieldRaceTints[r]);
+    fp.shape.setOutlineThickness(fieldBorderPx);
+}
+
+bool placeField(fieldGrid& fields, int r, int kPlot, const vector<barb>& barbs, const vector<house>& houses,
+                const vector<shrine>& shrines, bool withMill) {
+    plot& fp = fields[r][kPlot];
     uniform_real_distribution<float> ang(0.0f, 6.2831853f), rad(fieldStoreMinRadius, fieldStoreMaxRadius);
     Vector2f qc = quarterCentre(r), road;
     bool hasRoad = nearestQuarterHouse(r, houses, road);
@@ -4120,31 +4209,68 @@ bool placeField(plot& fp, int r, const vector<barb>& barbs, const vector<house>&
             if (ok && zone.findIntersection(FloatRect(Vector2f((float)s.x, (float)s.y - shrineCapH), shrineSlabSize + Vector2f(0.0f, shrineCapH)))) ok = false;
         return ok;
     };
-    for (int k = 0; k < fieldPlaceTries; k++) {
+    if (kPlot > 0) {   // R32-F1: only the slot reserved beside the mill, never the random ring
+        if (!fp.reserved) return false;
+        fp.reserved = false;   // own reservation off while checking, so fieldsClear() doesn't see it
+        FloatRect zone = fieldZone(fp.slotPos);
+        if (!zoneOk(zone) || !zoneOffRoads(zone)) {
+            fp.reserved = true;
+            if (!fp.slotLogged) printf("FIELD SLOT BLOCKED - %s plot %d at %d,%d, waiting\n", racePlurals[r], kPlot + 1,
+                                       (int)fp.slotPos.x, (int)fp.slotPos.y);
+            fp.slotLogged = true;
+            return false;
+        }
+        setPlotSpot(fp, r, fp.slotPos);
+        printf("FIELD SPOT chosen for the %s at %d,%d (mill slot %d)\n", racePlurals[r], (int)fp.slotPos.x, (int)fp.slotPos.y, kPlot);
+        return true;
+    }
+    // R32-F1: slot k beside a mill at millPos (plot 0 at pos) is usable if it passes zoneOk, avoids the roads, plot 0's
+    // zone, the mill zone, the door lane and the slots before it
+    auto slotOk = [&](Vector2f pos, Vector2f millPos, int side, int k) {
+        FloatRect zone = fieldZone(fieldSlotPos(millPos, side, k));
+        if (!zoneOk(zone) || !zoneOffRoads(zone)) return false;
+        if (zone.findIntersection(fieldZone(pos)) || zone.findIntersection(millZone(millPos))
+            || zone.findIntersection(millDoorLane(millPos))) return false;
+        for (int j = 1; j < k; j++)
+            if (zone.findIntersection(fieldZone(fieldSlotPos(millPos, side, j)))) return false;
+        return true;
+    };
+    int bestSide = 0, bestSlots = -1;
+    Vector2f bestPos;
+    for (int k = 0; k < fieldPlaceTries && bestSlots < fieldsPerRace - 1; k++) {
         float a = ang(gen), d = rad(gen);
         Vector2f pos(round(qc.x + cos(a) * d - fieldSize.x / 2), round(qc.y + sin(a) * d - fieldSize.y / 2));
         if (!zoneOk(fieldZone(pos))) continue;
-        int side = 0;
-        if (withMill) {
-            for (int s : {1, -1})
-                if (!side && zoneOk(millZone(millSpotBeside(pos, s)))) side = s;
-            if (!side) continue;
-            mills[r].placed = true;
-            mills[r].pos = millSpotBeside(pos, side);
-            printf("MILL SPOT chosen for the %s at %d,%d (%s of the plot)\n", racePlurals[r],
-                   (int)mills[r].pos.x, (int)mills[r].pos.y, side > 0 ? "right" : "left");
+        if (!withMill) { bestPos = pos; bestSlots = 0; break; }
+        for (int s : {1, -1}) {
+            Vector2f mp = millSpotBeside(pos, s);
+            if (!zoneOk(millZone(mp))) continue;
+            int n = 0;
+            for (int j = 1; j < fieldsPerRace; j++) if (slotOk(pos, mp, s, j)) n++;
+            if (n > bestSlots) { bestSlots = n; bestSide = s; bestPos = pos; }
         }
-        fp.placed = true;
-        fp.rect = FloatRect(pos, fieldSize);
-        fp.shape.setSize(fieldSize);
-        fp.shape.setPosition(pos);
-        fp.shape.setFillColor(fieldSoilColor);
-        fp.shape.setOutlineColor(fieldRaceTints[r]);
-        fp.shape.setOutlineThickness(fieldBorderPx);
-        printf("FIELD SPOT chosen for the %s at %d,%d\n", racePlurals[r], (int)pos.x, (int)pos.y);
-        return true;
     }
-    return false;
+    if (bestSlots < 0) return false;
+    Vector2f pos = bestPos;
+    if (withMill) {
+        mills[r].placed = true;
+        mills[r].pos = millSpotBeside(pos, bestSide);
+        printf("MILL SPOT chosen for the %s at %d,%d (%s of the plot)\n", racePlurals[r],
+               (int)mills[r].pos.x, (int)mills[r].pos.y, bestSide > 0 ? "right" : "left");
+        for (int j = 1; j < fieldsPerRace; j++) {   // reserve the extra plots' slots now, with plot 0 and the mill
+            plot& sp = fields[r][j];
+            if (sp.placed || !slotOk(pos, mills[r].pos, bestSide, j)) {
+                printf("FIELD SLOT %d unavailable for the %s: that plot will not be sown\n", j, racePlurals[r]);
+                continue;
+            }
+            sp.slotPos = fieldSlotPos(mills[r].pos, bestSide, j);
+            sp.reserved = true;
+            printf("FIELD SLOT %d reserved for the %s at %d,%d\n", j, racePlurals[r], (int)sp.slotPos.x, (int)sp.slotPos.y);
+        }
+    }
+    setPlotSpot(fp, r, pos);
+    printf("FIELD SPOT chosen for the %s at %d,%d\n", racePlurals[r], (int)pos.x, (int)pos.y);
+    return true;
 }
 
 // Runs after buildstorehouses(). Each race sows its own plots once it has a house and a standing storehouse; only a
@@ -4174,13 +4300,15 @@ void buildfield(vector<barb>& barbs, vector<RectangleShape>& squares, const vect
         for (int k = 0; k < fieldsPerRace; k++) {
             plot& fp = fields[r][k];
             if (fp.built || (activeRace >= 0 && (r != activeRace || k != activeK))) continue;
+            int needHouses = fieldMinHouses * k + 1;   // R32-F1: one more home per extra plot
             if (!fp.placed) {
-                if (!stores[r].built || raceHouses[r] < fieldMinHouses || !canAfford(stock[r], fieldWoodCost, 0)) continue;
-                if (!placeField(fp, r, barbs, houses, shrines, fields, k == 0 && !mills[r].placed)) continue;
+                if (!stores[r].built || raceHouses[r] < needHouses || !canAfford(stock[r], fieldWoodCost, 0)) continue;
+                if (k > 0 && !mills[r].placed) continue;   // R32-F1: extra plots sit in slots beside the mill
+                if (!placeField(fields, r, k, barbs, houses, shrines, k == 0 && !mills[r].placed)) continue;
             }
             bool done = buildOneOff(barbs, squares, fp.claimed, jobField, fieldWorkSpot(fp), "FIELD",
                 [&](const barb& b) {
-                    if (raceHouses[r] < fieldMinHouses || !canAfford(stock[r], fieldWoodCost, 0)) return -1;
+                    if (raceHouses[r] < needHouses || !canAfford(stock[r], fieldWoodCost, 0)) return -1;
                     if (b.race != r) return 0;   // only that race sows its plot
                     spend(stock[r], fieldWoodCost, 0);   // RACE-F1: the race's own wood
                     fp.sowerId = b.id;
@@ -4190,8 +4318,9 @@ void buildfield(vector<barb>& barbs, vector<RectangleShape>& squares, const vect
                 fp.built = true;
                 fp.claimed = false;
                 fp.sowerId = -1;
-                fp.growth = 0;
-                printf("---FIELD SOWN--- %s, ripe in %d ticks, +%d food per harvest\n", racePlurals[r], fieldGrowTicks, fieldFoodYield);
+                replantField(fields[r], k);   // R32-F1: may lie fallow first, so it ripens out of step with its siblings
+                printf("---FIELD SOWN--- %s plot %d, ripe in %d ticks (+%d fallow), +%d food per harvest\n", racePlurals[r], k + 1,
+                       wheatGrowTicks(), fp.fallow, fieldFoodYield);
                 logEvent(string(racePlurals[r]) + " sow a wheat field");
             }
             if (fp.claimed) return;   // one being sown at a time
@@ -4352,7 +4481,8 @@ void craftspear(vector<barb>& barbs, vector<RectangleShape>& squares, const forg
 void fieldTick(fieldGrid& fields) {
     for (int r = 0; r < raceCount; r++)
         for (auto& fp : fields[r])
-            if (fp.built && fp.growth < wheatGrowTicks()) {
+            if (fp.built && fp.fallow > 0) fp.fallow--;   // R32-F1: resting before it grows again
+            else if (fp.built && fp.growth < wheatGrowTicks()) {
                 fp.growth++;
                 if (fp.growth == wheatGrowTicks()) printf("WHEAT RIPE - %s\n", racePlurals[r]);
             }
@@ -4372,6 +4502,7 @@ void drawField(RenderWindow& window, const plot& fp, int race, int frame) {
     r.setFillColor(fieldRaceTints[race]);
     r.setPosition(snapPx(fieldWorkSpot(fp)));
     window.draw(r);
+    if (fp.fallow > 0) return;   // R32-F1: fallow plot is bare soil in its frame
     for (int row = 0; row < 3; row++) {
         float stalkY = 2.0f + 2.0f * row, headY = stalkY - 1.0f;
         if (stage == 0) {                           // staggered 1px sprouts
@@ -5900,7 +6031,7 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
             // FARM-F2: the reaped sheaf adds no food here; it is carried (carryWheat) to the race's mill, or to the
             // storehouse/campfire if no mill stands, and counted on arrival in haulTick() (Forager bonus applied there)
             if (harvestTick(b, wp, bpos, fieldHarvestTicks, 0)) {
-                fp.growth = 0;     // replanted at once
+                replantField(fields[b.race], k);   // replanted at once (R32-F1: maybe fallow first, to stay staggered)
                 startHaul(b, carryWheat, stores);
                 printf("WHEAT REAPED - barb %d carries the sheaf to the %s\n", b.id, millDepot(b) ? "mill" : "storehouse");
                 practice(techSeedSelection);
