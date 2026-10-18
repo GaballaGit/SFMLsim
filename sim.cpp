@@ -196,6 +196,10 @@ const int tradeMsgTicks = 600;            // ticks the last-trade line stays on 
 const Vector2f traderSize(3.0f, 3.0f);
 const Color traderColor(190, 140, 230);
 const Vector2f villageCenter(400.0f, 400.0f);
+// POL-F4: the trader serves the eligible race with the least wood, at its storehouse (campfire while it has none)
+const int traderRaceCooldownVisits = 1;   // a served race sits out this many following visits (1 = no back-to-back)
+const int tradeFoodCost = 3;              // food paid per lot when no race can pay in stone
+const int tradeFoodReserve = startStock.food; // food fallback never takes a race below this
 
 const int hungerThreshold = 15 * ticksPerMinute; // 15 real min between meals; deer are the only food for now
 const int hungerWorkSlowdown = 2;         // hungry barbs with no food work and walk this many times slower
@@ -527,6 +531,7 @@ const int storehouseBuildTicks = 600;      // same work as a house
 const Vector2f storehouseSize(10.0f, 10.0f);
 Vector2f storehousePos[raceCount];         // crate top-left, indexed by barbRace; set once at startup by placeQuarters() (R30-F1)
 const Vector2f storehouseStandOffset(-4.0f, 3.0f); // builder/hauler hitbox top-left relative to the crate: at its left side
+const Vector2f traderStoreOffset(storehouseSize.x + 1.0f, 3.0f); // POL-F4: trader top-left relative to the crate: its right side
 const float storehouseClearPx = 3.0f;      // houses, shrines, the field and blinks keep this far from crate + stand spot
 const float storehouseOutlinePx = 1.0f;    // drawn inward, so the crate stays exactly storehouseSize
 const Color storehouseColors[raceCount] = {
@@ -1396,7 +1401,11 @@ struct trader {
     int stepTimer = 0;
     int timer = 0;
     RectangleShape shape;
+    int race = -1;            // POL-F4: race served this visit; -1 = nobody (campfire, buys nothing)
+    bool buysFood = false;    // POL-F4: food-for-wood fallback (no race could pay in stone)
+    bool toStore = false;     // POL-F4: walking to/at race's storehouse; false = campfire
 };
+int raceCooldown[raceCount] = {};   // POL-F4: visits left before a race can be served again
 
 // Wolves own their shape (like the trader), so there is no parallel vector to keep in sync
 struct wolf {
@@ -2385,13 +2394,41 @@ void drawDeer(RenderWindow& window, const vector<deer>& deers, const vector<Rect
     }
 }
 
-void traderTick(optional<trader>& tr) {
+// POL-F4: a race the trader can still serve: in range and with living members
+bool traderRaceAlive(const vector<barb>& barbs, int r) {
+    if (r < 0 || r >= raceCount) return false;
+    for (auto& b : barbs) if (b.race == r) return true;
+    return false;
+}
+
+// POL-F4: eligible race (off cooldown, alive, can pay) with the least wood, ties lowest index; -1 if none
+int traderPickRace(const vector<barb>& barbs, bool food) {
+    int best = -1;
+    for (int r = 0; r < raceCount; r++) {
+        if (raceCooldown[r] > 0 || !traderRaceAlive(barbs, r)) continue;
+        bool pays = food ? stock[r].food >= tradeFoodReserve + tradeFoodCost : stock[r].stone >= tradeStoneCost;
+        if (pays && (best < 0 || stock[r].wood < stock[best].wood)) best = r;
+    }
+    return best;
+}
+
+Vector2f traderGoal(const trader& t) {
+    if (t.phase == trader::Leaving) return t.exit;
+    return t.toStore ? storehousePos[t.race] + traderStoreOffset : villageCenter;
+}
+
+void traderTick(optional<trader>& tr, const vector<barb>& barbs, const storehouse (&stores)[raceCount]) {
     static int ttimer = 0;
     if (tradeMsgTimer > 0) tradeMsgTimer--;
     if (!tr) {
         if (++ttimer < traderIntervalTicks) return;
         ttimer = 0;
         trader t;
+        t.race = traderPickRace(barbs, false);
+        if (t.race < 0) { t.race = traderPickRace(barbs, true); t.buysFood = t.race >= 0; }
+        for (int r = 0; r < raceCount; r++) if (raceCooldown[r] > 0) raceCooldown[r]--;
+        if (t.race >= 0) raceCooldown[t.race] = traderRaceCooldownVisits;
+        t.toStore = t.race >= 0 && stores[t.race].built;
         float along = (float)clamp(distrib(gen), 20, 780);
         switch (uniform_int_distribution<int>(0, 3)(gen)) {
             case 0:  t.exit = Vector2f(-10.0f, along); break;
@@ -2403,11 +2440,36 @@ void traderTick(optional<trader>& tr) {
         t.shape.setFillColor(traderColor);
         t.shape.setPosition(t.exit);
         tr = t;
-        printf("Trader arriving\n");
-        logEvent("Trader arriving");
+        const char* buys = t.buysFood ? "food" : "stone";
+        if (t.race < 0) {
+            printf("Trader arriving: no race can pay, heading to the campfire\n");
+            logEvent("Trader arriving: nothing to buy, heads to the campfire");
+        } else if (!t.toStore) {
+            printf("Trader arriving for %s %s (no storehouse, campfire)\n", racePlurals[t.race], buys);
+            logRaceEvent(string("Trader comes for ") + racePlurals[t.race] + "' " + buys + ", at the campfire", t.race);
+        } else {
+            printf("Trader arriving for %s %s\n", racePlurals[t.race], buys);
+            logRaceEvent(string("Trader comes for ") + racePlurals[t.race] + "' " + buys, t.race);
+        }
         return;
     }
     trader& t = *tr;
+    // POL-F4: re-validate the served race and its storehouse every tick; fall back to the campfire if either is gone
+    if (t.race >= 0 && !traderRaceAlive(barbs, t.race)) {
+        if (t.phase == trader::Arriving) {
+            printf("Trader: %s gone, heading to the campfire\n", racePlurals[t.race]);
+            logEvent(string("Trader: ") + racePlurals[t.race] + " gone, heads to the campfire");
+        }
+        t.race = -1;
+        t.buysFood = false;
+        t.toStore = false;
+    } else if (t.toStore && !stores[t.race].built) {   // only the walk in uses the crate; Trading/Leaving just drop it
+        if (t.phase == trader::Arriving) {
+            printf("Trader: %s storehouse gone, heading to the campfire\n", racePlurals[t.race]);
+            logRaceEvent(string("Trader: ") + racePlurals[t.race] + "' storehouse gone, to the campfire", t.race);
+        }
+        t.toStore = false;
+    }
     if (t.phase == trader::Trading) {
         if (++t.timer >= traderTradeTicks) {
             t.phase = trader::Leaving;
@@ -2416,7 +2478,7 @@ void traderTick(optional<trader>& tr) {
         }
         return;
     }
-    Vector2f goal = t.phase == trader::Arriving ? villageCenter : t.exit;
+    Vector2f goal = traderGoal(t);
     Vector2f diff = goal - t.shape.getPosition();
     float dSq = diff.x * diff.x + diff.y * diff.y;
     if (dSq < 1.0f) {
@@ -2424,22 +2486,31 @@ void traderTick(optional<trader>& tr) {
             tr.reset();
             return;
         }
-        // RACE-F1: the trader deals with the race holding the most stone (ties: lowest index) and only takes its stone
-        int tr_r = 0;
-        for (int r = 1; r < raceCount; r++) if (stock[r].stone > stock[tr_r].stone) tr_r = r;
-        raceStock& rs = stock[tr_r];
-        int lots = min(rs.stone / tradeStoneCost, tradeMaxLots + (hasStall ? stallExtraLots : 0));
+        // POL-F4: deal only with the race picked at spawn (re-validated above), in stone or the food fallback
+        int tr_r = t.race;
+        int lots = 0, paid = 0;
+        const char* what = t.buysFood ? "food" : "stone";
+        if (tr_r >= 0) {
+            raceStock& rs = stock[tr_r];
+            int cost = t.buysFood ? tradeFoodCost : tradeStoneCost;
+            int avail = t.buysFood ? max(0, rs.food - tradeFoodReserve) : rs.stone;
+            lots = min(avail / cost, tradeMaxLots + (hasStall ? stallExtraLots : 0));
+            paid = lots * cost;
+            (t.buysFood ? rs.food : rs.stone) -= paid;
+            rs.wood += lots * tradeWoodGain;
+        }
         stallBonusLots = max(0, lots - tradeMaxLots);
-        rs.stone -= lots * tradeStoneCost;
-        rs.wood  += lots * tradeWoodGain;
         if (lots > 0 && stallBonusLots > 0)
-            snprintf(tradeMsg, sizeof(tradeMsg), "%s traded: -%d stone +%d wood (stall +%d)", racePlurals[tr_r], lots * tradeStoneCost, lots * tradeWoodGain, stallBonusLots);
-        else if (lots > 0) snprintf(tradeMsg, sizeof(tradeMsg), "%s traded: -%d stone +%d wood", racePlurals[tr_r], lots * tradeStoneCost, lots * tradeWoodGain);
-        else          snprintf(tradeMsg, sizeof(tradeMsg), "Trader: no stone to buy");
+            snprintf(tradeMsg, sizeof(tradeMsg), "%s traded: -%d %s +%d wood (stall +%d)", racePlurals[tr_r], paid, what, lots * tradeWoodGain, stallBonusLots);
+        else if (lots > 0) snprintf(tradeMsg, sizeof(tradeMsg), "%s traded: -%d %s +%d wood", racePlurals[tr_r], paid, what, lots * tradeWoodGain);
+        else if (tr_r >= 0) snprintf(tradeMsg, sizeof(tradeMsg), "Trader: %s have no %s to sell", racePlurals[tr_r], what);
+        else          snprintf(tradeMsg, sizeof(tradeMsg), "Trader: nothing to buy");
         tradeMsgTimer = tradeMsgTicks;
         if (lots > 0) logRaceEvent(tradeMsg, tr_r);   // POL-F2: tinted by the race that traded
         else          logEvent(tradeMsg);
-        printf("TRADE - %s, %d stone for %d wood - stone: %d wood: %d\n", racePlurals[tr_r], lots * tradeStoneCost, lots * tradeWoodGain, rs.stone, rs.wood);
+        if (tr_r >= 0) printf("TRADE - %s, %d %s for %d wood - stone: %d food: %d wood: %d\n", racePlurals[tr_r], paid, what,
+                              lots * tradeWoodGain, stock[tr_r].stone, stock[tr_r].food, stock[tr_r].wood);
+        else printf("TRADE - nobody could pay\n");
         t.phase = trader::Trading;
         t.timer = 0;
     } else if (++t.stepTimer >= traderStepInterval) {
@@ -2513,7 +2584,10 @@ optional<hoverHit> pickHover(Vector2f p, float radius, const vector<barb>& barbs
         }
     if (tr && near(tr->shape)) {
         const char* ph = tr->phase == trader::Arriving ? "arriving" : tr->phase == trader::Trading ? "trading" : "leaving";
-        return hoverHit{string("Trader: ") + ph, tr->shape, nullopt};
+        string label = string("Trader: ") + ph;   // POL-F4: who it serves and what it buys
+        if (tr->race >= 0) label += string(", for ") + racePlurals[tr->race] + ", buys " + (tr->buysFood ? "food" : "stone");
+        else               label += ", buys nothing";
+        return hoverHit{label, tr->shape, nullopt};
     }
     for (auto& w : wolves)
         if (near(w.shape)) return hoverHit{w.phase == wolf::Hunting ? "Wolf: hunting" : "Wolf: leaving", w.shape, nullopt};
@@ -5446,7 +5520,7 @@ int main() {
                 wolfTick(wolves, deers, deershape, barbs);
                 clockk();
                 weatherTick();
-                traderTick(activeTrader);
+                traderTick(activeTrader, barbs, stores);
                 hungerTick(barbs);
                 trailTick();
                 birdTick(birds, birdHeading, squares);
