@@ -236,6 +236,10 @@ const float tooltipFlipGap = 8.0f;        // gap from the cursor when flipped le
 const float tooltipEdgeMargin = 2.0f;
 const Color tooltipPanelColor(0, 0, 0, 170);
 const Color tooltipTextColor(225, 220, 200);
+// Storehouse hover ledger (POL-F1): hovering a race's crate (or the campfire) shows one stock line; text and the 1px
+// outline use the race's lens colour (lensRaceColors), the shared campfire uses ledgerPipColor
+const float ledgerOutlinePx = 1.0f;       // screen px (scaled by zoom), hovered building only
+const Color ledgerPipColor(226, 220, 204); // neutral pale stone for the shared campfire: belongs to no race
 
 const float trailCellSize = 8.0f;          // world px per trail grid cell
 const int trailGridN = 100;                // cells per side (800 / 8)
@@ -2422,7 +2426,37 @@ void traderTick(optional<trader>& tr) {
 
 struct hoverHit {string label; optional<RectangleShape> rect; optional<CircleShape> circle;
                  int homeOfBarb = -1;     // hovered barb's home house id -> outline that house
-                 int hoveredHouse = -1;}; // hovered house id -> pip over each resident
+                 int hoveredHouse = -1;   // hovered house id -> pip over each resident
+                 optional<Color> tint;}; // POL-F1: ledger outline + text colour (default tooltip colours when unset)
+
+int spearsOfRace(const vector<barb>& barbs, int r);   // POL-F3, defined with craftspear
+
+// POL-F1: ledger string cached on the hover target (race index, raceCount = campfire) and the numbers it shows;
+// the string is only rebuilt when either changes
+struct ledgerCacheT { int target = -1; vector<int> key; string text; };
+ledgerCacheT ledgerCache;
+
+string ledgerLine(int target, const vector<barb>& barbs, const storehouse (&stores)[raceCount]) {
+    int hungry[raceCount] = {}, spears[raceCount] = {};
+    for (auto& b : barbs) if (isHungry(b)) hungry[clampRace(b.race)]++;
+    for (int r = 0; r < raceCount; r++) spears[r] = spearsOfRace(barbs, r);
+    vector<int> races;   // storehouse: its race; campfire: every race still hauling there (no crate yet)
+    if (target < raceCount) races.push_back(target);
+    else for (int r = 0; r < raceCount; r++) if (!stores[r].built) races.push_back(r);
+    vector<int> key{target < raceCount ? 0 : campfireWood};
+    for (int r : races) key.insert(key.end(), {r, stock[r].wood, stock[r].stone, stock[r].food, hungry[r], spears[r]});
+    if (ledgerCache.target == target && ledgerCache.key == key) return ledgerCache.text;
+    string s = target < raceCount ? "" : "Campfire: fire wood " + to_string(campfireWood);
+    bool full = races.size() == 1;   // several races at the campfire: stock only, so the single line stays short
+    for (int r : races) {
+        if (!s.empty()) s += "; ";
+        s += string(racePlurals[r]) + (full ? ": " : " ") + to_string(stock[r].wood) + "w " + to_string(stock[r].stone) + "s "
+           + to_string(stock[r].food) + "f";
+        if (full) s += ", " + to_string(hungry[r]) + " hungry, " + to_string(spears[r]) + (spears[r] == 1 ? " spear" : " spears");
+    }
+    ledgerCache = {target, key, s};
+    return s;
+}
 
 float rectDistSq(const FloatRect& r, Vector2f p) {
     float dx = max(max(r.position.x - p.x, p.x - (r.position.x + r.size.x)), 0.0f);
@@ -2435,7 +2469,8 @@ optional<hoverHit> pickHover(Vector2f p, float radius, const vector<barb>& barbs
                              const optional<trader>& tr, const vector<wolf>& wolves, const vector<deer>& deers, const vector<RectangleShape>& deershape,
                              const vector<rock>& rocks, const vector<CircleShape>& octs,
                              const vector<bush>& bushes, const vector<CircleShape>& bushshapes,
-                             const vector<house>& houses, const vector<RectangleShape>& houseshapes, const fieldGrid& fields) {
+                             const vector<house>& houses, const vector<RectangleShape>& houseshapes, const fieldGrid& fields,
+                             const storehouse (&stores)[raceCount]) {
     float rSq = radius * radius;
     auto near = [&](const Shape& s) { return rectDistSq(s.getGlobalBounds(), p) <= rSq; };
     for (int i = 0; i < (int)squares.size() && i < (int)barbs.size(); i++)
@@ -2470,6 +2505,28 @@ optional<hoverHit> pickHover(Vector2f p, float radius, const vector<barb>& barbs
             h.hoveredHouse = houses[i].id;
             return h;
         }
+    for (int r = 0; r < raceCount; r++) {   // POL-F1: a standing crate shows its race's ledger line
+        if (!stores[r].built) continue;
+        RectangleShape crate(storehouseSize);
+        crate.setPosition(storehousePos[r]);
+        if (!near(crate)) continue;
+        hoverHit h{ledgerLine(r, barbs, stores), crate, nullopt};
+        h.tint = lensRaceColors[r];
+        return h;
+    }
+    {   // POL-F1: the campfire shows its shared fire wood plus any race still hauling there
+        float cr = campfireStoneRadius + 1.0f;   // covers the 1px stone ring drawn outward
+        CircleShape ring(cr);
+        ring.setOrigin({cr, cr});
+        ring.setPosition(villageCenter);
+        if (near(ring)) {
+            hoverHit h{ledgerLine(raceCount, barbs, stores), nullopt, ring};
+            int only = -1, n = 0;   // one race still hauling here: its colour; none or several: the neutral pip colour
+            for (int r = 0; r < raceCount; r++) if (!stores[r].built) { only = r; n++; }
+            h.tint = n == 1 ? lensRaceColors[only] : ledgerPipColor;
+            return h;
+        }
+    }
     auto farmLine = [&](int r) {   // FARM-F2: "mill: built/none, plots n/cap" for race r
         int sown = 0;
         for (auto& fp : fields[r]) if (fp.built) sown++;
@@ -2605,23 +2662,25 @@ void drawHousehold(RenderWindow& window, const View& worldView, const hoverHit& 
 // Outline-only copy of the hit shape, drawn above the overlays so it stays readable at night
 void drawHoverOutline(RenderWindow& window, const View& worldView, hoverHit& h, float zoom) {
     window.setView(worldView);
-    float th = tooltipOutlinePx / zoom;
+    float th = (h.tint ? ledgerOutlinePx : tooltipOutlinePx) / zoom;   // POL-F1: ledger hits use the race tint
+    Color oc = h.tint.value_or(tooltipOutlineColor);
     if (h.rect) {
         h.rect->setFillColor(Color::Transparent);
         h.rect->setOutlineThickness(th);
-        h.rect->setOutlineColor(tooltipOutlineColor);
+        h.rect->setOutlineColor(oc);
         drawSnapped(window, *h.rect);
     }
     if (h.circle) {
         h.circle->setFillColor(Color::Transparent);
         h.circle->setOutlineThickness(th);
-        h.circle->setOutlineColor(tooltipOutlineColor);
+        h.circle->setOutlineColor(oc);
         drawSnapped(window, *h.circle);
     }
 }
 
 // Places the label beside the cursor, flipping left/above to stay on screen and off the HUD and ticker
-void drawTooltip(RenderWindow& window, const Font& font, const string& label, Vector2f mouse, const FloatRect& hudRect, const FloatRect& tickerRect) {
+void drawTooltip(RenderWindow& window, const Font& font, const string& label, Vector2f mouse, const FloatRect& hudRect, const FloatRect& tickerRect,
+                 Color textColor = tooltipTextColor) {
     window.setView(window.getDefaultView());
     Vector2f win = window.getDefaultView().getSize();
     Text t(font, label, tooltipFontSize);
@@ -2645,7 +2704,7 @@ void drawTooltip(RenderWindow& window, const Font& font, const string& label, Ve
     panel.setPosition(pos);
     panel.setFillColor(tooltipPanelColor);
     window.draw(panel);
-    t.setFillColor(tooltipTextColor);
+    t.setFillColor(textColor);
     t.setPosition(pos + tooltipPad - lb.position);
     window.draw(t);
 }
@@ -5516,7 +5575,7 @@ int main() {
                        || (stockRect.size.x > 0 && stockRect.contains(mscreen));
             if (window.hasFocus() && !panning && !overUi && mpx.x >= 0 && mpx.y >= 0 && mpx.x < (int)wsz.x && mpx.y < (int)wsz.y) {
                 Vector2f mworld = window.mapPixelToCoords(mpx, worldView);
-                hover = pickHover(mworld, tooltipPickRadius / zoom, barbs, squares, activeTrader, wolves, deers, deershape, rocks, octs, bushes, bushshapes, houses, houseshapes, fields);
+                hover = pickHover(mworld, tooltipPickRadius / zoom, barbs, squares, activeTrader, wolves, deers, deershape, rocks, octs, bushes, bushshapes, houses, houseshapes, fields, stores);
                 if (hover) drawHoverOutline(window, worldView, *hover, zoom);
                 if (hover) drawHousehold(window, worldView, *hover, zoom, barbs, squares, houses, houseshapes);
             }
@@ -5553,7 +5612,7 @@ int main() {
             if (overHud) // full details hang just under the strip, beside the cursor
                 drawTooltip(window, hudFont, hudDetailText(hv),
                             Vector2f(mouse.x, hudRect.position.y + hudRect.size.y + tooltipEdgeMargin - tooltipOffset.y), hudRect, tickerRect);
-            else if (hover) drawTooltip(window, hudFont, hover->label, mouse, hudRect, tickerRect);
+            else if (hover) drawTooltip(window, hudFont, hover->label, mouse, hudRect, tickerRect, hover->tint.value_or(tooltipTextColor));
         }
         else drawMinimap(window, minimapVerts, worldView, barbs, squares, houses, houseshapes, stores);   // no font: still show the map
         eventTick();
