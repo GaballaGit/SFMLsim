@@ -617,6 +617,18 @@ const Color keepBannerColors[raceCount] = {      // saturated, unlike the muted 
     Color(46, 176, 96),                          // elf: green
 };
 const Color keepLeaderPipColor = crownColor;     // bright crown gold, not the dimmer bell gold of the garrison pips
+// Keep as Bell Refuge (R31-F3): while a race's bell rings, its barbs prefer their built keep (up to keepSlotMax, by barb
+// id in keepSlots) over a house. Sheltering barbs light 2x1 slit-window pips on the wall face; the banner flies while
+// anyone shelters and droops while the keep is empty.
+const int keepSlotMax = 8;
+const int keepGarrisonId = -2;                   // garrisonHouseId sentinel: sheltering in the own race's keep (house ids are >= 0)
+const Vector2f keepPipSize(2.0f, 1.0f);          // 2px wide: larger than the 1px house garrison pips
+const float keepPipCols[4] = {1.0f, 4.0f, 8.0f, 11.0f}; // symmetric on the 14px wall, centre gap over the gate; no merlon/gate overlap
+const float keepPipRows[2] = {3.0f, 5.0f};       // wall rows 3 and 5: a clear row under the merlons (0-1), between, and above the gate (7)
+const Color keepPipColor(206, 220, 238);         // pale blue-white, distinct from the bell/crown golds
+const Vector2f keepDroopSize(2.0f, 3.0f);        // limp banner hanging beside the pole when the keep is empty
+const Vector2f keepDroopOffset(1.0f, 1.0f);      // relative to the pole top: just right of the pole, a px below the top
+static_assert(keepSlotMax <= 4 * 2, "one pip per slot: 4 columns x 2 rows");
 
 // UI red (UIO-F1/F2/F3): one muted brick red for every "starving" mark in the UI (minimap dots, inspect panel, hunger lens)
 const Color uiStarvingRed = healthBarFillColor;
@@ -1182,6 +1194,9 @@ int nextKeepId = 0;
 bool keepQueued[raceCount] = {false, false, false};
 int keepReservedStone[raceCount] = {0, 0, 0};
 int keepBuilderId[raceCount] = {-1, -1, -1};
+// R31-F3: barb ids sheltering in (or running to) race r's keep, at most keepSlotMax. Only bellTick() adds; only
+// ungarrison() removes, plus bellTick()'s per-tick validation against live barbs.
+vector<int> keepSlots[raceCount];
 
 // R31-F1: race k's keep footprint: banner pole/flag above, the silhouette, and its builder's stand spot below
 FloatRect keepZone(int k) {
@@ -1259,6 +1274,7 @@ void placeQuarters() {
             smokehousePos[k] = storehousePos[k] + smokehouseCrateOffset;   // INBOX2-F1: hut beside the crate
             Vector2f kp = storehousePos[k] + keepCrateOffset;              // R31-F1: keep below the crate
             keeps[k] = keep{-1, k, (int)kp.x, (int)kp.y, false};
+            keepSlots[k].clear();                                          // R31-F3
         }
     };
     bool ok = false;
@@ -4800,11 +4816,14 @@ void buildkeeps(vector<barb>& barbs, vector<RectangleShape>& squares, const stor
 // R31-F1: 14x12 slate keep: 4 merlons over a solid wall, a 1px dark plinth, a dark gate, and the race's saturated banner
 // on a 1px pole above the right merlon. While the race has a leader, one gold pip stands in the centre crenel.
 // Drawn just after the houses, under barbs.
-void drawKeeps(RenderWindow& window) {
+// R31-F3: sheltering barbs light pale slit windows on the wall face; the banner flies only while someone shelters.
+void drawKeeps(RenderWindow& window, const vector<barb>& barbs) {
     RectangleShape r;
     for (int k = 0; k < raceCount; k++) {
         const keep& kp = keeps[k];
         if (!kp.built) continue;
+        int inside = 0;   // R31-F3: hidden barbs in this race's keep
+        for (auto& b : barbs) if (barbHidden(b) && b.race == k && b.garrisonHouseId == keepGarrisonId) inside++;
         Vector2f o((float)kp.x, (float)kp.y);
         r.setFillColor(keepStoneColor);
         r.setSize(Vector2f(keepSize.x, keepSize.y - keepMerlonH));
@@ -4828,9 +4847,20 @@ void drawKeeps(RenderWindow& window) {
         r.setPosition(o + keepPolePos);
         window.draw(r);
         r.setFillColor(keepBannerColors[k]);
-        r.setSize(keepFlagSize);
-        r.setPosition(o + keepPolePos + Vector2f(1.0f, 0.0f));
+        if (inside > 0) {   // R31-F3: full height, flying right from the pole top
+            r.setSize(keepFlagSize);
+            r.setPosition(o + keepPolePos + Vector2f(1.0f, 0.0f));
+        } else {            // R31-F3: empty keep, the banner hangs limp beside the pole
+            r.setSize(keepDroopSize);
+            r.setPosition(o + keepPolePos + keepDroopOffset);
+        }
         window.draw(r);
+        r.setFillColor(keepPipColor);   // R31-F3: one slit window per sheltering barb, top row first
+        r.setSize(keepPipSize);
+        for (int p = 0; p < min(inside, keepSlotMax); p++) {
+            r.setPosition(o + Vector2f(keepPipCols[p % 4], keepPipRows[p / 4]));
+            window.draw(r);
+        }
         if (raceElected[k]) {
             r.setFillColor(keepLeaderPipColor);
             r.setSize(Vector2f(1.0f, 1.0f));
@@ -4875,6 +4905,8 @@ void releaseBarbWork(barb& b, smokehouseSet& sh, forge& fg, storehouse (&stores)
     b.timer = 0;
 }
 
+void ungarrison(barb& b);   // R31-F3: defined with bellTick(); also frees the barb's keep slot
+
 // R30-F5: the only place a barb is removed. Releases everything the barb holds or is referenced by (hunt, carried load,
 // reserved house/shrine materials, one-off build claims, paving/spear jobs, the crown), then swapRemoves barbs and
 // squares at the same index. Callers removing several must go in descending index order.
@@ -4882,6 +4914,7 @@ void removeBarb(vector<barb>& barbs, vector<RectangleShape>& squares, int i,
                 smokehouseSet& sh, forge& fg, storehouse (&stores)[raceCount], fieldGrid& fields) {
     barb& b = barbs[i];
     releaseBarbWork(b, sh, fg, stores, fields);   // garrison state (INBOX-F1) lives in the struct and goes with the swapRemove
+    ungarrison(b);                                // R31-F3: the shared reset also frees any keep slot before the swapRemove
     if (isLeader(b)) loseLeader(b.race);
     printf("BARB DIED - %s the %s (%s, %s), id %d - %d left\n", b.name, traitOf(b).name, raceOf(b).name,
            isGentry(b) ? "Gentry" : "Commoner", b.id, (int)barbs.size() - 1);
@@ -4920,8 +4953,13 @@ int findHouseById(const vector<house>& houses, int id) {
 
 Vector2f garrisonDoorstep(const RectangleShape& hs) { return snapPx(hs.getPosition()) + garrisonDoorOffset; }
 
+// R31-F3: keep gate (barb hitbox top-left), the keep's builder stand spot just below the gate
+Vector2f keepDoorstep(int r) { return Vector2f((float)keeps[r].x, (float)keeps[r].y) + keepStandOffset; }
+
 // The only way out of the garrison state: the barb stands idle on the doorstep (or wherever it got to)
+// R31-F3: also the one place a keep slot is freed (bell-off, death via removeBarb(), lost keep, failed validation)
 void ungarrison(barb& b) {
+    for (auto& slots : keepSlots) slots.erase(std::remove(slots.begin(), slots.end(), b.id), slots.end());
     b.garrisoned = b.garrisonInside = false;
     b.garrisonHouseId = -1;
     b.moving = false;
@@ -4966,20 +5004,43 @@ void bellTick(vector<barb>& barbs, vector<RectangleShape>& squares, const vector
             logRaceEvent(string(racePlurals[r]) + " ring the bell: wolf at the crate!", r);
         }
     }
+    for (int r = 0; r < raceCount; r++) {   // R31-F3: every slot must name a live barb of race r garrisoned in this keep
+        auto& slots = keepSlots[r];
+        for (int s = (int)slots.size() - 1; s >= 0; s--) {
+            int j = findBarbById(barbs, slots[s]);
+            bool dup = find(slots.begin(), slots.begin() + s, slots[s]) != slots.begin() + s;
+            if (dup || j < 0 || !barbs[j].garrisoned || barbs[j].garrisonHouseId != keepGarrisonId || barbs[j].race != r) {
+                printf("KEEP SLOT DROPPED - %s, barb %d\n", racePlurals[r], slots[s]);
+                slots.erase(slots.begin() + s);
+            }
+        }
+        while ((int)slots.size() > keepSlotMax) slots.pop_back();   // should not happen: assignment checks the cap
+    }
     for (int i = 0; i < (int)barbs.size() && i < (int)squares.size(); i++) {
         barb& b = barbs[i];
         auto& sq = squares[i];
         if (b.race < 0 || b.race >= raceCount) continue;
         if (b.garrisoned) {
-            int h = findHouseById(houses, b.garrisonHouseId);
-            if (h < 0 || h >= (int)houseshapes.size()) {
-                printf("GARRISON RELEASED - barb %d, house %d is gone\n", b.id, b.garrisonHouseId);
-                ungarrison(b);
-                continue;
+            Vector2f spot;
+            if (b.garrisonHouseId == keepGarrisonId) {   // R31-F3: keep refuge, validated against keepSlots by id
+                const auto& slots = keepSlots[b.race];
+                if (!keeps[b.race].built || find(slots.begin(), slots.end(), b.id) == slots.end()) {
+                    printf("GARRISON RELEASED - barb %d, no keep slot\n", b.id);
+                    ungarrison(b);
+                    continue;
+                }
+                spot = keepDoorstep(b.race);
+            } else {
+                int h = findHouseById(houses, b.garrisonHouseId);
+                if (h < 0 || h >= (int)houseshapes.size()) {
+                    printf("GARRISON RELEASED - barb %d, house %d is gone\n", b.id, b.garrisonHouseId);
+                    ungarrison(b);
+                    continue;
+                }
+                spot = garrisonDoorstep(houseshapes[h]);
             }
             if (raceBell[b.race] == 0) { ungarrison(b); continue; }
             if (b.garrisonInside) continue;
-            Vector2f spot = garrisonDoorstep(houseshapes[h]);
             b.targetx = (int)spot.x;
             b.targety = (int)spot.y;
             b.moving = true;
@@ -5002,15 +5063,18 @@ void bellTick(vector<barb>& barbs, vector<RectangleShape>& squares, const vector
         Vector2f pos = sq.getPosition();
         Vector2f dq = pos - quarterCentre(b.race);
         if (dq.x * dq.x + dq.y * dq.y >= bellGatherRadius * bellGatherRadius) continue;
+        // R31-F3: the race's built keep first while it has a free slot; otherwise (full or not built) the house path
+        bool toKeep = keeps[b.race].built && (int)keepSlots[b.race].size() < keepSlotMax;
         int best = -1;
         float bestDSq = 0.0f;
-        for (int k = 0; k < (int)houses.size() && k < (int)houseshapes.size(); k++) {
-            if (houses[k].race != b.race) continue;
-            Vector2f d = garrisonDoorstep(houseshapes[k]) - pos;
-            float dSq = d.x * d.x + d.y * d.y;
-            if (best < 0 || dSq < bestDSq) { best = k; bestDSq = dSq; }
-        }
-        if (best < 0) continue;   // no own-race house to hide in
+        if (!toKeep)
+            for (int k = 0; k < (int)houses.size() && k < (int)houseshapes.size(); k++) {
+                if (houses[k].race != b.race) continue;
+                Vector2f d = garrisonDoorstep(houseshapes[k]) - pos;
+                float dSq = d.x * d.x + d.y * d.y;
+                if (best < 0 || dSq < bestDSq) { best = k; bestDSq = dSq; }
+            }
+        if (!toKeep && best < 0) continue;   // no free keep slot and no own-race house to hide in
         if (b.chopping && b.target == targetNone)   // the tree/rock/bush it was working is free for others again
             for (int k = 0; k < (int)trees.size() && k < (int)tris.size(); k++) {
                 Vector2f p = tris[k].getPosition() + treeWorkOffset;
@@ -5030,12 +5094,21 @@ void bellTick(vector<barb>& barbs, vector<RectangleShape>& squares, const vector
         b.stepTimer = 0;
         b.garrisoned = true;
         b.garrisonInside = false;
-        b.garrisonHouseId = houses[best].id;
-        Vector2f spot = garrisonDoorstep(houseshapes[best]);
+        Vector2f spot;
+        if (toKeep) {   // R31-F3: the slot is held from now on, while running and while inside
+            b.garrisonHouseId = keepGarrisonId;
+            keepSlots[b.race].push_back(b.id);
+            spot = keepDoorstep(b.race);
+        } else {
+            b.garrisonHouseId = houses[best].id;
+            spot = garrisonDoorstep(houseshapes[best]);
+        }
         b.targetx = (int)spot.x;
         b.targety = (int)spot.y;
         b.moving = true;
-        printf("GARRISON - barb %d (%s) heads for house %d\n", b.id, racePlurals[b.race], houses[best].id + 1);
+        if (toKeep) printf("GARRISON - barb %d (%s) heads for the keep (%d/%d)\n", b.id, racePlurals[b.race],
+                           (int)keepSlots[b.race].size(), keepSlotMax);
+        else printf("GARRISON - barb %d (%s) heads for house %d\n", b.id, racePlurals[b.race], houses[best].id + 1);
     }
 }
 
@@ -6285,7 +6358,7 @@ int main() {
 		}
 	}
 	drawHouses(window, houses, houseshapes);
-	drawKeeps(window);   // R31-F1
+	drawKeeps(window, barbs);   // R31-F1; R31-F3 refuge windows + banner
 	drawShrines(window, shrines);
 	drawSmokehouse(window, smoke, stores);
 	drawStall(window, activeTrader);
