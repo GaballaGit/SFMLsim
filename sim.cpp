@@ -522,6 +522,16 @@ const Color forgeEmberLit(132, 64, 36);
 const Color forgeEmberHot(176, 90, 44);    // brief glow after a dwarf mines a rock
 const int forgeEmberBreathFrames = 150;    // one slow breath every ~2.5s
 const int forgeEmberBoostFrames = 120;     // ~2s brighter after a dwarf mines (frames, so it reads the same at any speed)
+// POL-F5b: forge phase 2. While forgeActive, each dwarf stone load deposits +forgeStoneBonus and pops a few sparks.
+const int forgeStoneBonus = 1;             // modest: one extra stone per dwarf rock
+const int forgeSparkMin = 3, forgeSparkMax = 4; // sparks per bonus deposit
+const int forgeSparkFrames = 20;           // ~1/3s life, counted per drawn frame
+const int forgeSparkPoolMax = 8;           // capped pool: at most two bursts in flight; extra sparks are dropped
+const Vector2f forgeSparkOrigin(2.0f, 2.0f); // top of the hearth mouth, offset from forgePos
+const float forgeSparkRiseMin = 0.15f, forgeSparkRiseMax = 0.3f; // px per frame upward (3-6px over a life)
+const float forgeSparkDriftMax = 0.12f;    // px per frame sideways, either way
+const Color forgeSparkColor(236, 146, 64); // warm orange, a step above forgeEmberHot
+const uint8_t forgeSparkMaxAlpha = 220;    // linear fade to 0
 
 // Race storehouses (R29-F1): one per race at a fixed spot, built by a barb of that race. Chopped wood and mined stone
 // are carried to the hauler's own race's storehouse (the campfire while it isn't standing) and only counted on arrival.
@@ -1061,6 +1071,9 @@ struct forge {bool built = false; bool claimed = false;}; // the one dwarf forge
 // POL-F5a: the single forge gate (shared with forge phase 2): race r works at the forge only if it is dwarves and it is built
 bool forgeActive(const forge& fg, int r) { return r == raceDwarf && fg.built; }
 int forgeEmberFrames = 0;  // >0 = ember glows hot; set when a dwarf mines a rock, counted down per drawn frame
+// POL-F5b: fixed spark pool; a slot is free once age >= forgeSparkFrames
+struct forgeSpark {Vector2f pos, vel; int age = forgeSparkFrames;};
+forgeSpark forgeSparks[forgeSparkPoolMax];
 // R29-F1: one per race (index = barbRace), held in a fixed array in main; built is the validity flag haulers check
 struct storehouse {bool built = false; bool claimed = false; int stored = 0; int flashFrames = 0;}; // flashFrames: deposit flash, per drawn frame
 
@@ -3679,7 +3692,43 @@ void buildforge(vector<barb>& barbs, vector<RectangleShape>& squares, const vect
 
 // 7x5 slate forge: darker roof row, hearth mouth with a 1px breathing ember, 2x2 iron anvil.
 // The ember glows hotter for ~2s after a dwarf mines a rock. Drawn with the shrines, under barbs and trees.
-void drawForge(RenderWindow& window, const forge& fg, int frame) {
+// POL-F5b: the forge stone bonus is pending while a dwarf it applies to (forgeActive) is hauling stone
+bool forgeBonusPending(const vector<barb>& barbs, const forge& fg) {
+    for (auto& b : barbs) if (b.carryKind == carryStone && forgeActive(fg, b.race)) return true;
+    return false;
+}
+
+// POL-F5b: 3-4 sparks out of the hearth mouth into free pool slots; none spawn if the pool is full
+void spawnForgeSparks() {
+    uniform_int_distribution<int> count(forgeSparkMin, forgeSparkMax);
+    uniform_real_distribution<float> rise(forgeSparkRiseMin, forgeSparkRiseMax), drift(-forgeSparkDriftMax, forgeSparkDriftMax);
+    int n = count(gen);
+    for (auto& s : forgeSparks) {
+        if (n <= 0) break;
+        if (s.age < forgeSparkFrames) continue;
+        s.pos = forgePos + forgeSparkOrigin;
+        s.vel = Vector2f(drift(gen), -rise(gen));
+        s.age = 0;
+        n--;
+    }
+}
+
+// POL-F5b: 1px sparks, rising and fading; aged per drawn frame (not while paused)
+void drawForgeSparks(RenderWindow& window, bool paused) {
+    RectangleShape r(Vector2f(1.0f, 1.0f));
+    for (auto& s : forgeSparks) {
+        if (s.age >= forgeSparkFrames) continue;
+        Color c = forgeSparkColor;
+        c.a = (uint8_t)(forgeSparkMaxAlpha * (1.0f - (float)s.age / forgeSparkFrames));
+        r.setFillColor(c);
+        r.setPosition(snapPx(s.pos));
+        window.draw(r);
+        if (!paused) { s.pos += s.vel; s.age++; }
+    }
+}
+
+// POL-F5b: bonusPending (forgeBonusPending) keeps the ember in the hot range while bonus stone is on its way
+void drawForge(RenderWindow& window, const forge& fg, int frame, bool bonusPending) {
     if (!fg.built) return;
     RectangleShape r;
     for (auto& p : forgeParts) {
@@ -3690,7 +3739,7 @@ void drawForge(RenderWindow& window, const forge& fg, int frame) {
     }
     float t = 0.5f + 0.5f * sin(frame * 6.2831853f / forgeEmberBreathFrames);
     Color lo = forgeEmberDim, hi = forgeEmberLit;
-    if (forgeEmberFrames > 0) { lo = forgeEmberLit; hi = forgeEmberHot; }
+    if (forgeEmberFrames > 0 || bonusPending) { lo = forgeEmberLit; hi = forgeEmberHot; }
     auto mix = [t](uint8_t a, uint8_t c) { return (uint8_t)(a + (c - a) * t); };
     r.setSize(Vector2f(1.0f, 1.0f));
     r.setPosition(forgePos + forgeEmberPos);
@@ -4794,7 +4843,7 @@ void startHaul(barb& b, carryLoad load, const storehouse (&stores)[raceCount]) {
 
 // R29-F1: one hauler step. The depot is re-resolved every tick, so a storehouse that is gone sends the load to the
 // campfire. On arrival the load is added to the stock, the storehouse flashes, and the barb is idle again.
-void haulTick(barb& b, RectangleShape& sq, storehouse (&stores)[raceCount]) {
+void haulTick(barb& b, RectangleShape& sq, storehouse (&stores)[raceCount], const forge& fg) {
     Vector2f spot = depotSpot(b, stores);
     b.targetx = (int)spot.x;
     b.targety = (int)spot.y;
@@ -4835,10 +4884,16 @@ void haulTick(barb& b, RectangleShape& sq, storehouse (&stores)[raceCount]) {
             campfireWood++;
             tithe = true;
         } else (isWood ? rs.wood : rs.stone)++;
+        bool forged = !isWood && forgeActive(fg, b.race);   // POL-F5b: forge stone bonus, checked at deposit
+        if (forged) {
+            rs.stone += forgeStoneBonus;
+            spawnForgeSparks();
+        }
         storehouse* st = (b.race >= 0 && b.race < raceCount && stores[b.race].built) ? &stores[b.race] : nullptr;
         if (st) { st->stored++; st->flashFrames = storehouseFlashFrames; }
-        printf("%s DEPOSITED at %s%s - %s wood: %d stone: %d, campfire wood: %d\n", isWood ? "WOOD" : "STONE",
-               st ? "storehouse" : "campfire", tithe ? " (campfire tithe)" : "", racePlurals[clampRace(b.race)], rs.wood, rs.stone, campfireWood);
+        printf("%s DEPOSITED at %s%s%s - %s wood: %d stone: %d, campfire wood: %d\n", isWood ? "WOOD" : "STONE",
+               st ? "storehouse" : "campfire", tithe ? " (campfire tithe)" : "", forged ? " (+forge bonus)" : "",
+               racePlurals[clampRace(b.race)], rs.wood, rs.stone, campfireWood);
     }
     b.carryKind = carryNone;
     b.target = targetNone;
@@ -4848,7 +4903,8 @@ void haulTick(barb& b, RectangleShape& sq, storehouse (&stores)[raceCount]) {
 }
 
 void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<CircleShape>& tris, vector<RectangleShape>& stumps, vector<tree>& trees, vector<CircleShape>& octs, vector<rock>& rocks,
-                   vector<bush>& bushes, vector<CircleShape>& bushshapes, vector<birthRing>& catchRings, fieldGrid& fields, storehouse (&stores)[raceCount]) {
+                   vector<bush>& bushes, vector<CircleShape>& bushshapes, vector<birthRing>& catchRings, fieldGrid& fields, storehouse (&stores)[raceCount],
+                   const forge& fg) {
     vector<int> treeClaim, rockClaim;   // parallel to trees/tris and rocks/octs for this tick
     buildWorkClaims(barbs, tris, octs, treeClaim, rockClaim);
     vector<int> shoreClaim(shorePoints.size(), -1);   // rebuilt every tick like the tree/rock claims, so no stale anglers
@@ -4869,7 +4925,7 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
         auto& b  = barbs[j];
         if (b.carryKind != carryNone) {   // R29-F1: any other state taken over the haul drops the load
             if (b.target != targetDepot || b.movingbspot || b.building || b.deertargeting || b.chopping || b.jobKind != jobNone) dropCarry(b);
-            else { haulTick(b, sq, stores); continue; }
+            else { haulTick(b, sq, stores, fg); continue; }
         }
         if (b.movingbspot || b.building) continue;
         Vector2f bpos = sq.getPosition();
@@ -5523,7 +5579,7 @@ int main() {
                 buildfield(barbs, squares, houses, shrines, stores, fields);
                 buildmills(barbs, squares, fields);   // FARM-F2
                 craftspear(barbs, squares, dwarfForge);
-                minematerials(squares, barbs, tris, stumps, trees, octs, rocks, bushes, bushshapes, catchRings, fields, stores);
+                minematerials(squares, barbs, tris, stumps, trees, octs, rocks, bushes, bushshapes, catchRings, fields, stores, dwarfForge);
                 barbmove(squares, barbs);
                 shinobiTick(barbs, squares, houseshapes, octs, shinobiPuffs);
                 treespawn(trees, tris, stumps, fields);
@@ -5610,7 +5666,7 @@ int main() {
 	drawShrines(window, shrines);
 	drawSmokehouse(window, smoke, houses);
 	drawStall(window, activeTrader);
-	drawForge(window, dwarfForge, frameCount);
+	drawForge(window, dwarfForge, frameCount, forgeBonusPending(barbs, dwarfForge));
 	if (forgeEmberFrames > 0 && !paused) forgeEmberFrames--;
 	drawStorehouses(window, stores);
 	for (auto& st : stores) if (st.flashFrames > 0 && !paused) st.flashFrames--;
@@ -5635,6 +5691,7 @@ int main() {
 	drawTrees(window, tris, treeVerts);
 	drawSmoke(window, smoke, frameCount);
 	drawMillPuffs(window);   // FARM-F2: above the trees, under the overlay
+	drawForgeSparks(window, paused);   // POL-F5b: above barbs and trees so the sparks read, under the overlay
 	drawBirds(window, birds, birdShape, frameCount);
 	if (raining) drawRain(window, rainVerts, frameCount);
 	for (int q = 0; q < (int)squares.size(); ++q) {
