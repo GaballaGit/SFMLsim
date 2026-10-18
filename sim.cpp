@@ -554,6 +554,22 @@ const int storehouseFlashFrames = 18;      // deposit flash, ~0.3s (frames, froz
 const float storehouseFlashMix = 0.4f;     // peak blend toward white: subtle
 const Vector2f campfireDepotOffset(-10.0f, -2.0f); // fallback drop spot (hitbox top-left) just west of the stone ring
 
+// Town bell and garrison (INBOX-F1): a wolf near a standing crate rings that race's bell; the race's barbs near the crate
+// walk to the doorstep of their nearest own-race house and shelter inside (hidden) until the bell stops.
+const float bellWolfRadius = 70.0f;           // wolf centre within this of the crate centre rings the bell
+const float bellGatherRadius = 100.0f;        // that race's barbs within this of the crate centre take shelter
+const int bellQuietTicks = 600;               // bell stops ~10s at 1x after the last wolf left bellWolfRadius...
+const int bellMaxTicks = 2 * ticksPerMinute;  // ...or after this long at most (timeout), wolf or not
+const int bellCooldownTicks = 30 * 60;        // after a bell ends, that race can't ring again for ~30s
+const Vector2f bellMarkerSize(3.0f, 3.0f);    // static marker, no pulse
+const Vector2f bellMarkerOffset(storehouseSize.x - bellMarkerSize.x, -bellMarkerSize.y - 1.0f); // above the crate's top-right corner, 1px gap
+const Color bellMarkerColor(196, 166, 92);    // muted gold: dimmer than the crown and shrine cap
+const Vector2f garrisonDoorOffset(0.0f, 8.0f); // doorstep hitbox top-left relative to the 4x4 house: just below the slab, under the door
+const Color garrisonRoofTint(196, 166, 92);   // occupied house roofs ease toward the bell gold...
+const float garrisonRoofTintAmount = 0.3f;    // ...by this much: subtle
+const int garrisonPipMax = 3;                 // 1px pips above the roof, one per sheltering barb, capped
+const float garrisonPipGap = 1.0f;            // px between pips, and between the pip row and the top of the roof/chimney
+
 // UI red (UIO-F1/F2/F3): one muted brick red for every "starving" mark in the UI (minimap dots, inspect panel, hunger lens)
 const Color uiStarvingRed = healthBarFillColor;
 // Minimap (UIO-F1): bottom-right 120px map of the whole 800x800 world, drawn after the HUD in the default (UI) view.
@@ -1351,7 +1367,11 @@ struct barb {
     carryLoad carryKind = carryNone; // R29-F1: load being hauled to a storehouse/the campfire; dropped with the barb, cleared by dropCarry()
     int health = barbMaxHealth;  // R30-F5: 0 = dies at the end of the tick (removeBarb)
     int starveTicks = 0;         // R30-F5: ticks spent hungry since the last meal; starving past starveGraceTicks
+    bool garrisoned = false;     // INBOX-F1: exclusive state owned by bellTick(); every other per-tick loop skips the barb
+    bool garrisonInside = false; // INBOX-F1: reached the doorstep and hidden inside (not drawn, not pickable)
+    int garrisonHouseId = -1;    // INBOX-F1: house.id (stable, never an index); validated every tick
 };
+bool barbHidden(const barb& b) { return b.garrisoned && b.garrisonInside; }   // INBOX-F1
 
 const raceDef& raceOf(const barb& b) { return raceDefs[b.race]; }
 const traitDef& traitOf(const barb& b) { return traitDefs[b.trait]; }
@@ -1566,6 +1586,7 @@ Color barbColor(const barb& b) {
 
 // Same priority as barbColor() so the tooltip always matches the colour on screen
 const char* barbTaskName(const barb& b) {
+    if (b.garrisoned) return b.garrisonInside ? "sheltering" : "running to shelter";   // INBOX-F1
     if (b.deertargeting) return b.hasSpear ? "hunting (spear)" : "hunting";
     if (b.building) return "building";
     if (b.chopping && b.target == targetBush) return "picking";
@@ -1619,7 +1640,7 @@ void deerkilling(vector<deer>& deers, vector<RectangleShape>& deershape, vector<
 		for (int j = 0; j < (int)barbs.size(); ++j) {
 			auto& b = barbs[j];
 			auto& sq = squares[j];
-			if (b.building || b.movingbspot || b.chopping || b.timer > 0 || b.carryKind != carryNone) continue;   // R29-F1: haulers finish the trip
+			if (b.garrisoned || b.building || b.movingbspot || b.chopping || b.timer > 0 || b.carryKind != carryNone) continue;   // R29-F1: haulers finish the trip
 			if (!b.deertargeting) {
 				Vector2f bpos = sq.getPosition();
 				float dx = deerpos.x - bpos.x, dy = deerpos.y - bpos.y;
@@ -1783,7 +1804,7 @@ void endFlee(deer& d) {
     d.stepTimer = 0;
 }
 
-void deerwander(vector<RectangleShape>& deershape, vector<deer>& deers, const vector<RectangleShape>& squares) {
+void deerwander(vector<RectangleShape>& deershape, vector<deer>& deers, const vector<RectangleShape>& squares, const vector<barb>& barbs) {
     static int fleeCheckTick = 0;
     bool checkFlee = ++fleeCheckTick >= deerFleeCheckInterval;
     if (checkFlee) fleeCheckTick = 0;
@@ -1800,8 +1821,9 @@ void deerwander(vector<RectangleShape>& deershape, vector<deer>& deers, const ve
             float bestSq = deerFleeRadiusSq;
             Vector2f away;
             bool found = false;
-            for (const auto& sq : squares) {
-                Vector2f diff = pos - sq.getPosition();
+            for (int k = 0; k < (int)squares.size() && k < (int)barbs.size(); k++) {
+                if (barbHidden(barbs[k])) continue;   // INBOX-F1: sheltering barbs are indoors
+                Vector2f diff = pos - squares[k].getPosition();
                 float dSq = diff.x * diff.x + diff.y * diff.y;
                 if (dSq < bestSq) { bestSq = dSq; away = diff; found = true; }
             }
@@ -2002,7 +2024,7 @@ void drawPaving(RenderWindow& window, VertexArray& va) {
 // Cosmetic flock: crosses the map along a heading, scatters from nearby barbs, regroups by cohesion
 struct bird {Vector2f pos, vel; int flapOffset = 0;};
 
-void birdTick(vector<bird>& birds, Vector2f& heading, const vector<RectangleShape>& squares) {
+void birdTick(vector<bird>& birds, Vector2f& heading, const vector<RectangleShape>& squares, const vector<barb>& barbs) {
     static int gap = birdGapTicks / 4;
     if (birds.empty()) {
         if (--gap > 0) return;
@@ -2038,8 +2060,9 @@ void birdTick(vector<bird>& birds, Vector2f& heading, const vector<RectangleShap
             float dSq = d.x * d.x + d.y * d.y;
             if (dSq > 0.0001f && dSq < sepSq) acc += d / sqrt(dSq) * birdSeparation;
         }
-        for (auto& sq : squares) {
-            Vector2f d = b.pos - sq.getPosition();
+        for (int k = 0; k < (int)squares.size() && k < (int)barbs.size(); k++) {
+            if (barbHidden(barbs[k])) continue;   // INBOX-F1: sheltering barbs are indoors
+            Vector2f d = b.pos - squares[k].getPosition();
             float dSq = d.x * d.x + d.y * d.y;
             if (dSq > 0.0001f && dSq < fleeSq) acc += d / sqrt(dSq) * birdFleeForce;
         }
@@ -2185,6 +2208,7 @@ void drawBarbs(RenderWindow& window, const vector<barb>& barbs, const vector<Rec
     bool showTraits = zoom >= traitDotMinZoom;
     for (int i = 0; i < (int)squares.size() && i < (int)barbs.size(); i++) {
         const barb& b = barbs[i];
+        if (barbHidden(b)) continue;   // INBOX-F1: indoors
         const raceDef& rd = raceOf(b);
         Vector2f bodySize = rd.bodySize;
         bool hungry = isHungry(b);
@@ -2592,7 +2616,7 @@ optional<hoverHit> pickHover(Vector2f p, float radius, const vector<barb>& barbs
     float rSq = radius * radius;
     auto near = [&](const Shape& s) { return rectDistSq(s.getGlobalBounds(), p) <= rSq; };
     for (int i = 0; i < (int)squares.size() && i < (int)barbs.size(); i++)
-        if (near(squares[i])) {
+        if (!barbHidden(barbs[i]) && near(squares[i])) {   // INBOX-F1: sheltering barbs can't be hovered
             const barb& b = barbs[i];
             string label = string(b.name) + ", " + traitOf(b).name + ", " + raceOf(b).name + ": " + barbTaskName(b) + (isStarving(b) ? " (starving)" : isHungry(b) ? " (hungry)" : "");
             if (b.homeHouse >= 0) {   // kin counted here, on hover only
@@ -2622,7 +2646,10 @@ optional<hoverHit> pickHover(Vector2f p, float radius, const vector<barb>& barbs
         if (near(bushshapes[i])) return hoverHit{bushes[i].ripe ? "Bush: ripe" : "Bush: bare", bushDrawShape(bushshapes[i]), nullopt};
     for (int i = 0; i < (int)houseshapes.size() && i < (int)houses.size(); i++)
         if (near(houseshapes[i])) {
-            hoverHit h{"House " + to_string(houses[i].id + 1), houseshapes[i], nullopt};
+            int sheltering = 0;   // INBOX-F1
+            for (auto& b : barbs) if (barbHidden(b) && b.garrisonHouseId == houses[i].id) sheltering++;
+            hoverHit h{"House " + to_string(houses[i].id + 1) + (sheltering > 0 ? ", " + to_string(sheltering) + " sheltering" : string()),
+                       houseshapes[i], nullopt};
             h.hoveredHouse = houses[i].id;
             return h;
         }
@@ -2674,6 +2701,7 @@ int pickBarbAt(Vector2f p, float radius, const vector<barb>& barbs, const vector
     float bestSq = radius * radius;
     int best = -1;
     for (int i = 0; i < (int)squares.size() && i < (int)barbs.size(); i++) {
+        if (barbHidden(barbs[i])) continue;   // INBOX-F1
         float dSq = rectDistSq(squares[i].getGlobalBounds(), p);
         if (dSq <= bestSq) { bestSq = dSq; best = barbs[i].id; }
     }
@@ -2752,7 +2780,7 @@ void drawHousehold(RenderWindow& window, const View& worldView, const hoverHit& 
         RectangleShape pip(householdPipSize);
         pip.setFillColor(householdColor);
         for (int i = 0; i < (int)squares.size() && i < (int)barbs.size(); i++) {
-            if (barbs[i].homeHouse != h.hoveredHouse) continue;
+            if (barbs[i].homeHouse != h.hoveredHouse || barbHidden(barbs[i])) continue;   // INBOX-F1: no pip over an indoor barb
             Vector2f top = snapPx(squares[i].getPosition());
             float cx = top.x + round((squares[i].getSize().x - householdPipSize.x) / 2.0f);
             pip.setPosition(Vector2f(cx, top.y - householdPipGap - householdPipSize.y));
@@ -3014,6 +3042,7 @@ void drawMinimap(RenderWindow& window, VertexArray& va, const View& worldView,
     for (int k = 0; k < raceCount; k++)
         if (stores[k].built) minimapDot(va, inner, quarterCentre(k), MM_STORE_PX, MM_STORE_COLORS[k]);
     for (int i = 0; i < (int)barbs.size(); i++)
+        if (!barbHidden(barbs[i]))   // INBOX-F1
         minimapDot(va, inner, squares[i].getPosition() + squares[i].getSize() / 2.0f, MM_BARB_PX,
                    isStarving(barbs[i]) ? uiStarvingRed : MM_BARB_COLORS[barbs[i].race]);
     if (va.getVertexCount() > 0) window.draw(va);
@@ -3101,6 +3130,7 @@ void drawLens(RenderWindow& window, VertexArray& va, const View& worldView, Lens
     va.clear();
     if (lens == Lens::Hunger) {
         for (int i = 0; i < (int)barbs.size() && i < (int)squares.size(); i++)
+            if (!barbHidden(barbs[i]))   // INBOX-F1
             appendLensDisc(va, cam, squares[i].getPosition() + squares[i].getSize() / 2.0f, lensBarbRadius, lensHungerColor(barbs[i]));
     } else {
         for (int i = 0; i < (int)houses.size() && i < (int)houseshapes.size(); i++)
@@ -3356,6 +3386,7 @@ void buildhouse(vector<barb>& barbs,vector<RectangleShape>& squares, vector<hous
     for (int i = 0; i < (int)squares.size(); i++) {
         auto& sq = squares[i];
         auto& b  = barbs[i];
+        if (b.garrisoned) continue;           // INBOX-F1: bellTick() owns this barb
         if (b.jobKind != jobNone) continue;   // buildshrine() / buildsmokehouse() / buildstall() / buildforge() / buildfield() own this barb
         if (b.chopping || (b.timer > 0 && !b.building)) continue;
         if (!b.movingbspot && !b.moving) {
@@ -3446,6 +3477,7 @@ void buildshrine(vector<barb>& barbs, vector<RectangleShape>& squares, const vec
     for (int i = 0; i < (int)squares.size() && i < (int)barbs.size(); i++) {
         auto& sq = squares[i];
         auto& b  = barbs[i];
+        if (b.garrisoned) continue;   // INBOX-F1: bellTick() owns this barb
         if (b.jobKind != jobNone && b.jobKind != jobShrine) continue; // buildsmokehouse() / buildstall() / buildforge() own this barb
         if (b.chopping || (b.timer > 0 && !b.building)) continue;
         if (!b.movingbspot && !b.moving) {
@@ -3548,6 +3580,7 @@ bool buildOneOff(vector<barb>& barbs, vector<RectangleShape>& squares, bool& cla
     for (int i = 0; i < (int)squares.size() && i < (int)barbs.size(); i++) {
         auto& sq = squares[i];
         auto& b  = barbs[i];
+        if (b.garrisoned) continue;   // INBOX-F1: bellTick() owns this barb
         if (!claimed) {
             if (b.jobKind != jobNone || b.chopping || b.timer > 0 || b.moving || b.movingbspot || b.building) continue;
             int r = ready(b);
@@ -4064,7 +4097,7 @@ void craftspear(vector<barb>& barbs, vector<RectangleShape>& squares, const forg
             if (pick < 0) return;
             tried[pick] = true;
             for (auto& b : barbs) {
-                if (b.race != pick || b.hasSpear || b.jobKind != jobNone || b.deertargeting || b.chopping || b.timer > 0
+                if (b.garrisoned || b.race != pick || b.hasSpear || b.jobKind != jobNone || b.deertargeting || b.chopping || b.timer > 0
                     || b.moving || b.movingbspot || b.building) continue;
                 spend(stockOfRace(pick), spearWoodCost, spearStoneCost);   // POL-F3: paid up front by the crafter's race
                 b.spearPaid = true;
@@ -4302,7 +4335,7 @@ void shinobiTick(vector<barb>& barbs, vector<RectangleShape>& squares, const vec
     for (int i = 0; i < (int)barbs.size() && i < (int)squares.size(); i++) {
         barb& b = barbs[i];
         if (!b.shinobi) continue;
-        if (b.moving || b.chopping || b.building || b.movingbspot || b.deertargeting || b.timer > 0 || b.jobKind != jobNone) continue;
+        if (b.garrisoned || b.moving || b.chopping || b.building || b.movingbspot || b.deertargeting || b.timer > 0 || b.jobKind != jobNone) continue;
         if (blinkChance(gen) != 0) continue;
         Vector2f from = squares[i].getPosition(), size = squares[i].getSize();
         for (int t = 0; t < shinobiBlinkTries; t++) {
@@ -4484,7 +4517,7 @@ void paveTick(vector<barb>& barbs, vector<RectangleShape>& squares) {
     float whoDSq = 0.0f;
     for (int i = 0; i < (int)barbs.size(); i++) {
         auto& b = barbs[i];
-        if (b.jobKind != jobNone || b.deertargeting || b.chopping || b.timer > 0
+        if (b.garrisoned || b.jobKind != jobNone || b.deertargeting || b.chopping || b.timer > 0
             || b.moving || b.movingbspot || b.building) continue;
         if (!canAfford(stockOf(b), 0, paveStoneCost + houseStoneCost)) continue;
         Vector2f d = squares[i].getPosition() - bestCentre;
@@ -4531,7 +4564,7 @@ void drawBallots(RenderWindow& window, const View& worldView, float zoom,
     float a = min(1.0f, (float)ballotFramesLeft / ballotFadeFrames);
     RectangleShape pip(ballotPipSize);
     for (int i = 0; i < (int)squares.size() && i < (int)barbs.size(); i++) {
-        if (barbs[i].lastVote == decreeNone) continue;   // born after the vote
+        if (barbs[i].lastVote == decreeNone || barbHidden(barbs[i])) continue;   // born after the vote; INBOX-F1: indoors
         Color c = ballotPipColors[barbs[i].lastVote];
         c.a = (uint8_t)(255 * a);
         pip.setFillColor(c);
@@ -4561,12 +4594,8 @@ void leaderWatchTick(const vector<barb>& barbs) {
         if (raceElected[r] && findBarbById(barbs, raceLeaderId[r]) < 0) loseLeader(r);
 }
 
-// R30-F5: the only place a barb is removed. Releases everything the barb holds or is referenced by (hunt, carried load,
-// reserved house/shrine materials, one-off build claims, paving/spear jobs, the crown), then swapRemoves barbs and
-// squares at the same index. Callers removing several must go in descending index order.
-void removeBarb(vector<barb>& barbs, vector<RectangleShape>& squares, int i,
-                smokehouse& sh, forge& fg, storehouse (&stores)[raceCount], fieldGrid& fields) {
-    barb& b = barbs[i];
+// INBOX-F1: the release half of removeBarb(), shared with bellTick() so a barb taking shelter frees exactly what a dead one does
+void releaseBarbWork(barb& b, smokehouse& sh, forge& fg, storehouse (&stores)[raceCount], fieldGrid& fields) {
     if (b.deertargeting) clearHunt(b);
     dropCarry(b);
     if (b.reservedwood) stockOf(b).wood += houseWoodCost;   // house claim walked to but never built: back to its race's stock
@@ -4597,6 +4626,15 @@ void removeBarb(vector<barb>& barbs, vector<RectangleShape>& squares, int i,
     b.jobKind = jobNone;
     b.moving = b.movingbspot = b.building = b.chopping = false;
     b.timer = 0;
+}
+
+// R30-F5: the only place a barb is removed. Releases everything the barb holds or is referenced by (hunt, carried load,
+// reserved house/shrine materials, one-off build claims, paving/spear jobs, the crown), then swapRemoves barbs and
+// squares at the same index. Callers removing several must go in descending index order.
+void removeBarb(vector<barb>& barbs, vector<RectangleShape>& squares, int i,
+                smokehouse& sh, forge& fg, storehouse (&stores)[raceCount], fieldGrid& fields) {
+    barb& b = barbs[i];
+    releaseBarbWork(b, sh, fg, stores, fields);   // garrison state (INBOX-F1) lives in the struct and goes with the swapRemove
     if (isLeader(b)) loseLeader(b.race);
     printf("BARB DIED - %s the %s (%s, %s), id %d - %d left\n", b.name, traitOf(b).name, raceOf(b).name,
            isGentry(b) ? "Gentry" : "Commoner", b.id, (int)barbs.size() - 1);
@@ -4619,6 +4657,177 @@ void starveDeathTick(vector<barb>& barbs, vector<RectangleShape>& squares,
         if (i >= (int)barbs.size() || i >= (int)squares.size()) continue;
         printf("STARVED - ");
         removeBarb(barbs, squares, i, sh, fg, stores, fields);
+    }
+}
+
+// INBOX-F1: town bell. raceBell[r] = ticks left before race r's bell falls silent (0 = silent); refreshed while a wolf is near.
+int raceBell[raceCount] = {};
+int raceBellAge[raceCount] = {};       // ticks since the bell started; the bell times out at bellMaxTicks
+int raceBellCooldown[raceCount] = {};  // ticks before race r may ring again
+
+int findHouseById(const vector<house>& houses, int id) {
+    if (id < 0) return -1;
+    for (int i = 0; i < (int)houses.size(); i++) if (houses[i].id == id) return i;
+    return -1;
+}
+
+Vector2f garrisonDoorstep(const RectangleShape& hs) { return snapPx(hs.getPosition()) + garrisonDoorOffset; }
+
+// The only way out of the garrison state: the barb stands idle on the doorstep (or wherever it got to)
+void ungarrison(barb& b) {
+    b.garrisoned = b.garrisonInside = false;
+    b.garrisonHouseId = -1;
+    b.moving = false;
+    b.stepTimer = 0;
+    b.targetx = b.targety = -1;
+    b.target = targetNone;
+}
+
+// Runs right after wolfTick(). Rings/silences each race's bell, then walks garrisoned barbs to their doorstep and hides them.
+// Garrisoning drops the barb's work through releaseBarbWork() (and frees the tree/rock/bush it was working); haulers finish
+// their trip first. Every garrisoned barb's house is re-resolved by id each tick; a missing house releases the barb.
+void bellTick(vector<barb>& barbs, vector<RectangleShape>& squares, const vector<house>& houses, const vector<RectangleShape>& houseshapes,
+              const vector<wolf>& wolves, storehouse (&stores)[raceCount], smokehouse& sh, forge& fg, fieldGrid& fields,
+              vector<tree>& trees, const vector<CircleShape>& tris, vector<rock>& rocks, const vector<CircleShape>& octs,
+              vector<bush>& bushes) {
+    for (int r = 0; r < raceCount; r++) {
+        if (raceBellCooldown[r] > 0) raceBellCooldown[r]--;
+        bool wolfNear = false;
+        Vector2f qc = quarterCentre(r);
+        for (auto& w : wolves) {
+            Vector2f d = w.shape.getPosition() + wolfSize / 2.0f - qc;
+            if (d.x * d.x + d.y * d.y < bellWolfRadius * bellWolfRadius) wolfNear = true;
+        }
+        if (!stores[r].built) wolfNear = false;   // no crate, no bell
+        if (raceBell[r] > 0) {
+            raceBellAge[r]++;
+            if (wolfNear) raceBell[r] = bellQuietTicks;
+            else raceBell[r]--;
+            bool timedOut = raceBellAge[r] >= bellMaxTicks;
+            if (raceBell[r] <= 0 || timedOut || !stores[r].built) {
+                raceBell[r] = 0;
+                raceBellCooldown[r] = bellCooldownTicks;
+                int sheltered = 0;
+                for (auto& b : barbs) if (b.garrisoned && b.race == r) sheltered++;
+                printf("BELL SILENT - %s%s, %d leave shelter\n", racePlurals[r], timedOut ? " (timeout)" : "", sheltered);
+                logRaceEvent(string(racePlurals[r]) + " leave shelter, the bell falls silent", r);
+            }
+        } else if (wolfNear && raceBellCooldown[r] == 0) {
+            raceBell[r] = bellQuietTicks;
+            raceBellAge[r] = 0;
+            printf("BELL RUNG - %s, wolf within %.0fpx of the crate\n", racePlurals[r], bellWolfRadius);
+            logRaceEvent(string(racePlurals[r]) + " ring the bell: wolf at the crate!", r);
+        }
+    }
+    for (int i = 0; i < (int)barbs.size() && i < (int)squares.size(); i++) {
+        barb& b = barbs[i];
+        auto& sq = squares[i];
+        if (b.race < 0 || b.race >= raceCount) continue;
+        if (b.garrisoned) {
+            int h = findHouseById(houses, b.garrisonHouseId);
+            if (h < 0 || h >= (int)houseshapes.size()) {
+                printf("GARRISON RELEASED - barb %d, house %d is gone\n", b.id, b.garrisonHouseId);
+                ungarrison(b);
+                continue;
+            }
+            if (raceBell[b.race] == 0) { ungarrison(b); continue; }
+            if (b.garrisonInside) continue;
+            Vector2f spot = garrisonDoorstep(houseshapes[h]);
+            b.targetx = (int)spot.x;
+            b.targety = (int)spot.y;
+            b.moving = true;
+            Vector2f pos = sq.getPosition();
+            Vector2f diff = spot - pos;
+            float dSq = diff.x * diff.x + diff.y * diff.y;
+            if (dSq < 1.0f) {
+                sq.setPosition(spot);
+                b.garrisonInside = true;
+                b.moving = false;
+                b.stepTimer = 0;
+            } else if (++b.stepTimer >= stepLimit(b, pos)) {
+                b.stepTimer = 0;
+                sq.move(pathStep(pos, diff));
+                trailStep(sq.getPosition());
+            }
+            continue;
+        }
+        if (raceBell[b.race] == 0 || b.carryKind != carryNone) continue;   // haulers deposit first, then shelter
+        Vector2f pos = sq.getPosition();
+        Vector2f dq = pos - quarterCentre(b.race);
+        if (dq.x * dq.x + dq.y * dq.y >= bellGatherRadius * bellGatherRadius) continue;
+        int best = -1;
+        float bestDSq = 0.0f;
+        for (int k = 0; k < (int)houses.size() && k < (int)houseshapes.size(); k++) {
+            if (houses[k].race != b.race) continue;
+            Vector2f d = garrisonDoorstep(houseshapes[k]) - pos;
+            float dSq = d.x * d.x + d.y * d.y;
+            if (best < 0 || dSq < bestDSq) { best = k; bestDSq = dSq; }
+        }
+        if (best < 0) continue;   // no own-race house to hide in
+        if (b.chopping && b.target == targetNone)   // the tree/rock/bush it was working is free for others again
+            for (int k = 0; k < (int)trees.size() && k < (int)tris.size(); k++) {
+                Vector2f p = tris[k].getPosition() + treeWorkOffset;
+                if ((int)p.x == b.targetx && (int)p.y == b.targety) { trees[k].dying = false; break; }
+            }
+        if (b.chopping && b.target == targetRock)
+            for (int k = 0; k < (int)rocks.size() && k < (int)octs.size(); k++) {
+                Vector2f p = octs[k].getPosition() + rockWorkOffset;
+                if ((int)p.x == b.targetx && (int)p.y == b.targety) { rocks[k].dying = false; break; }
+            }
+        if (b.chopping && b.target == targetBush && b.targetBush >= 0 && b.targetBush < (int)bushes.size())
+            bushes[b.targetBush].picking = false;
+        releaseBarbWork(b, sh, fg, stores, fields);
+        b.target = targetNone;
+        b.targetBush = b.targetShore = -1;
+        b.wanderX = b.wanderY = -1;
+        b.stepTimer = 0;
+        b.garrisoned = true;
+        b.garrisonInside = false;
+        b.garrisonHouseId = houses[best].id;
+        Vector2f spot = garrisonDoorstep(houseshapes[best]);
+        b.targetx = (int)spot.x;
+        b.targety = (int)spot.y;
+        b.moving = true;
+        printf("GARRISON - barb %d (%s) heads for house %d\n", b.id, racePlurals[b.race], houses[best].id + 1);
+    }
+}
+
+// INBOX-F1: world layer, after the houses and crates. A static bell marker by each ringing race's crate; houses with
+// barbs sheltering get a roof eased toward the bell gold plus one 1px pip per occupant above the roof (capped).
+void drawGarrison(RenderWindow& window, const vector<barb>& barbs, const vector<house>& houses,
+                  const vector<RectangleShape>& houseshapes, const storehouse (&stores)[raceCount]) {
+    RectangleShape r(bellMarkerSize);
+    r.setFillColor(bellMarkerColor);
+    for (int k = 0; k < raceCount; k++) {
+        if (raceBell[k] <= 0 || !stores[k].built) continue;
+        r.setPosition(storehousePos[k] + bellMarkerOffset);
+        window.draw(r);
+    }
+    for (int i = 0; i < (int)houses.size() && i < (int)houseshapes.size(); i++) {
+        int n = 0;
+        for (auto& b : barbs) if (barbHidden(b) && b.garrisonHouseId == houses[i].id) n++;
+        if (n == 0) continue;
+        const houseStyle& st = houseStyles[clampRace(houses[i].race)];
+        Vector2f o = snapPx(houseshapes[i].getPosition());
+        r.setFillColor(lerpColor(st.roof, garrisonRoofTint, garrisonRoofTintAmount));
+        for (int k = 0; k < st.rows; k++) {   // same rows as drawHouses(), retinted on top
+            r.setSize(Vector2f(st.width[k], 1.0f));
+            r.setPosition(o + Vector2f(st.left[k], st.top + k));
+            window.draw(r);
+        }
+        float top = st.top;
+        if (st.chimneySize.x > 0.0f) top = min(top, st.chimneyPos.y);
+        int pips = min(n, garrisonPipMax);
+        float step = 1.0f + garrisonPipGap;
+        float x0 = o.x + 2.0f - floor((pips - 1) * step / 2.0f);   // centred on the 4px house (x + 2)
+        r.setSize(Vector2f(1.0f, 1.0f));
+        r.setFillColor(bellMarkerColor);
+        for (int k = 0; k < pips; k++) {
+            r.setPosition(Vector2f(x0 + k * step, o.y + top - garrisonPipGap - 1.0f));
+            window.draw(r);
+        }
+        r.setSize(bellMarkerSize);
+        r.setFillColor(bellMarkerColor);
     }
 }
 
@@ -4738,7 +4947,7 @@ void barbmove(vector<RectangleShape>& squares, vector<barb>& barbs) {
     for (int i = 0; i < (int)squares.size(); i++) {
         auto& sq = squares[i];
         auto& b  = barbs[i];
-        if (b.chopping || b.timer > 0 || b.movingbspot || b.building || b.carryKind != carryNone) continue;   // R29-F1: haulTick() walks haulers
+        if (b.garrisoned || b.chopping || b.timer > 0 || b.movingbspot || b.building || b.carryKind != carryNone) continue;   // R29-F1: haulTick() walks haulers; INBOX-F1: bellTick() walks garrisoned
         Vector2f pos = sq.getPosition();
         if (!b.moving) {
             if (wanderChance(gen) != 0) continue;
@@ -4781,7 +4990,7 @@ void buildWorkClaims(const vector<barb>& barbs, const vector<CircleShape>& tris,
     unordered_map<long long, int> treeSpots, rockSpots;
     for (int j = 0; j < (int)barbs.size(); j++) {
         const barb& b = barbs[j];
-        if (b.targetx == -1 || b.target == targetBush || b.target == targetLake || b.target == targetField || b.target == targetDepot || b.deertargeting || b.movingbspot || b.building) continue;
+        if (b.garrisoned || b.targetx == -1 || b.target == targetBush || b.target == targetLake || b.target == targetField || b.target == targetDepot || b.deertargeting || b.movingbspot || b.building) continue;
         (b.target == targetRock ? rockSpots : treeSpots).emplace(workSpotKey(b.targetx, b.targety), j); // first claimant kept
     }
     treeClaim.assign(tris.size(), -1);
@@ -4929,6 +5138,7 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
     for (int j = 0; j < (int)squares.size(); j++) {
         auto& sq = squares[j];
         auto& b  = barbs[j];
+        if (b.garrisoned) continue;   // INBOX-F1: no work or tree/rock/bush/shore search while sheltering
         if (b.carryKind != carryNone) {   // R29-F1: any other state taken over the haul drops the load
             if (b.target != targetDepot || b.movingbspot || b.building || b.deertargeting || b.chopping || b.jobKind != jobNone) dropCarry(b);
             else { haulTick(b, sq, stores, fg); continue; }
@@ -5594,15 +5804,17 @@ int main() {
                 birthRingTick(birthRings);
                 catchRingTick(catchRings);
                 deerspawn(deers, deershape);
-                deerwander(deershape, deers, squares);
+                deerwander(deershape, deers, squares, barbs);
                 deerkilling(deers, deershape, barbs, squares, smoke);
                 wolfTick(wolves, deers, deershape, barbs);
+                bellTick(barbs, squares, houses, houseshapes, wolves, stores, smoke, dwarfForge, fields,
+                         trees, tris, rocks, octs, bushes);   // INBOX-F1: after the wolves move
                 clockk();
                 weatherTick();
                 traderTick(activeTrader, barbs, stores);
                 hungerTick(barbs);
                 trailTick();
-                birdTick(birds, birdHeading, squares);
+                birdTick(birds, birdHeading, squares, barbs);
                 bushTick(bushes, bushshapes);
                 fieldTick(fields);
                 campfireTick(fire);
@@ -5620,7 +5832,7 @@ int main() {
             if (inClearing(p)) {   // village clearing or a race quarter (R30-F1)
                 int tix = (int)(p.x + 8), tiy = (int)(p.y + 15);
                 for (auto& b : barbs) {
-                    if (b.target != targetBush && b.targetx == tix && b.targety == tiy) {
+                    if (!b.garrisoned && b.target != targetBush && b.targetx == tix && b.targety == tiy) {   // INBOX-F1: doorstep walks untouched
                         b.moving = b.chopping = false;
                         b.timer  = 0;
                         b.targetx = b.targety = -1;
@@ -5634,7 +5846,7 @@ int main() {
             if (inClearing(p)) {   // village clearing or a race quarter (R30-F1)
                 int rix = (int)(p.x + 6), riy = (int)(p.y + 10);   // same stand spot minematerials targets
                 for (auto& b : barbs) {
-                    if (b.target == targetRock && b.targetx == rix && b.targety == riy) {
+                    if (!b.garrisoned && b.target == targetRock && b.targetx == rix && b.targety == riy) {
                         b.moving = b.chopping = false;
                         b.timer  = 0;
                         b.targetx = b.targety = -1;
@@ -5676,6 +5888,7 @@ int main() {
 	drawForge(window, dwarfForge, frameCount, forgeBonusPending(barbs, dwarfForge));
 	if (forgeEmberFrames > 0 && !paused) forgeEmberFrames--;
 	drawStorehouses(window, stores);
+	drawGarrison(window, barbs, houses, houseshapes, stores);   // INBOX-F1: bell marker, sheltering roof tint + pips
 	for (auto& st : stores) if (st.flashFrames > 0 && !paused) st.flashFrames--;
 	for (int r = 0; r < raceCount; r++)
 	    for (auto& fp : fields[r]) drawField(window, fp, r, frameCount);
@@ -5738,7 +5951,7 @@ int main() {
         // UIO-F2: resolve the selection once per frame; a vanished barb (died/removed) clears it
         int selIdx = findBarbById(barbs, selectedBarbId);
         if (selIdx < 0) { selectedBarbId = -1; inspectRect = FloatRect(); }
-        if (selIdx >= 0 && selIdx < (int)squares.size()) drawSelectRing(window, worldView, squares[selIdx], zoom);
+        if (selIdx >= 0 && selIdx < (int)squares.size() && !barbHidden(barbs[selIdx])) drawSelectRing(window, worldView, squares[selIdx], zoom);
 
         optional<hoverHit> hover;
         bool overHud = false;
