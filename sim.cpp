@@ -608,13 +608,12 @@ Vector2f smokehousePos[raceCount];         // INBOX2-F1: hut top-left = storehou
 const Vector2f storehouseStandOffset(-4.0f, 3.0f); // builder/hauler hitbox top-left relative to the crate: at its left side
 const Vector2f traderStoreOffset(storehouseSize.x + 1.0f, 3.0f); // POL-F4: trader top-left relative to the crate: its right side
 const float storehouseClearPx = 3.0f;      // houses, shrines, the field and blinks keep this far from crate + stand spot
-const float storehouseOutlinePx = 1.0f;    // drawn inward, so the crate stays exactly storehouseSize
-const Color storehouseColors[raceCount] = {
+const Color storehouseColors[raceCount] = {   // R36-F1: the crate's runtime tint (drawParts), lid and body ramp off it
     Color(142, 106, 66),                   // human: muted timber brown
     Color(116, 112, 102),                  // dwarf: stone grey
     Color(108, 134, 94),                   // elf: sage
 };
-const Color storehouseOutlineColor(34, 26, 18); // dark rim and lid slat
+const Color storehouseRopeColor(170, 148, 104); // R36-F1: pale hemp band round the crate body
 const int storehouseFlashFrames = 18;      // deposit flash, ~0.3s (frames, frozen while paused)
 const float storehouseFlashMix = 0.4f;     // peak blend toward white: subtle
 const Vector2f campfireDepotOffset(-10.0f, -2.0f); // fallback drop spot (hitbox top-left) just west of the stone ring
@@ -642,14 +641,14 @@ const int keepStoneReserve = houseStoneCost + tradeStoneCost; // only paid from 
 const int keepBuildTicks = 2 * houseBuildTicks;  // a bigger job than a house
 const Vector2f keepSize(14.0f, 12.0f);           // whole silhouette, battlements included
 const Vector2f keepCrateOffset(-2.0f, 19.0f);    // keep top-left relative to the crate: below it; the banner stays clear of the crate's clear zone
-const float keepMerlonW = 2.0f;                  // merlons and crenels both 2px wide: merlons at x 0, 4, 8, 12
-const float keepMerlonH = 2.0f;                  // top 2 rows are the battlements
-const Vector2f keepGatePos(5.0f, 7.0f);          // dark 4x5 gate, centred on the 14px front, on the ground line
-const Vector2f keepGateSize(4.0f, 5.0f);
+const float keepMerlonH = 2.0f;                  // top 2 rows are the battlements (R36-F1: 3 notched merlons, see buildingParts)
+const Vector2f keepGatePos(5.0f, 7.0f);          // dark 4x5 arched door, centred on the 14px front, on the ground line
+const Vector2f keepGateSize(4.0f, 5.0f);         // top row is the 2px arch, the 4px door below it
 const float keepPoleH = 5.0f;                    // banner pole rises this far above the top-right merlon
 const Vector2f keepPolePos(keepSize.x - 1.0f, -keepPoleH); // 1px pole on the right column of the last merlon
 const Vector2f keepFlagSize(3.0f, 2.0f);         // flies right from the pole top
-const Vector2f keepLeaderPipPos(6.0f, 1.0f);     // in the centre crenel, on the wall walk: inside the silhouette, never above a roof
+const Vector2f keepLeaderPipPos(6.0f, 0.0f);     // R36-F1: fills the centre merlon's 2px notch: inside the silhouette, never above a roof
+const Vector2f keepLeaderPipSize(2.0f, 1.0f);
 const Vector2f keepStandOffset(6.0f, keepSize.y); // builder hitbox top-left relative to the keep: just below the gate
 const float keepStandRoomPx = 6.0f;              // reserved below the keep for the stand spot: tallest barb body (5) + 1
 const float keepClearPx = 3.0f;                  // houses, shrines, plots and blinks keep this far from the keep zone
@@ -676,6 +675,57 @@ const Color keepPipColor(206, 220, 238);         // pale blue-white, distinct fr
 const Vector2f keepDroopSize(2.0f, 3.0f);        // limp banner hanging beside the pole when the keep is empty
 const Vector2f keepDroopOffset(1.0f, 1.0f);      // relative to the pole top: just right of the pole, a px below the top
 static_assert(keepSlotMax <= 4 * 2, "one pip per slot: 4 columns x 2 rows");
+
+// Building Signatures (R36-F1, phase 1): each building is a list of 1px-grid parts in one shared table, drawn by
+// drawParts() into a VertexArray (one draw per building kind). Each part's colour is multiplied by a runtime tint
+// (sf::Color modulate): "tinted" ranges are authored on the grey ramp below, so they take the tint's hue at 3 muted
+// steps; "fixed" ranges use real colours and are drawn with a white tint. Draw-only: hitboxes are unchanged.
+struct partDef {Vector2f pos, size; Color color;};
+struct partRange {int first, count;};
+const Color partRampLight(255, 255, 255);        // exactly the tint
+const Color partRampMid(222, 222, 222);          // ~13% darker
+const Color partRampDark(176, 176, 176);         // ~30% darker: undersides, shaded sides
+const Color buildingShadowColor(12, 18, 10, 120); // translucent 1px ground shadow, cast 1px right of the footprint
+const partDef buildingParts[] = {
+    // [0] storehouse, fixed: ground shadow under the 10x10 crate
+    {{1.0f, 10.0f}, {10.0f, 1.0f}, buildingShadowColor},
+    // [1..4] storehouse, tinted (race colour): 10px lid over an 8px body inset 1px each side, so the lid lips out
+    {{0.0f, 0.0f}, {10.0f, 1.0f}, partRampLight},  // lid top
+    {{0.0f, 1.0f}, {10.0f, 1.0f}, partRampDark},   // lid edge
+    {{1.0f, 2.0f}, {8.0f, 8.0f}, partRampMid},     // body
+    {{8.0f, 2.0f}, {1.0f, 8.0f}, partRampDark},    // shaded right side
+    // [5] storehouse, fixed: 1px rope band round the body
+    {{1.0f, 6.0f}, {8.0f, 1.0f}, storehouseRopeColor},
+    // [6] keep, fixed: ground shadow under the 14x12 keep
+    {{1.0f, 12.0f}, {14.0f, 1.0f}, buildingShadowColor},
+    // [7..17] keep, tinted (keepStoneColor): wall, a dark wall-walk row, then 3 notched merlons (3, 4, 3 px wide at
+    // x 0, 5, 11; 2px crenels between). Each merlon's top row is split by a notch: 1px on the sides, 2px in the centre.
+    {{0.0f, keepMerlonH}, {keepSize.x, keepSize.y - keepMerlonH}, partRampLight},
+    {{0.0f, keepMerlonH}, {keepSize.x, 1.0f}, partRampDark},
+    {{0.0f, 1.0f}, {3.0f, 1.0f}, partRampLight},
+    {{0.0f, 0.0f}, {1.0f, 1.0f}, partRampLight},
+    {{2.0f, 0.0f}, {1.0f, 1.0f}, partRampLight},
+    {{5.0f, 1.0f}, {4.0f, 1.0f}, partRampLight},
+    {{5.0f, 0.0f}, {1.0f, 1.0f}, partRampLight},
+    {{8.0f, 0.0f}, {1.0f, 1.0f}, partRampLight},
+    {{11.0f, 1.0f}, {3.0f, 1.0f}, partRampLight},
+    {{11.0f, 0.0f}, {1.0f, 1.0f}, partRampLight},
+    {{13.0f, 0.0f}, {1.0f, 1.0f}, partRampLight},
+    // [18..20] keep, fixed: plinth row, then the dark arched door through it
+    {{0.0f, keepSize.y - 1.0f}, {keepSize.x, 1.0f}, keepPlinthColor},
+    {keepGatePos + Vector2f(1.0f, 0.0f), {keepGateSize.x - 2.0f, 1.0f}, keepGateColor},
+    {keepGatePos + Vector2f(0.0f, 1.0f), {keepGateSize.x, keepGateSize.y - 1.0f}, keepGateColor},
+    // [21] house, fixed: ground shadow under the 6px walls (offsets from the 4x4 house shape)
+    {houseWallPos + Vector2f(1.0f, houseWallSize.y), {houseWallSize.x, 1.0f}, buildingShadowColor},
+    // [22..24] house, fixed: walls, door, window (drawn after the race roof; drawHouseLights lights the window)
+    {houseWallPos, houseWallSize, houseWallColor},
+    {houseDoorPos, houseDoorSize, houseDoorColor},
+    {houseWindowPos, houseWindowSize, houseWindowDayColor},
+};
+const partRange storeShadowParts{0, 1}, storeBodyParts{1, 4}, storeTrimParts{5, 1};
+const partRange keepShadowParts{6, 1}, keepStoneParts{7, 11}, keepTrimParts{18, 3};
+const partRange houseShadowParts{21, 1}, houseBodyParts{22, 3};
+static_assert(size(buildingParts) == 25, "partRange indices above must match the buildingParts table");
 // Curtain Wall and Gate (R31-F2): cosmetic only (no collision or pathing). Once a race's keep stands, a ring of
 // wallSlots arc slots centred on the keep gets one 2px-thick stone segment every wallRiseTicks, growing out from both
 // sides of a wallGateSlots-wide gate gap that faces the campfire. A slot whose arc would touch a building, plot, rock,
@@ -1215,6 +1265,14 @@ Color shade(Color c, float f) {
 void pushQuad(VertexArray& va, Vector2f p, Vector2f s, Color c) {
     Vector2f a = p, b = p + Vector2f(s.x, 0), d = p + Vector2f(0, s.y), e = p + s;
     for (Vector2f v : {a, b, e, a, e, d}) va.append(Vertex{v, c});
+}
+
+// R36-F1: append parts (in order) at origin, each colour modulated by tint; callers draw va once per building kind
+void drawParts(VertexArray& va, const partDef* parts, int count, Vector2f origin, Color tint) {
+    for (int i = 0; i < count; i++) pushQuad(va, origin + parts[i].pos, parts[i].size, parts[i].color * tint);
+}
+void drawParts(VertexArray& va, partRange parts, Vector2f origin, Color tint) {
+    drawParts(va, buildingParts + parts.first, parts.count, origin, tint);
 }
 
 // Stable kind for a tree from its integer position (same tree always looks the same)
@@ -2739,37 +2797,27 @@ void drawBarbs(RenderWindow& window, const vector<barb>& barbs, const vector<Rec
 }
 
 // Roofed houses: slab is drawn separately underneath. Window is dark glass here; drawHouseLights lights it at night.
+// R36-F1: batched via drawParts. The race roof rows come from houseStyle (shared with the garrison retint and the hover
+// outline), tinted with the race roof colour; the bottom roof row is one ramp step darker as an eave.
 void drawHouses(RenderWindow& window, const vector<house>& houses, const vector<RectangleShape>& houseshapes) {
-    RectangleShape r;
+    static VertexArray va(PrimitiveType::Triangles);
+    va.clear();
     for (int i = 0; i < (int)houseshapes.size() && i < (int)houses.size(); i++) {
         auto& hs = houseshapes[i];
         const houseStyle& st = houseStyles[houses[i].race];
         Vector2f o = snapPx(hs.getPosition());
+        drawParts(va, houseShadowParts, o, Color::White);
         if (st.chimneySize.x > 0.0f) {                  // behind the roof so its base tucks in
-            r.setSize(st.chimneySize);
-            r.setPosition(o + st.chimneyPos);
-            r.setFillColor(houseChimneyDwarfColor);
-            window.draw(r);
+            partDef chimney{st.chimneyPos, st.chimneySize, houseChimneyDwarfColor};
+            drawParts(va, &chimney, 1, o, Color::White);
         }
-        r.setFillColor(st.roof);
-        for (int k = 0; k < st.rows; k++) {
-            r.setSize(Vector2f(st.width[k], 1.0f));
-            r.setPosition(o + Vector2f(st.left[k], st.top + k));
-            window.draw(r);
-        }
-        r.setSize(houseWallSize);
-        r.setPosition(o + houseWallPos);
-        r.setFillColor(houseWallColor);
-        window.draw(r);
-        r.setSize(houseDoorSize);
-        r.setPosition(o + houseDoorPos);
-        r.setFillColor(houseDoorColor);
-        window.draw(r);
-        r.setSize(houseWindowSize);
-        r.setPosition(o + houseWindowPos);
-        r.setFillColor(houseWindowDayColor);
-        window.draw(r);
+        partDef roof[houseStyleMaxRows];
+        for (int k = 0; k < st.rows; k++)
+            roof[k] = {Vector2f(st.left[k], st.top + k), Vector2f(st.width[k], 1.0f), k == st.rows - 1 ? partRampMid : partRampLight};
+        drawParts(va, roof, st.rows, o, st.roof);
+        drawParts(va, houseBodyParts, o, Color::White);
     }
+    if (va.getVertexCount() > 0) window.draw(va);
 }
 
 // Lit windows, drawn after the night overlay (which leaves the default view set) so they read as lamplight
@@ -4350,7 +4398,7 @@ void drawMineShafts(RenderWindow& window, const vector<barb>& barbs, const vecto
     }
 }
 
-// R29-F1: 10x10 race-coloured crate, dark inset rim and one dark lid slat across it. The fill eases toward white
+// R29-F1: 10x10 race-coloured crate (R36-F1: lidded, see drawStorehouses). The fill eases toward white
 // for a moment after each deposit. Drawn with the forge, under barbs and trees.
 // R30-F1: ground layer. Each standing crate's 1px road to its race's nearest house (prebuilt on house build), then the
 // faint dotted quarter rings at zoom >= quarterRingMinZoom (at 1x a 1px dot ring is just noise).
@@ -4360,21 +4408,21 @@ void drawQuarters(RenderWindow& window, const storehouse (&stores)[raceCount], f
     if (zoom >= quarterRingMinZoom && quarterRingVerts.getVertexCount() > 0) window.draw(quarterRingVerts);
 }
 
+// R36-F1: lidded crate via drawParts: a 10px lid lipping over an 8px race-tinted body, a 1px rope band, a ground shadow.
+// The deposit flash eases the tint toward white, so lid and body brighten together.
 void drawStorehouses(RenderWindow& window, const storehouse (&stores)[raceCount]) {
-    RectangleShape crate(storehouseSize), slat(Vector2f(storehouseSize.x, storehouseOutlinePx));
-    crate.setOutlineThickness(-storehouseOutlinePx);
-    crate.setOutlineColor(storehouseOutlineColor);
-    slat.setFillColor(storehouseOutlineColor);
+    static VertexArray va(PrimitiveType::Triangles);
+    va.clear();
     for (int r = 0; r < raceCount; r++) {
         const storehouse& st = stores[r];
         if (!st.built) continue;
         float t = storehouseFlashMix * (float)st.flashFrames / storehouseFlashFrames;
-        crate.setFillColor(lerpColor(storehouseColors[r], Color::White, t));
-        crate.setPosition(storehousePos[r]);
-        window.draw(crate);
-        slat.setPosition(storehousePos[r] + Vector2f(0.0f, floor(storehouseSize.y / 2.0f) - 1.0f));
-        window.draw(slat);
+        Vector2f o = snapPx(storehousePos[r]);
+        drawParts(va, storeShadowParts, o, Color::White);
+        drawParts(va, storeBodyParts, o, lerpColor(storehouseColors[r], Color::White, t));
+        drawParts(va, storeTrimParts, o, Color::White);
     }
+    if (va.getVertexCount() > 0) window.draw(va);
 }
 
 // 7x6 stall: striped 2-row awning on two 1px posts over a 2-row counter. While a trader is Trading on a visit
@@ -5243,61 +5291,33 @@ void buildkeeps(vector<barb>& barbs, vector<RectangleShape>& squares, const stor
     }
 }
 
-// R31-F1: 14x12 slate keep: 4 merlons over a solid wall, a 1px dark plinth, a dark gate, and the race's saturated banner
+// R31-F1: 14x12 slate keep: merlons over a solid wall, a 1px dark plinth, a dark gate, and the race's saturated banner
 // on a 1px pole above the right merlon. While the race has a leader, one gold pip stands in the centre crenel.
 // Drawn just after the houses, under barbs.
 // R31-F3: sheltering barbs light pale slit windows on the wall face; the banner flies only while someone shelters.
+// R36-F1: ported to drawParts (3 notched merlons, dark arched door, ground shadow); the live marks are batched with it.
 void drawKeeps(RenderWindow& window, const vector<barb>& barbs) {
-    RectangleShape r;
+    static VertexArray va(PrimitiveType::Triangles);
+    va.clear();
     for (int k = 0; k < raceCount; k++) {
         const keep& kp = keeps[k];
         if (!kp.built) continue;
         int inside = 0;   // R31-F3: hidden barbs in this race's keep
         for (auto& b : barbs) if (barbHidden(b) && b.race == k && b.garrisonHouseId == keepGarrisonId) inside++;
         Vector2f o((float)kp.x, (float)kp.y);
-        r.setFillColor(keepStoneColor);
-        r.setSize(Vector2f(keepSize.x, keepSize.y - keepMerlonH));
-        r.setPosition(o + Vector2f(0.0f, keepMerlonH));
-        window.draw(r);
-        r.setSize(Vector2f(keepMerlonW, keepMerlonH));
-        for (float x = 0.0f; x + keepMerlonW <= keepSize.x; x += 2 * keepMerlonW) {
-            r.setPosition(o + Vector2f(x, 0.0f));
-            window.draw(r);
-        }
-        r.setFillColor(keepPlinthColor);
-        r.setSize(Vector2f(keepSize.x, 1.0f));
-        r.setPosition(o + Vector2f(0.0f, keepSize.y - 1.0f));
-        window.draw(r);
-        r.setFillColor(keepGateColor);
-        r.setSize(keepGateSize);
-        r.setPosition(o + keepGatePos);
-        window.draw(r);
-        r.setFillColor(keepPoleColor);
-        r.setSize(Vector2f(1.0f, keepPoleH));
-        r.setPosition(o + keepPolePos);
-        window.draw(r);
-        r.setFillColor(keepBannerColors[k]);
-        if (inside > 0) {   // R31-F3: full height, flying right from the pole top
-            r.setSize(keepFlagSize);
-            r.setPosition(o + keepPolePos + Vector2f(1.0f, 0.0f));
-        } else {            // R31-F3: empty keep, the banner hangs limp beside the pole
-            r.setSize(keepDroopSize);
-            r.setPosition(o + keepPolePos + keepDroopOffset);
-        }
-        window.draw(r);
-        r.setFillColor(keepPipColor);   // R31-F3: one slit window per sheltering barb, top row first
-        r.setSize(keepPipSize);
-        for (int p = 0; p < min(inside, keepSlotMax); p++) {
-            r.setPosition(o + Vector2f(keepPipCols[p % 4], keepPipRows[p / 4]));
-            window.draw(r);
-        }
-        if (raceElected[k]) {
-            r.setFillColor(keepLeaderPipColor);
-            r.setSize(Vector2f(1.0f, 1.0f));
-            r.setPosition(o + keepLeaderPipPos);
-            window.draw(r);
-        }
+        drawParts(va, keepShadowParts, o, Color::White);
+        drawParts(va, keepStoneParts, o, keepStoneColor);
+        drawParts(va, keepTrimParts, o, Color::White);
+        pushQuad(va, o + keepPolePos, Vector2f(1.0f, keepPoleH), keepPoleColor);
+        if (inside > 0)     // R31-F3: full height, flying right from the pole top
+            pushQuad(va, o + keepPolePos + Vector2f(1.0f, 0.0f), keepFlagSize, keepBannerColors[k]);
+        else                // R31-F3: empty keep, the banner hangs limp beside the pole
+            pushQuad(va, o + keepPolePos + keepDroopOffset, keepDroopSize, keepBannerColors[k]);
+        for (int p = 0; p < min(inside, keepSlotMax); p++)   // R31-F3: one slit window per sheltering barb, top row first
+            pushQuad(va, o + Vector2f(keepPipCols[p % 4], keepPipRows[p / 4]), keepPipSize, keepPipColor);
+        if (raceElected[k]) pushQuad(va, o + keepLeaderPipPos, keepLeaderPipSize, keepLeaderPipColor);
     }
+    if (va.getVertexCount() > 0) window.draw(va);
 }
 
 // R31-F2: keep centre, the campfire bearing the gate faces, and the 2x2 block top-lefts tracing slot s's arc
