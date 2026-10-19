@@ -314,7 +314,14 @@ const int pathWearClamp = trailRoadThreshold; // wear beyond road tier adds no e
 const float pathSkipDistSq = 4.0f;         // within 2px of the target barbs step straight in
 static_assert(pathBias < 1.0f, "pathBias must stay below the alignment weight");
 const Color trailPathColor(150, 125, 85, 26);
-const Color trailRoadColor(150, 125, 85, 52);
+const Color trailRoadColor(150, 125, 85, 52);   // kept as-is for the underlay of paved cells
+// R38-F1: muted tan-brown trails whose alpha follows wear (in 8-wear buckets); road a shade darker than path
+const Color trailPathTint(150, 126, 88);
+const Color trailRoadTint(136, 113, 78);
+const int trailPathAlphaMin = 40, trailPathAlphaMax = 70;    // path tier: wear trailPathThreshold..trailRoadThreshold
+const int trailRoadAlphaMin = 70, trailRoadAlphaMax = 110;   // road tier: wear trailRoadThreshold..trailMaxWear
+const int trailTierHysteresis = 8;   // a cell drops a tier only once wear falls this far below the threshold
+const int trailWearBucket = 8;       // drawTrails is rebuilt only when a cell's wear crosses one of these buckets
 
 // Cobbled roads (R20-F2): from the Hamlet era an idle barb paves road-tier trail cells near the campfire; paved cells never decay
 const int paveScanTicks = 600;             // look for a new cell to pave this often (only while nobody is paving)
@@ -2339,6 +2346,7 @@ int stepLimit(const barb& b) {
 // Worn trails: per-cell wear from barb steps, decaying over time. Tiers: 0 none, 1 path, 2 road.
 vector<int> trailWear(trailGridN * trailGridN, 0);
 vector<uint8_t> trailTier(trailGridN * trailGridN, 0);
+vector<uint8_t> trailBucket(trailGridN * trailGridN, 0);   // R38-F1: wear / trailWearBucket last seen per cell
 bool trailDirty = false;
 vector<uint8_t> trailPaved(trailGridN * trailGridN, 0);   // R20-F2: 1 = cobbled; same grid as trailWear, skipped by trailTick decay
 int pavedCount = 0;
@@ -2353,6 +2361,7 @@ bool causewayDone[raceCount] = {false, false, false};
 void resetTrails() {
     trailWear.assign(trailGridN * trailGridN, 0);
     trailTier.assign(trailGridN * trailGridN, 0);
+    trailBucket.assign(trailGridN * trailGridN, 0);
     trailPaved.assign(trailGridN * trailGridN, 0);
     pavedCount = 0;
     paveClaim = -1;
@@ -2366,9 +2375,27 @@ int trailCell(Vector2f p) {
     return cy * trailGridN + cx;
 }
 
+// R38-F1: tiers rise at the thresholds but fall only trailTierHysteresis below them, so a cell hovering at a
+// threshold no longer flickers. Every tier change goes through here (steps, decay, paving, causeway).
 void trailSetTier(int c) {
-    uint8_t t = trailWear[c] >= trailRoadThreshold ? 2 : trailWear[c] >= trailPathThreshold ? 1 : 0;
-    if (t != trailTier[c]) { trailTier[c] = t; trailDirty = true; }
+    int w = trailWear[c];
+    uint8_t cur = trailTier[c];
+    uint8_t up = w >= trailRoadThreshold ? 2 : w >= trailPathThreshold ? 1 : 0;
+    uint8_t down = w >= trailRoadThreshold - trailTierHysteresis ? 2 : w >= trailPathThreshold - trailTierHysteresis ? 1 : 0;
+    uint8_t t = max(up, min(cur, down));
+    if (t != cur) { trailTier[c] = t; trailDirty = true; }
+    uint8_t bk = (uint8_t)(w / trailWearBucket);
+    if (bk != trailBucket[c]) { trailBucket[c] = bk; if (t != 0) trailDirty = true; }
+}
+
+// R38-F1: alpha lerped from the cell's wear bucket within its tier's range
+uint8_t trailAlpha(int c) {
+    int w = trailBucket[c] * trailWearBucket;
+    bool road = trailTier[c] == 2;
+    int lo = road ? trailRoadThreshold : trailPathThreshold, hi = road ? trailMaxWear : trailRoadThreshold;
+    int aMin = road ? trailRoadAlphaMin : trailPathAlphaMin, aMax = road ? trailRoadAlphaMax : trailPathAlphaMax;
+    float f = clamp((float)(w - lo) / (float)(hi - lo), 0.0f, 1.0f);
+    return (uint8_t)(aMin + f * (aMax - aMin) + 0.5f);
 }
 
 void trailStep(Vector2f p) {
@@ -2422,13 +2449,14 @@ Vector2f pathStep(Vector2f pos, Vector2f diff) {
     return best;
 }
 
-// Rebuilds the tinted cell quads only when some cell changed tier
+// Rebuilds the tinted cell quads only when some cell changed tier or wear bucket (va reused, capacity kept)
 void drawTrails(RenderWindow& window, VertexArray& va) {
     if (trailDirty) {
         va.clear();
         for (int c = 0; c < (int)trailTier.size(); c++) {
             if (trailTier[c] == 0) continue;
-            Color col = trailTier[c] == 2 ? trailRoadColor : trailPathColor;
+            Color col = trailPaved[c] ? trailRoadColor : trailTier[c] == 2 ? trailRoadTint : trailPathTint;   // paved underlay unchanged
+            if (!trailPaved[c]) col.a = trailAlpha(c);
             float x0 = (c % trailGridN) * trailCellSize, y0 = (c / trailGridN) * trailCellSize;
             float x1 = x0 + trailCellSize, y1 = y0 + trailCellSize;
             Vector2f q[6] = {{x0, y0}, {x1, y0}, {x1, y1}, {x0, y0}, {x1, y1}, {x0, y1}};
@@ -5199,6 +5227,7 @@ void paveTick(vector<barb>& barbs, vector<RectangleShape>& squares) {
         trailPaved[c] = 1;
         trailWear[c] = max(trailWear[c], trailRoadThreshold);   // locked at road tier (keeps roadStepBonus)
         trailSetTier(c);
+        trailDirty = true;   // R38-F1: paved cells switch to the fixed road underlay
         pavedCount++;
         paveDirty = true;
         printf("---CELL PAVED--- barb %d at %d,%d (%d/%d) stone: %d\n", b.id, (int)((c % trailGridN) * trailCellSize),
@@ -5729,6 +5758,7 @@ void causewayTick() {
         trailPaved[next] = causewayPaved;
         trailWear[next] = max(trailWear[next], trailRoadThreshold);   // locked at road tier: roadStepBonus speed-up
         trailSetTier(next);
+        trailDirty = true;   // R38-F1: paved cells switch to the fixed road underlay
         paveDirty = true;
         causewayCells[r]++;
         printf("---CAUSEWAY CELL--- %s at %d,%d (%d laid) stone: %d\n", raceDefs[r].name, (int)((next % trailGridN) * trailCellSize),
