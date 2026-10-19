@@ -87,6 +87,45 @@ constexpr raceDef raceDefs[raceCount] = {
     {"Elf",   "An elf",  {2.0f, 5.0f}, {2.0f, 1.0f}, {1.0f, 1.0f}, Color(170, 196, 150), 1.0f}, // tall, pale sage pointed hat
 };
 
+// Race looks (R35-F1): fantasy silhouettes as 1px marks around the body; draw-only, batched into one VertexArray.
+// Marks sit beside/above the body (or on the face row) so the task stripe stays the dominant body tint.
+// Offsets: x from the body's left edge (or right edge when fromRight), y from bodyTop; toFeet stretches h to the feet.
+const int raceLookMaxMarks = 4;
+constexpr Color dwarfHornColor(196, 186, 156);      // muted bone, horns on the helm
+constexpr Color dwarfBeardColor(132, 92, 60);       // braided auburn beard on the face row
+constexpr Color dwarfGlintColor(222, 228, 236);     // brief steel glint above a raised tool
+const int dwarfGlintEvery = 4;                  // glint on one raised swing in this many
+constexpr Color elfEarColor(196, 158, 122);     // pointed ears, same tan as barbSkinColor
+constexpr Color elfCloakColor(96, 124, 78);         // muted leaf green cloak down the back (left side)
+constexpr Color elfCloakRainColor(66, 88, 56);      // darker, soaked while it rains
+struct lookMark {
+    float x, y, w, h;
+    bool fromRight;   // x measured from the body's right edge
+    bool toFeet;      // h is ignored; the mark runs from y to the bottom of the body
+    bool rainDarkens; // swap to the race's rain colour while raining
+    Color color;
+};
+struct raceLook {
+    int markCount;
+    lookMark marks[raceLookMaxMarks];
+    Color rainColor;
+    bool axeGlint;    // steel glint above a raised tool while working
+};
+constexpr raceLook raceLooks[raceCount] = {
+    // Human: today's look, no extra marks
+    {0, {}, Color(0, 0, 0), false},
+    // Dwarf: horned helm (horns flank the cap, clear of the crown), 1px beard on the face row, axe glint
+    {3, {{-1.0f, -2.0f, 1.0f, 1.0f, false, false, false, dwarfHornColor},
+         { 0.0f, -2.0f, 1.0f, 1.0f, true,  false, false, dwarfHornColor},
+         { 1.0f,  0.0f, 1.0f, 1.0f, false, false, false, dwarfBeardColor}},
+     Color(0, 0, 0), true},
+    // Elf: pointed ears on the head row, leaf cloak down the back below the trait dot
+    {3, {{-1.0f,  0.0f, 1.0f, 1.0f, false, false, false, elfEarColor},
+         { 0.0f,  0.0f, 1.0f, 1.0f, true,  false, false, elfEarColor},
+         {-1.0f,  2.0f, 1.0f, 0.0f, false, true,  true,  elfCloakColor}},
+     elfCloakRainColor, false},
+};
+
 // Names and traits (R25-F1): rolled once in makeBarb(). Names are unique until the table runs out.
 const char* const barbNames[] = {
     "Mika", "Tove", "Arno", "Brin", "Cora", "Dain", "Edda", "Finn", "Gala", "Hale",
@@ -2546,6 +2585,13 @@ fishPose fishPoseOf(const barb& b, const RectangleShape& sq) {
 void drawBarbs(RenderWindow& window, const vector<barb>& barbs, const vector<RectangleShape>& squares, int frame, float zoom) {
     RectangleShape body(barbBodySize), stripe(Vector2f(barbBodySize.x, barbStripeH)), tool(barbToolSize), hat, tip, dot(Vector2f(1.0f, 1.0f));
     bool showTraits = zoom >= traitDotMinZoom;
+    static VertexArray lookVerts(PrimitiveType::Triangles);   // R35-F1: every race mark this frame, one draw after the loop
+    lookVerts.clear();
+    auto addLookQuad = [](Vector2f p, Vector2f sz, Color c) {
+        Vector2f q[4] = {p, p + Vector2f(sz.x, 0.0f), p + sz, p + Vector2f(0.0f, sz.y)};
+        int idx[6] = {0, 1, 2, 0, 2, 3};
+        for (int k : idx) lookVerts.append(Vertex{q[k], c});
+    };
     for (int i = 0; i < (int)squares.size() && i < (int)barbs.size(); i++) {
         const barb& b = barbs[i];
         if (barbHidden(b)) continue;   // INBOX-F1: indoors
@@ -2615,6 +2661,14 @@ void drawBarbs(RenderWindow& window, const vector<barb>& barbs, const vector<Rec
                 window.draw(tip);
             }
         }
+        const raceLook& lk = raceLooks[clampRace(b.race)];   // R35-F1: batched, drawn after every barb
+        for (int m = 0; m < lk.markCount; m++) {
+            const lookMark& mk = lk.marks[m];
+            float mx = base.x + mk.x + (mk.fromRight ? bodySize.x : 0.0f);
+            float mh = mk.toFeet ? bodyH - mk.y : mk.h;
+            if (mh <= 0.0f) continue;   // a drooping body can be too short for the cloak
+            addLookQuad(Vector2f(mx, bodyTop + mk.y), Vector2f(mk.w, mh), (mk.rainDarkens && raining) ? lk.rainColor : mk.color);
+        }
         if (zoom >= crownMinZoom && isLeader(b)) {   // R28-F2: gold band on the very top of the head or hat (stays under the ballot pip)
             float headTop = bodyTop - rd.hatSize.y - rd.hatTipSize.y;
             stripe.setSize(crownSize);
@@ -2645,6 +2699,8 @@ void drawBarbs(RenderWindow& window, const vector<barb>& barbs, const vector<Rec
             if (b.chopping && b.target == targetNone && know.learned[techHandAxe]) tool.setFillColor(steelToolColor); // R20-F1: 1px axe head
             tool.setPosition(Vector2f(side, raised ? bodyTop - barbToolSize.y : bodyTop + 1.0f));
             window.draw(tool);
+            if (lk.axeGlint && raised && (phase / (barbToolFrames * 2)) % dwarfGlintEvery == 0)   // R35-F1: up-right of the head, clear of the horn
+                addLookQuad(Vector2f(side + 1.0f, bodyTop - barbToolSize.y - 1.0f), Vector2f(1.0f, 1.0f), dwarfGlintColor);
         } else if (b.jobKind == jobSpear && b.spearTimer > 0) {   // R20-F3: knapping flint at the fire, hand taps the stone
             bool raised = (phase / spearKnapFrames) % 2 == 0;
             tool.setFillColor(spearTipColor);
@@ -2679,6 +2735,7 @@ void drawBarbs(RenderWindow& window, const vector<barb>& barbs, const vector<Rec
             }
         }
     }
+    if (lookVerts.getVertexCount() > 0) window.draw(lookVerts);   // still inside the barb pass: under trader, trees and overlays
 }
 
 // Roofed houses: slab is drawn separately underneath. Window is dark glass here; drawHouseLights lights it at night.
