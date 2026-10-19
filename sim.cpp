@@ -679,6 +679,34 @@ const Color towerPennantColors[raceCount] = {    // muted and darker than every 
     Color(92, 80, 160),                          // dwarf: indigo
     Color(40, 120, 84),                          // elf: dark jade
 };
+// Deep Mine Shaft (R34-F1, phase 1): each race with a standing crate builds one timber-framed shaft just right of it
+// (buildOneOff, jobShaft). Miners score it like a rock; one miner at a time works it for kShaftTickMult x mineTicks and
+// hauls kShaftYield stone per trip until the finite seam (kShaftCapacity) runs dry, after which the shaft is inert.
+const int kShaftCapacity = 40;                   // stone in the seam; 0 = exhausted for good
+const int kShaftYield = 2;                       // stone per trip (a rock gives 1), clamped to what is left
+const int kShaftTickMult = 2;                    // work time = this x mineTicks(b)
+const float kShaftSearchRadius = 60.0f;          // own-race miners notice the shaft from about the quarter clearing (rocks: 25)
+const int shaftWoodCost = 8;                     // timber frame, from the race's own wood
+const int shaftBuildTicks = houseBuildTicks;
+const Vector2f shaftSize(12.0f, 12.0f);
+const Vector2f shaftCrateOffset(16.0f, -2.0f);   // shaft top-left relative to the crate: right of it, past the trader's spot
+const Vector2f shaftStandOffset(5.0f, shaftSize.y); // miner/builder hitbox top-left relative to the shaft: just below the pit
+const float shaftLintelH = 2.0f;                 // beam across the top
+const float shaftPostW = 2.0f;                   // side posts; 1px sill at the bottom
+const float shaftSeamGap = 1.0f;                 // seam bar sits this far above the lintel...
+const float shaftSeamH = 1.0f;                   // ...1px tall, shaftSize.x wide when full
+const float shaftClearPx = 3.0f;                 // houses, plots, mills and towers keep this far from the shaft zone
+const float shaftTintRadius = 8.0f;              // a chopping miner of that race this close to the stand spot tints the pit
+const float shaftTintMix = 0.3f;                 // faint: pit eases this far toward amber
+const Color shaftFrameColor(88, 66, 42);         // dark timber
+const Color shaftLintelColor(132, 102, 66);      // lighter beam, close to the spear ash
+const Color shaftPitColor(20, 16, 12);           // idle pit: near black, warm
+const Color shaftAmberColor(214, 150, 64);       // worked pit tint target
+const Color shaftDeadFrameColor(58, 50, 42);     // exhausted: greyed timber...
+const Color shaftDeadLintelColor(76, 68, 60);    // ...dimmed lintel...
+const Color shaftDeadPitColor(6, 6, 6);          // ...and a flat black pit
+const Color shaftSeamColor(150, 150, 146);       // thin grey seam bar
+const Color shaftSeamTrackColor(36, 38, 36);     // its empty track
 
 // UI red (UIO-F1/F2/F3): one muted brick red for every "starving" mark in the UI (minimap dots, inspect panel, hunger lens)
 const Color uiStarvingRed = healthBarFillColor;
@@ -944,8 +972,8 @@ const int spearKnapFrames = 8;                // crafter's knapping hand ticks u
 // Build jobs: which structure a barb's movingbspot/building belongs to. jobNone = no job, or a house (buildhouse()).
 // jobSpear is a craft, not a structure: it uses movingbspot (so no other system grabs the barb) but never building/timer.
 // jobPave (R20-F2) is run by paveTick(): movingbspot while walking, building/timer while laying the cobbles.
-enum buildJob {jobNone, jobShrine, jobSmoke, jobStall, jobForge, jobField, jobSpear, jobPave, jobStore, jobMill, jobKeep, buildJobCount};
-const int buildJobTicks[buildJobCount] = {houseBuildTicks, shrineBuildTicks, smokehouseBuildTicks, stallBuildTicks, forgeBuildTicks, fieldBuildTicks, spearCraftTicks, paveTicks, storehouseBuildTicks, millBuildTicks, keepBuildTicks};
+enum buildJob {jobNone, jobShrine, jobSmoke, jobStall, jobForge, jobField, jobSpear, jobPave, jobStore, jobMill, jobKeep, jobShaft, buildJobCount};
+const int buildJobTicks[buildJobCount] = {houseBuildTicks, shrineBuildTicks, smokehouseBuildTicks, stallBuildTicks, forgeBuildTicks, fieldBuildTicks, spearCraftTicks, paveTicks, storehouseBuildTicks, millBuildTicks, keepBuildTicks, shaftBuildTicks};
 // Game animals share the deer code (deers/deershape vectors); per-species numbers live in speciesDefs below.
 // Sprite offsets are relative to the logic shape (body = hitbox), written for an animal facing right.
 enum animalSpecies {speciesDeer, speciesRabbit, speciesCount};
@@ -1216,6 +1244,26 @@ struct forgeSpark {Vector2f pos, vel; int age = forgeSparkFrames;};
 forgeSpark forgeSparks[forgeSparkPoolMax];
 // R29-F1: one per race (index = barbRace), held in a fixed array in main; built is the validity flag haulers check
 struct storehouse {bool built = false; bool claimed = false; int stored = 0; int flashFrames = 0;}; // flashFrames: deposit flash, per drawn frame
+// R34-F1: one per race (index = barbRace), at storehousePos + shaftCrateOffset. built is the validity flag; claimed and
+// builderId follow the mill's claim path; seam counts down to 0 (never below). Reset with the quarters in placeQuarters().
+struct mineShaft {bool built = false; bool claimed = false; int builderId = -1; int seam = kShaftCapacity;};
+mineShaft mineShafts[raceCount];
+Vector2f shaftPos(int r) { return storehousePos[r] + shaftCrateOffset; }
+Vector2f shaftWorkSpot(int r) { return shaftPos(r) + shaftStandOffset; }
+bool shaftOpen(int r) { return r >= 0 && r < raceCount && mineShafts[r].built && mineShafts[r].seam > 0; }
+// Seam bar above, the frame, and the miner's stand spot below
+FloatRect shaftZone(int r) {
+    return FloatRect(shaftPos(r) - Vector2f(0.0f, shaftSeamGap + shaftSeamH), Vector2f(shaftSize.x, shaftSeamGap + shaftSeamH + shaftSize.y + keepStandRoomPx));
+}
+// False if rect comes within shaftClearPx of any race's shaft zone (reserved from the start, built or not)
+bool shaftClear(const FloatRect& rect) {
+    for (int k = 0; k < raceCount; k++) {
+        FloatRect z = shaftZone(k);
+        FloatRect zone(z.position - Vector2f(shaftClearPx, shaftClearPx), z.size + Vector2f(2 * shaftClearPx, 2 * shaftClearPx));
+        if (rect.findIntersection(zone).has_value()) return false;
+    }
+    return true;
+}
 
 // False if r comes within storehouseClearPx of any race's crate or its stand spot (reserved from the start, built or not)
 bool storehouseClear(const FloatRect& r) {
@@ -1313,7 +1361,8 @@ bool keepClear(const FloatRect& r) {
 // INBOX2-F1: and every race's smokehouse spot. R31-F1: and every race's keep spot. R33-F2: and every placed gate tower.
 bool forgeClear(const FloatRect& r) {
     FloatRect zone(forgePos - Vector2f(forgeClearPx, forgeClearPx), forgeParts[0].size + Vector2f(2 * forgeClearPx, 2 * forgeClearPx));
-    return !r.findIntersection(zone).has_value() && storehouseClear(r) && smokehouseClear(r) && keepClear(r) && towerClear(r);
+    return !r.findIntersection(zone).has_value() && storehouseClear(r) && smokehouseClear(r) && keepClear(r) && towerClear(r)
+        && shaftClear(r);   // R34-F1
 }
 
 // R30-F1: race quarters
@@ -1374,6 +1423,7 @@ void placeQuarters() {
             wallFlashSegId[k] = -1;
             for (auto& t : towers[k]) t = gatetower{};                     // R33-F2
             towerReservedStone[k] = 0;
+            mineShafts[k] = mineShaft{};                                   // R34-F1: unbuilt, full seam
         }
         wallsegs.clear();
     };
@@ -1622,6 +1672,7 @@ struct barb {
     barbTrait trait = traitSwift; // R25-F1: rolled once in makeBarb()
     bool shinobi = false;        // R25-F2: Sasuke; set once in makeBarb()
     carryLoad carryKind = carryNone; // R29-F1: load being hauled to a storehouse/the campfire; dropped with the barb, cleared by dropCarry()
+    int carryAmount = 1;         // R34-F1: units in the load (kShaftYield stone from a shaft); back to 1 whenever carryKind clears
     int health = barbMaxHealth;  // R30-F5: 0 = dies at the end of the tick (removeBarb)
     int starveTicks = 0;         // R30-F5: ticks spent hungry since the last meal; starving past starveGraceTicks
     bool garrisoned = false;     // INBOX-F1: exclusive state owned by bellTick(); every other per-tick loop skips the barb
@@ -1673,8 +1724,18 @@ int mineTicks(const barb& b) { return (int)(rockMineTicks / raceOf(b).mineSpeed 
 void dropCarry(barb& b) {
     if (b.carryKind != carryNone) printf("LOAD DROPPED - barb %d (%s)\n", b.id, carryName(b.carryKind));
     b.carryKind = carryNone;
+    b.carryAmount = 1;   // R34-F1
     if (b.target == targetDepot) b.target = targetNone;
 }
+
+// R34-F1: true if b's work target is its own race's shaft stand spot (the spot is fixed, so this holds in any shaft state)
+bool atShaftTarget(const barb& b) {
+    if (b.race < 0 || b.race >= raceCount || b.target != targetRock) return false;
+    Vector2f s = shaftWorkSpot(b.race);
+    return b.targetx == (int)s.x && b.targety == (int)s.y;
+}
+// R34-F1: work ticks for the barb's current mining job: doubled at the shaft
+int mineTicksFor(const barb& b) { return atShaftTarget(b) ? kShaftTickMult * mineTicks(b) : mineTicks(b); }
 
 struct deer {            // any game animal; species picks its row in speciesDefs
 animalSpecies species = speciesDeer;
@@ -4159,6 +4220,79 @@ void buildstorehouses(vector<barb>& barbs, vector<RectangleShape>& squares, cons
     }
 }
 
+// R34-F1: runs after buildstorehouses(). Each race with a standing crate builds one shaft at its fixed spot, through
+// buildOneOff() by a barb of that race (onlyRace), paying shaftWoodCost from its own wood. The claim follows the mill's
+// path: held only while its builder (by id, same race) still holds jobShaft. Races build independently.
+void buildshafts(vector<barb>& barbs, vector<RectangleShape>& squares, const storehouse (&stores)[raceCount]) {
+    for (int r = 0; r < raceCount; r++) {
+        mineShaft& ms = mineShafts[r];
+        if (ms.built || !stores[r].built) continue;
+        if (ms.claimed) {
+            int i = findBarbById(barbs, ms.builderId);
+            if (i < 0 || barbs[i].jobKind != jobShaft || barbs[i].race != r) {
+                printf("SHAFT CLAIM RELEASED - %s, builder %d lost\n", racePlurals[r], ms.builderId);
+                ms.claimed = false;
+                ms.builderId = -1;
+            }
+        }
+        bool done = buildOneOff(barbs, squares, ms.claimed, jobShaft, shaftWorkSpot(r), "MINE SHAFT",
+            [&](const barb& b) {
+                if (!lakeClear(shaftZone(r)) || !canAfford(stock[r], shaftWoodCost + houseWoodCost, 0)) return -1;   // a house's wood first
+                spend(stock[r], shaftWoodCost, 0);
+                ms.builderId = b.id;
+                return 1;
+            }, r);
+        if (done) {
+            ms.built = true;
+            ms.claimed = false;
+            ms.builderId = -1;
+            printf("---MINE SHAFT BUILT--- %s, seam of %d stone (%d wood)\n", racePlurals[r], ms.seam, shaftWoodCost);
+            logEvent(string(racePlurals[r]) + " sink a mine shaft");
+        }
+    }
+}
+
+// R34-F1: 12x12 timber frame (2px posts, 1px sill), dark pit, 2px lintel, and a 1px grey seam bar above on a dark
+// track. The pit eases faintly toward amber while a chopping barb of that race is within shaftTintRadius of the stand
+// spot. Exhausted: greyed frame, dimmed lintel, flat black pit, empty track. World layer, after the crates.
+void drawMineShafts(RenderWindow& window, const vector<barb>& barbs, const vector<RectangleShape>& squares) {
+    RectangleShape frame(shaftSize), pit(Vector2f(shaftSize.x - 2 * shaftPostW, shaftSize.y - shaftLintelH - 1.0f));
+    RectangleShape lintel(Vector2f(shaftSize.x, shaftLintelH)), seam(Vector2f(shaftSize.x, shaftSeamH));
+    for (int r = 0; r < raceCount; r++) {
+        const mineShaft& ms = mineShafts[r];
+        if (!ms.built) continue;
+        bool dead = ms.seam <= 0;
+        bool worked = false;
+        for (int i = 0; !dead && !worked && i < (int)barbs.size() && i < (int)squares.size(); i++) {
+            const barb& b = barbs[i];
+            if (b.race != r || !b.chopping || barbHidden(b)) continue;
+            Vector2f d = squares[i].getPosition() - shaftWorkSpot(r);
+            worked = d.x * d.x + d.y * d.y <= shaftTintRadius * shaftTintRadius;
+        }
+        Vector2f p = shaftPos(r);
+        frame.setPosition(p);
+        frame.setFillColor(dead ? shaftDeadFrameColor : shaftFrameColor);
+        window.draw(frame);
+        pit.setPosition(p + Vector2f(shaftPostW, shaftLintelH));
+        pit.setFillColor(dead ? shaftDeadPitColor : worked ? lerpColor(shaftPitColor, shaftAmberColor, shaftTintMix) : shaftPitColor);
+        window.draw(pit);
+        lintel.setPosition(p);
+        lintel.setFillColor(dead ? shaftDeadLintelColor : shaftLintelColor);
+        window.draw(lintel);
+        Vector2f sp = p - Vector2f(0.0f, shaftSeamGap + shaftSeamH);
+        seam.setSize(Vector2f(shaftSize.x, shaftSeamH));
+        seam.setPosition(sp);
+        seam.setFillColor(shaftSeamTrackColor);
+        window.draw(seam);
+        float w = round(shaftSize.x * (float)ms.seam / kShaftCapacity);
+        if (w > 0.0f) {
+            seam.setSize(Vector2f(w, shaftSeamH));
+            seam.setFillColor(shaftSeamColor);
+            window.draw(seam);
+        }
+    }
+}
+
 // R29-F1: 10x10 race-coloured crate, dark inset rim and one dark lid slat across it. The fill eases toward white
 // for a moment after each deposit. Drawn with the forge, under barbs and trees.
 // R30-F1: ground layer. Each standing crate's 1px road to its race's nearest house (prebuilt on house build), then the
@@ -5490,6 +5624,12 @@ void releaseBarbWork(barb& b, smokehouseSet& sh, forge& fg, storehouse (&stores)
                 mills[b.race].builderId = -1;
             }
             break;
+        case jobShaft:   // R34-F1: only its own race's shaft, and only if this barb holds the claim
+            if (b.race >= 0 && b.race < raceCount && !mineShafts[b.race].built && mineShafts[b.race].builderId == b.id) {
+                mineShafts[b.race].claimed = false;
+                mineShafts[b.race].builderId = -1;
+            }
+            break;
         case jobPave:  clearPave(b); break;
         case jobSpear: clearSpearCraft(b); break;
         case jobKeep:  if (b.race >= 0 && b.race < raceCount && keepBuilderId[b.race] == b.id) {   // R31-F1: refund, can requeue
@@ -6049,8 +6189,9 @@ Vector2f depotSpot(const barb& b, const storehouse (&stores)[raceCount]) {
 
 // R29-F1: a felled tree / mined rock becomes a load; the barb walks it to the depot (haulTick) before it counts.
 // FARM-F2: a reaped sheaf too (carryWheat).
-void startHaul(barb& b, carryLoad load, const storehouse (&stores)[raceCount]) {
+void startHaul(barb& b, carryLoad load, const storehouse (&stores)[raceCount], int amount = 1) {
     b.carryKind = load;   // first: the depot depends on the load (wheat -> mill)
+    b.carryAmount = max(1, amount);   // R34-F1: kShaftYield stone from a shaft
     Vector2f spot = depotSpot(b, stores);
     b.chopping = false;
     b.timer = 0;
@@ -6103,7 +6244,7 @@ void haulTick(barb& b, RectangleShape& sq, storehouse (&stores)[raceCount], cons
             campfireTitheCount = 0;
             campfireWood++;
             tithe = true;
-        } else (isWood ? rs.wood : rs.stone)++;
+        } else (isWood ? rs.wood : rs.stone) += b.carryAmount;   // R34-F1: shaft stone is a kShaftYield load
         bool forged = !isWood && forgeActive(fg, b.race);   // POL-F5b: forge stone bonus, checked at deposit
         if (forged) {
             rs.stone += forgeStoneBonus;
@@ -6111,11 +6252,12 @@ void haulTick(barb& b, RectangleShape& sq, storehouse (&stores)[raceCount], cons
         }
         storehouse* st = (b.race >= 0 && b.race < raceCount && stores[b.race].built) ? &stores[b.race] : nullptr;
         if (st) { st->stored++; st->flashFrames = storehouseFlashFrames; }
-        printf("%s DEPOSITED at %s%s%s - %s wood: %d stone: %d, campfire wood: %d\n", isWood ? "WOOD" : "STONE",
+        printf("%s x%d DEPOSITED at %s%s%s - %s wood: %d stone: %d, campfire wood: %d\n", isWood ? "WOOD" : "STONE", b.carryAmount,
                st ? "storehouse" : "campfire", tithe ? " (campfire tithe)" : "", forged ? " (+forge bonus)" : "",
                racePlurals[clampRace(b.race)], rs.wood, rs.stone, campfireWood);
     }
     b.carryKind = carryNone;
+    b.carryAmount = 1;   // R34-F1
     b.target = targetNone;
     b.moving = false;
     b.stepTimer = 0;
@@ -6139,6 +6281,9 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
         int k = fieldIndexAt(fields[o.race], o.targetx, o.targety);
         if (k >= 0) fieldTaken[o.race][k] = true;
     }
+    int shaftMiner[raceCount] = {-1, -1, -1};   // R34-F1: one miner per shaft, derived from targets every tick (no stored claim)
+    for (int j = 0; j < (int)barbs.size(); j++)
+        if (!barbs[j].garrisoned && atShaftTarget(barbs[j]) && shaftMiner[barbs[j].race] == -1) shaftMiner[barbs[j].race] = j;
     leaderNeed liveNeed[raceCount];   // R30-F2: a race's need counts only while its leader is alive (checked once per tick)
     for (int r = 0; r < raceCount; r++) liveNeed[r] = findBarbById(barbs, raceLeaderId[r]) >= 0 ? raceNeed[r] : needNone;
     for (int j = 0; j < (int)squares.size(); j++) {
@@ -6160,6 +6305,17 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
             int bestRock = findNearest(bpos, barbWorkSearchRadius, (int)rocks.size(),
                                        [&](int k) { return octs[k].getPosition() + rockWorkOffset; },
                                        [&](int k) { return rocks[k].dying || (rockClaim[k] != -1 && rockClaim[k] != j); }, &rockDSq);
+            // R34-F1: the own race's open shaft is a rock candidate, by its stand spot; it replaces a farther rock
+            bool shaftPick = false;
+            if (shaftOpen(b.race) && (shaftMiner[b.race] == -1 || shaftMiner[b.race] == j)) {
+                Vector2f d = shaftWorkSpot(b.race) - bpos;
+                float dSq = d.x * d.x + d.y * d.y;
+                if (dSq < kShaftSearchRadius * kShaftSearchRadius && (bestRock == -1 || dSq < rockDSq)) {
+                    shaftPick = true;
+                    rockDSq = dSq;
+                }
+            }
+            bool anyRock = bestRock != -1 || shaftPick;
             int bestBush = findNearest(bpos, barbWorkSearchRadius, (int)bushes.size(),
                                        [&](int k) { return bushWorkSpot(bushshapes[k]); },
                                        [&](int k) { return !bushes[k].ripe || bushes[k].picking; }, &bushDSq);
@@ -6178,16 +6334,16 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
             if (currentDecree == decreeBerries) bushW *= councilDecreeMult;
             const float notFound = numeric_limits<float>::infinity();
             float treeScore = bestTree != -1 ? treeDSq / (treeW * treeW) : notFound;
-            float rockScore = bestRock != -1 ? rockDSq / (rockW * rockW) : notFound;
+            float rockScore = anyRock ? rockDSq / (rockW * rockW) : notFound;   // R34-F1: rock or shaft
             float bushScore = bestBush != -1 ? bushDSq / (bushW * bushW) : notFound;
             // INBOX-F2b: an ordered barb takes its ordered resource whenever one is in reach (-1 beats any real score);
             // with none in reach it falls back to the normal weighted pick, so an order never strands a barb
             bool orderHit = false;
             if (b.order == needWood  && bestTree != -1) { treeScore = -1.0f; orderHit = true; }
-            if (b.order == needStone && bestRock != -1) { rockScore = -1.0f; orderHit = true; }
+            if (b.order == needStone && anyRock) { rockScore = -1.0f; orderHit = true; }
             if (b.order == needFood  && bestBush != -1) { bushScore = -1.0f; orderHit = true; }
             // a rock wins only when strictly better, as when trees were scanned first; a bush likewise
-            bestIsRock = bestRock != -1 && rockScore < treeScore;
+            bestIsRock = anyRock && rockScore < treeScore;
             bool bestIsBush = bestBush != -1 && bushScore < (bestIsRock ? rockScore : treeScore);
             int best = bestIsRock ? bestRock : bestTree;
             // ripe wheat: weighted like berries (same food decree), wins only when strictly better than everything else
@@ -6282,6 +6438,14 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
                 freshKind = memTree;   // INBOX-F2
                 freshPos = Vector2f(b.targetx, b.targety);
             }
+            if (shaftPick && !bestIsBush && bestIsRock && b.moving==false) {   // R34-F1: the shaft beat every rock in reach
+                Vector2f sp = shaftWorkSpot(b.race);
+                b.targetx = (int)sp.x;
+                b.targety = (int)sp.y;
+                b.moving = true;   // the rock branch below needs !moving
+                b.target = targetRock;
+                shaftMiner[b.race] = j;
+            }
 	    if (best != -1 && !bestIsBush && bestIsRock && b.moving==false) {
 		    Vector2f rp = octs[best].getPosition();
 		    b.targetx = (int)(rp.x + 6);
@@ -6372,6 +6536,35 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
                 memRecord(b, memBush, wp);   // INBOX-F2: picking food ends the trip on the spot
                 memEndTrip(b);
                 printf("BERRIES PICKED - %s food: %d\n", racePlurals[clampRace(b.race)], stockOf(b).food);
+            }
+            continue;
+	}
+	if (atShaftTarget(b)) {   // R34-F1: own race's shaft; checked before the rock scan (its spot is never a rock's)
+            mineShaft& ms = mineShafts[b.race];
+            if (!ms.built || ms.seam <= 0 || shaftMiner[b.race] != j) {   // dry, gone or taken: drop it and search again next tick
+                if (b.chopping || b.timer > 0) printf("SHAFT LEFT - barb %d, %s seam %d\n", b.id, racePlurals[b.race], ms.seam);
+                b.moving = b.chopping = false;
+                b.timer = 0;
+                b.targetx = b.targety = -1;
+                b.target = targetNone;
+                continue;
+            }
+            Vector2f sp = shaftWorkSpot(b.race);
+            float dx = sp.x - bpos.x, dy = sp.y - bpos.y;
+            if (dx * dx + dy * dy >= 4.0f) continue;   // still walking (barbmove)
+            b.chopping = true;
+            if (workTick(b)) b.timer++;
+            if (b.timer >= mineTicksFor(b)) {
+                int yield = min(kShaftYield, ms.seam);
+                ms.seam = max(0, ms.seam - yield);
+                practice(techPickwork);
+                if (b.race == raceDwarf) forgeEmberFrames = forgeEmberBoostFrames;   // same flare as a mined rock
+                startHaul(b, carryStone, stores, yield);
+                printf("SHAFT MINED - barb %d hauls %d stone, %s seam %d/%d\n", b.id, yield, racePlurals[b.race], ms.seam, kShaftCapacity);
+                if (ms.seam == 0) {
+                    printf("---SHAFT EXHAUSTED--- %s\n", racePlurals[b.race]);
+                    logEvent(string(racePlurals[b.race]) + "' mine shaft runs dry");
+                }
             }
             continue;
 	}
@@ -6868,6 +7061,7 @@ int main() {
                 buildstall(barbs, squares);
                 buildforge(barbs, squares, houses, dwarfForge);
                 buildstorehouses(barbs, squares, houses, stores);
+                buildshafts(barbs, squares, stores);   // R34-F1
                 buildfield(barbs, squares, houses, shrines, stores, fields);
                 buildmills(barbs, squares, fields);   // FARM-F2
                 buildkeeps(barbs, squares, stores);   // R31-F1: Town era
@@ -6971,6 +7165,7 @@ int main() {
 	drawForge(window, dwarfForge, frameCount, forgeBonusPending(barbs, dwarfForge));
 	if (forgeEmberFrames > 0 && !paused) forgeEmberFrames--;
 	drawStorehouses(window, stores);
+	drawMineShafts(window, barbs, squares);   // R34-F1: beside the crates, under barbs
 	drawGarrison(window, barbs, houses, houseshapes, stores);   // INBOX-F1: bell marker, sheltering roof tint + pips
 	for (auto& st : stores) if (st.flashFrames > 0 && !paused) st.flashFrames--;
 	for (int r = 0; r < raceCount; r++)
@@ -7008,7 +7203,10 @@ int main() {
                         (float)b.timer / fieldHarvestTicks, fieldBarColor);
             if (b.building &&  b.timer > 0)
                 drawBar(window, Vector2f(b.targetx - 9, b.targety - 10), b.timer / (float)buildJobTicks[b.jobKind], pal.barBuild);
-	    if (b.chopping && b.timer > 0 && b.target == targetRock)
+	    if (b.chopping && b.timer > 0 && atShaftTarget(b))   // R34-F1: centred over the shaft, clear of its seam bar
+                drawBar(window, shaftPos(b.race) + Vector2f(shaftSize.x / 2 - barSize.x / 2,
+                        -shaftSeamGap - shaftSeamH - 2.0f - barFramePx - barSize.y), (float)b.timer / mineTicksFor(b), pal.barMine);
+	    else if (b.chopping && b.timer > 0 && b.target == targetRock)
                 drawBar(window, Vector2f(b.targetx - 10, b.targety - 16), (float)b.timer / mineTicks(b), pal.barMine);
 	}
 	drawBirthRings(window, birthRings);
