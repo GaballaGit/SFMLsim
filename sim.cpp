@@ -285,6 +285,14 @@ const float paveRadius = 48.0f;            // cell centre within this of the cam
 const int paveTicks = 240;                 // ~4s at 1x of work on the cell (barb.timer, shows the build bar)
 const Color paveColorA(78, 84, 94, 140);   // slate cobbles: cool blue-grey, darker than rocks (125) and clear of the brown trails;
 const Color paveColorB(66, 72, 82, 140);   // the two tones differ by 12 so the 4px checker stays low-contrast
+// Stone Roads to the Keep (R33-F3): once a race's keep stands, a causeway is paved cell by cell along the grid line
+// from the keep centre out to its crate, paid from stone above keepStoneReserve. Same trailPaved grid (road speed-up).
+const int causewayIntervalTicks = ticksPerMinute;   // one cell per minute at 1x
+const int causewayStoneCost = 1;                    // per cell, only from stone above keepStoneReserve
+const uint8_t causewayPaved = 2;                    // trailPaved value for causeway cells (campfire cobbles are 1)
+const Color causewayColor(128, 126, 116, 200);      // pale dressed stone: warmer and lighter than the slate cobbles, not brown like trails
+const Color causewayJointColor(110, 108, 100, 200); // fine 1px mortar joints, only 18 darker so the bond stays subtle
+const float causewayCoursePx = 4.0f;                // 4px stone courses (3px stone + 1px joint), running bond, tiles across cells
 
 const int birdFlockSize = 8;               // birds per flock (cosmetic only, no gameplay effect)
 const float birdFleeRadius = 30.0f;        // birds scatter from barbs closer than this (world px)
@@ -2112,6 +2120,9 @@ int pavedCount = 0;
 int paveClaim = -1;      // the one cell being paved, -1 = none. Released by paveTick() whenever no barb holds jobPave
                          // (paver removed from barbs) or the paver lost movingbspot (taken off the job), and on finish/abandon.
 bool paveDirty = false;
+int causewayTimer[raceCount] = {0, 0, 0};          // R33-F3: ticks since the race's last causeway attempt
+int causewayCells[raceCount] = {0, 0, 0};          // R33-F3: cells the race has paved (not counted in pavedCount)
+bool causewayDone[raceCount] = {false, false, false};
 
 // One reset path for the whole trail grid (wear, tiers, paving); called on (re)start in main
 void resetTrails() {
@@ -2120,6 +2131,7 @@ void resetTrails() {
     trailPaved.assign(trailGridN * trailGridN, 0);
     pavedCount = 0;
     paveClaim = -1;
+    for (int r = 0; r < raceCount; r++) { causewayTimer[r] = causewayCells[r] = 0; causewayDone[r] = false; }   // R33-F3
     trailDirty = paveDirty = true;
 }
 
@@ -2211,6 +2223,18 @@ void drawPaving(RenderWindow& window, VertexArray& va) {
         for (int c = 0; c < (int)trailPaved.size(); c++) {
             if (!trailPaved[c]) continue;
             float cx = (c % trailGridN) * trailCellSize, cy = (c / trailGridN) * trailCellSize;
+            if (trailPaved[c] == causewayPaved) {   // R33-F3: pale stone, 1px bed joints every course, head joints offset per course
+                pushQuad(va, Vector2f(cx, cy), Vector2f(trailCellSize, trailCellSize), causewayColor);
+                int courses = (int)(trailCellSize / causewayCoursePx);
+                for (int k = 0; k < courses; k++) {
+                    float y = cy + k * causewayCoursePx;
+                    pushQuad(va, Vector2f(cx, y + causewayCoursePx - 1.0f), Vector2f(trailCellSize, 1.0f), causewayJointColor);
+                    float shift = (k % 2 == 0) ? causewayCoursePx - 1.0f : causewayCoursePx / 2.0f - 1.0f;
+                    for (float x = shift; x < trailCellSize; x += causewayCoursePx)
+                        pushQuad(va, Vector2f(cx + x, y), Vector2f(1.0f, causewayCoursePx - 1.0f), causewayJointColor);
+                }
+                continue;
+            }
             for (int q = 0; q < 4; q++) {
                 int qx = q % 2, qy = q / 2;
                 Color col = (qx + qy) % 2 == 0 ? paveColorA : paveColorB;
@@ -5153,6 +5177,80 @@ void drawWalls(RenderWindow& window, VertexArray& va) {
     if (va.getVertexCount() > 0) window.draw(va);
 }
 
+// R33-F3: Bresenham over the trail grid from the keep centre's cell out to the crate centre's cell. Every cell appears
+// once (consecutive repeats dropped), ordered keep-first, so the causeway grows outward from the keep.
+void causewayLine(int r, vector<int>& out) {
+    out.clear();
+    Vector2f a = wallCentre(r), b = quarterCentre(r);
+    int x0 = (int)(a.x / trailCellSize), y0 = (int)(a.y / trailCellSize);
+    int x1 = (int)(b.x / trailCellSize), y1 = (int)(b.y / trailCellSize);
+    int dx = abs(x1 - x0), dy = -abs(y1 - y0), sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1, err = dx + dy;
+    while (true) {
+        if (x0 >= 0 && y0 >= 0 && x0 < trailGridN && y0 < trailGridN) {
+            int c = y0 * trailGridN + x0;
+            if (out.empty() || out.back() != c) out.push_back(c);
+        }
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+}
+
+// R33-F3: a causeway cell must show (not entirely under the keep or crate), be dry, and stay off every wall and gate slot
+// of the race's ring (all wallSlots, built or not, so the gate gap is never paved)
+bool causewayCellOk(int r, int c, vector<Vector2f>& blocks) {
+    FloatRect cr(Vector2f((c % trailGridN) * trailCellSize, (c / trailGridN) * trailCellSize), Vector2f(trailCellSize, trailCellSize));
+    auto covers = [&](FloatRect o) {
+        return o.position.x <= cr.position.x && o.position.y <= cr.position.y
+            && o.position.x + o.size.x >= cr.position.x + cr.size.x && o.position.y + o.size.y >= cr.position.y + cr.size.y;
+    };
+    if (covers(FloatRect(Vector2f((float)keeps[r].x, (float)keeps[r].y), keepSize))) return false;
+    if (covers(FloatRect(storehousePos[r], storehouseSize))) return false;
+    if (!lakeClear(cr)) return false;
+    for (int s = 0; s < wallSlots; s++) {
+        wallArcBlocks(r, s, blocks);
+        for (auto& bp : blocks)
+            if (cr.findIntersection(FloatRect(bp, Vector2f(wallThickPx, wallThickPx))).has_value()) return false;
+    }
+    return true;
+}
+
+// R33-F3: once per tick. For each race with a built keep, every causewayIntervalTicks paves the first unpaved valid cell
+// on the keep -> crate line. Stone goes through the keep's reserve rule: canAfford(cost + keepStoneReserve), then spend().
+// Short of stone it waits for the next interval; with no cell left it logs completion once and stops.
+void causewayTick() {
+    static vector<int> line;
+    static vector<Vector2f> blocks;
+    for (int r = 0; r < raceCount; r++) {
+        if (!keeps[r].built || causewayDone[r]) continue;
+        if (++causewayTimer[r] < causewayIntervalTicks) continue;
+        causewayTimer[r] = 0;
+        causewayLine(r, line);
+        int next = -1;
+        for (int c : line) {
+            if (trailPaved[c] || !causewayCellOk(r, c, blocks)) continue;
+            next = c;
+            break;
+        }
+        if (next < 0) {
+            causewayDone[r] = true;
+            printf("---CAUSEWAY DONE--- %s, %d cells\n", raceDefs[r].name, causewayCells[r]);
+            if (causewayCells[r] > 0) logRaceEvent(string(racePlurals[r]) + " finish a stone road to their keep", r);
+            continue;
+        }
+        if (!canAfford(stock[r], 0, causewayStoneCost + keepStoneReserve)) continue;
+        spend(stock[r], 0, causewayStoneCost);
+        trailPaved[next] = causewayPaved;
+        trailWear[next] = max(trailWear[next], trailRoadThreshold);   // locked at road tier: roadStepBonus speed-up
+        trailSetTier(next);
+        paveDirty = true;
+        causewayCells[r]++;
+        printf("---CAUSEWAY CELL--- %s at %d,%d (%d laid) stone: %d\n", raceDefs[r].name, (int)((next % trailGridN) * trailCellSize),
+               (int)((next / trailGridN) * trailCellSize), causewayCells[r], stock[r].stone);
+    }
+}
+
 // INBOX-F1: the release half of removeBarb(), shared with bellTick() so a barb taking shelter frees exactly what a dead one does
 void releaseBarbWork(barb& b, smokehouseSet& sh, forge& fg, storehouse (&stores)[raceCount], fieldGrid& fields) {
     if (b.deertargeting) clearHunt(b);
@@ -6555,6 +6653,7 @@ int main() {
                 buildmills(barbs, squares, fields);   // FARM-F2
                 buildkeeps(barbs, squares, stores);   // R31-F1: Town era
                 wallTick(barbs, trees, tris, stumps, octs, bushshapes, houseshapes, shrines, fields);   // R31-F2: cosmetic curtain walls
+                causewayTick();   // R33-F3: keep -> crate stone road
                 craftspear(barbs, squares, dwarfForge);
                 minematerials(squares, barbs, tris, stumps, trees, octs, rocks, bushes, bushshapes, catchRings, fields, stores, dwarfForge);
                 barbmove(squares, barbs);
