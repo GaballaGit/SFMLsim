@@ -1023,6 +1023,14 @@ constexpr uint8_t millPuffAlpha = 110;        // faint at the start, fading to 0
 constexpr Vector2f fieldSlotOffsets[fieldsPerRace] = {{0.0f, 0.0f}, {19.0f, -11.0f}, {19.0f, 12.0f}};
 constexpr float millDoorLanePx = 12.0f;       // kept free below the mill stand spot: the haulers' approach to the door
 constexpr int fieldStaggerStages = 1;         // a replanted plot lies fallow until it is this many stages off its siblings
+// R37-F1: a blocked mill slot is retried every fieldSlotRetryTicks; after fieldSlotMaxFails failed checks (or if the slot
+// was unavailable when plot 0 was placed) the plot re-sites on a fallback ring around the mill's sail hub. The ring's
+// inner edge clears the mill zone (sail sweep + clear px, ~10 from the hub) plus half a plot zone (~8); the outer edge
+// stays about one plot farther out than the regular slots (~18-21 from the hub), so the farmstead still reads as one.
+constexpr int fieldSlotRetryTicks = 600;      // ~10s at 1x between checks of a blocked slot / fallback attempts
+constexpr int fieldSlotMaxFails = 3;          // failed slot checks before the plot gives up its slot and re-sites
+constexpr float fieldFallbackMinRadius = 18.0f; // plot centre -> mill hub
+constexpr float fieldFallbackMaxRadius = 32.0f;
 
 // Know-how discoveries (R20-F1): practice counters unlock one-off speedups
 const int treeChopTicks = 180;                // base work ticks to fell one tree
@@ -1581,6 +1589,10 @@ struct plot {
     bool reserved = false;  // R32-F1: plot k > 0 only: slot beside the mill held since plot 0 was placed (until placed)
     bool slotLogged = false; // R32-F1: "slot blocked" printed once
     Vector2f slotPos;       // R32-F1: that slot's soil top-left
+    bool fallback = false;  // R37-F1: k > 0, slot given up (blocked too often or unavailable): re-sites on the mill's ring
+    int retryTicks = 0;     // R37-F1: >0 = ticks until the next slot check / fallback attempt (counted down in buildfield)
+    int slotFails = 0;      // R37-F1: failed checks of the reserved slot
+    int stallMask = 0;      // R37-F1: stall gates already logged for this plot (bit per gate), so each prints once
 };
 using fieldGrid = plot[raceCount][fieldsPerRace];
 
@@ -1615,8 +1627,11 @@ FloatRect fieldZone(Vector2f pos) {
 }
 
 // R32-F1: soil top-left of the zone a plot holds: its spot once placed, else its reserved mill slot. False if neither.
+// R37-F1: a fallback plot holds no zone until its ring spot is chosen (then placed, so houses/trees avoid it from there);
+// its given-up slot is released, never held, so it can't block its own re-siting or other buildings.
 bool plotHeldAt(const plot& fp, Vector2f& pos) {
     if (fp.placed) { pos = fp.rect.position; return true; }
+    if (fp.fallback) return false;
     if (fp.reserved) { pos = fp.slotPos; return true; }
     return false;
 }
@@ -3130,6 +3145,7 @@ optional<hoverHit> pickHover(Vector2f p, float radius, const vector<barb>& barbs
         if (fp.built) return fp.fallow > 0 ? string("fallow") : fieldRipe(fp) ? string("ripe")
                                            : to_string(fp.growth * 100 / wheatGrowTicks()) + "% grown";
         if (fp.claimed) return string("being sown");
+        if (k > 0 && !fp.placed && fp.fallback) return string("re-siting");   // R37-F1: slot given up, ring spot pending
         if (k > 0 && mills[r].placed && !fp.placed && !fp.reserved) return string("no room");
         return "unsown (needs " + to_string(fieldMinHouses * k + 1) + (fieldMinHouses * k + 1 == 1 ? " home)" : " homes)");
     };
@@ -4492,6 +4508,7 @@ bool zoneOffRoads(const FloatRect& zone) {
 void setPlotSpot(plot& fp, int r, Vector2f pos) {
     fp.placed = true;
     fp.reserved = false;   // the placed spot holds the zone from now on
+    fp.fallback = false;   // R37-F1: re-sited (or never needed to)
     fp.rect = FloatRect(pos, fieldSize);
     fp.shape.setSize(fieldSize);
     fp.shape.setPosition(pos);
@@ -4524,28 +4541,53 @@ bool placeField(fieldGrid& fields, int r, int kPlot, const vector<barb>& barbs, 
             if (ok && zone.findIntersection(FloatRect(Vector2f((float)s.x, (float)s.y - shrineCapH), shrineSlabSize + Vector2f(0.0f, shrineCapH)))) ok = false;
         return ok;
     };
-    if (kPlot > 0) {   // R32-F1: only the slot reserved beside the mill, never the random ring
-        if (!fp.reserved) return false;
-        fp.reserved = false;   // own reservation off while checking, so fieldsClear() doesn't see it
-        FloatRect zone = fieldZone(fp.slotPos);
-        if (!zoneOk(zone) || !zoneOffRoads(zone)) {
-            fp.reserved = true;
-            if (!fp.slotLogged) printf("FIELD SLOT BLOCKED - %s plot %d at %d,%d, waiting\n", racePlurals[r], kPlot + 1,
-                                       (int)fp.slotPos.x, (int)fp.slotPos.y);
+    // R37-F1: zone keeps off plot 0's zone, the mill zone and the mill's door lane (shared by slotOk and the fallback ring)
+    auto farmsteadOk = [&](const FloatRect& zone, Vector2f plot0Pos, Vector2f millPos) {
+        return !zone.findIntersection(fieldZone(plot0Pos)) && !zone.findIntersection(millZone(millPos))
+            && !zone.findIntersection(millDoorLane(millPos));
+    };
+    if (kPlot > 0) {   // R32-F1: the slot reserved beside the mill; R37-F1: or, once given up, the fallback ring
+        if (fp.reserved && !fp.fallback) {
+            fp.reserved = false;   // own reservation off while checking, so fieldsClear() doesn't see it
+            FloatRect zone = fieldZone(fp.slotPos);
+            if (zoneOk(zone) && zoneOffRoads(zone)) {
+                setPlotSpot(fp, r, fp.slotPos);
+                printf("FIELD SPOT chosen for the %s at %d,%d (mill slot %d)\n", racePlurals[r], (int)fp.slotPos.x, (int)fp.slotPos.y, kPlot);
+                return true;
+            }
+            fp.reserved = true;    // restored on every failed check
+            fp.slotFails++;
+            if (!fp.slotLogged) printf("FIELD SLOT BLOCKED - %s plot %d at %d,%d, retrying every %d ticks\n", racePlurals[r],
+                                       kPlot + 1, (int)fp.slotPos.x, (int)fp.slotPos.y, fieldSlotRetryTicks);
             fp.slotLogged = true;
-            return false;
+            if (fp.slotFails < fieldSlotMaxFails) { fp.retryTicks = fieldSlotRetryTicks; return false; }
+            fp.reserved = false;   // given up: the slot is released and the plot re-sites on the ring below
+            fp.fallback = true;
+            printf("FIELD SLOT GIVEN UP - %s plot %d after %d blocked checks, re-siting near the mill\n", racePlurals[r],
+                   kPlot + 1, fp.slotFails);
         }
-        setPlotSpot(fp, r, fp.slotPos);
-        printf("FIELD SPOT chosen for the %s at %d,%d (mill slot %d)\n", racePlurals[r], (int)fp.slotPos.x, (int)fp.slotPos.y, kPlot);
-        return true;
+        const plot& p0 = fields[r][0];
+        if (!fp.fallback || !mills[r].placed || !p0.placed) return false;
+        Vector2f hub = mills[r].pos + millHubOffset;
+        uniform_real_distribution<float> frad(fieldFallbackMinRadius, fieldFallbackMaxRadius);
+        for (int t = 0; t < fieldPlaceTries; t++) {
+            float a = ang(gen), d = frad(gen);
+            Vector2f pos(round(hub.x + cos(a) * d - fieldSize.x / 2), round(hub.y + sin(a) * d - fieldSize.y / 2));
+            FloatRect zone = fieldZone(pos);   // zoneOk: clearing, forge, lakes, fieldsClear (other plots, mills), roads
+            if (!zoneOk(zone) || !zoneOffRoads(zone) || !farmsteadOk(zone, p0.rect.position, mills[r].pos)) continue;
+            setPlotSpot(fp, r, pos);
+            printf("FIELD SPOT chosen for the %s at %d,%d (fallback ring, %d px from the mill hub)\n", racePlurals[r],
+                   (int)pos.x, (int)pos.y, (int)d);
+            return true;
+        }
+        fp.retryTicks = fieldSlotRetryTicks;   // no ring spot yet: try again later, not every tick
+        return false;
     }
     // R32-F1: slot k beside a mill at millPos (plot 0 at pos) is usable if it passes zoneOk, avoids the roads, plot 0's
     // zone, the mill zone, the door lane and the slots before it
     auto slotOk = [&](Vector2f pos, Vector2f millPos, int side, int k) {
         FloatRect zone = fieldZone(fieldSlotPos(millPos, side, k));
-        if (!zoneOk(zone) || !zoneOffRoads(zone)) return false;
-        if (zone.findIntersection(fieldZone(pos)) || zone.findIntersection(millZone(millPos))
-            || zone.findIntersection(millDoorLane(millPos))) return false;
+        if (!zoneOk(zone) || !zoneOffRoads(zone) || !farmsteadOk(zone, pos, millPos)) return false;
         for (int j = 1; j < k; j++)
             if (zone.findIntersection(fieldZone(fieldSlotPos(millPos, side, j)))) return false;
         return true;
@@ -4574,8 +4616,11 @@ bool placeField(fieldGrid& fields, int r, int kPlot, const vector<barb>& barbs, 
                (int)mills[r].pos.x, (int)mills[r].pos.y, bestSide > 0 ? "right" : "left");
         for (int j = 1; j < fieldsPerRace; j++) {   // reserve the extra plots' slots now, with plot 0 and the mill
             plot& sp = fields[r][j];
-            if (sp.placed || !slotOk(pos, mills[r].pos, bestSide, j)) {
-                printf("FIELD SLOT %d unavailable for the %s: that plot will not be sown\n", j, racePlurals[r]);
+            if (sp.placed) continue;
+            if (!slotOk(pos, mills[r].pos, bestSide, j)) {   // R37-F1: re-sites on the mill's ring instead of never sowing
+                sp.reserved = false;
+                sp.fallback = true;
+                printf("FIELD SLOT %d unavailable for the %s: that plot will re-site near the mill\n", j, racePlurals[r]);
                 continue;
             }
             sp.slotPos = fieldSlotPos(mills[r].pos, bestSide, j);
@@ -4600,6 +4645,7 @@ void buildfield(vector<barb>& barbs, vector<RectangleShape>& squares, const vect
     for (int r = 0; r < raceCount; r++)
         for (int k = 0; k < fieldsPerRace; k++) {
             plot& fp = fields[r][k];
+            if (fp.retryTicks > 0) fp.retryTicks--;   // R37-F1: per-plot countdown to the next slot / fallback attempt
             if (fp.built || !fp.claimed) continue;
             int i = findBarbById(barbs, fp.sowerId);
             if (i < 0 || barbs[i].jobKind != jobField || barbs[i].race != r) {   // per race: no other barb keeps this claim
@@ -4617,9 +4663,23 @@ void buildfield(vector<barb>& barbs, vector<RectangleShape>& squares, const vect
             if (fp.built || (activeRace >= 0 && (r != activeRace || k != activeK))) continue;
             int needHouses = fieldMinHouses * k + 1;   // R32-F1: one more home per extra plot
             if (!fp.placed) {
-                if (!stores[r].built || raceHouses[r] < needHouses || !canAfford(stock[r], fieldWoodCost, 0)) continue;
-                if (k > 0 && !mills[r].placed) continue;   // R32-F1: extra plots sit in slots beside the mill
-                if (!placeField(fields, r, k, barbs, houses, shrines, k == 0 && !mills[r].placed)) continue;
+                // R37-F1: the first gate holding the plot back; the slot gate also covers the wait between retries
+                int gate = !stores[r].built ? 1 : raceHouses[r] < needHouses ? 2 : !canAfford(stock[r], fieldWoodCost, 0) ? 4
+                         : (k > 0 && !mills[r].placed) ? 8 : 0;   // R32-F1: extra plots sit beside the mill
+                if (gate == 0 && (fp.retryTicks > 0 || !placeField(fields, r, k, barbs, houses, shrines, k == 0 && !mills[r].placed)))
+                    gate = 8;
+                if (gate) {
+                    // logged once per plot and gate; extra plots only, once plot 0 is sown (plot 0's start-up waits are normal)
+                    if (k > 0 && fields[r][0].built && !(fp.stallMask & gate)) {
+                        fp.stallMask |= gate;
+                        const char* why = gate == 1 ? "store" : gate == 2 ? "houses" : gate == 4 ? "wood" : "slot";
+                        printf("FIELD STALLED - %s plot %d waits on %s (houses %d/%d, wood %d/%d, store %s, slot %s)\n",
+                               racePlurals[r], k + 1, why, raceHouses[r], needHouses, stock[r].wood, fieldWoodCost,
+                               stores[r].built ? "built" : "none",
+                               fp.fallback ? "re-siting" : fp.reserved ? "reserved" : "none");
+                    }
+                    continue;
+                }
             }
             bool done = buildOneOff(barbs, squares, fp.claimed, jobField, fieldWorkSpot(fp), "FIELD",
                 [&](const barb& b) {
