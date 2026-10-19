@@ -655,6 +655,30 @@ const Color wallRainColor(50, 56, 58);           // wet stone while raining (glo
 const Color wallFlashColor(118, 122, 114);       // the newest segment starts toward this...
 const float wallFlashStrength = 0.35f;           // ...by this much, fading linearly to nothing
 const int wallFlashTicks = 40;                   // ~0.7 s at 1x, timed from the race's last placement tick
+// Gatehouse Towers (R33-F2): when a race's curtain wall completes, two 12x16 stone towers are placed on the ring at the
+// gate-gap slots either side of the gate slot (slot 0), leaving slot 0 open as the passage. Each is raised in turn by a
+// barb of that race through the keep's builder path (jobKeep, keepQueued/keepBuilderId, keep labour), paying stone only
+// from above keepStoneReserve, so houses and trade keep first call. A blocked spot is dropped for good.
+const int towerCount = 2;
+const int towerStoneCost = shrineStoneCost / 2;  // per tower: 10 stone for the pair, half a keep
+const Vector2f towerSize(12.0f, 16.0f);
+const float towerMerlonH = 2.0f;                 // top 2 rows: 4 merlons with 3 2px notches
+const float towerMerlonX[4] = {0.0f, 4.0f, 7.0f, 10.0f};
+const float towerMerlonW[4] = {2.0f, 1.0f, 1.0f, 2.0f};   // solid 2px corners, 1px inner merlons: 2+2+1+2+1+2+2 = 12
+const Vector2f towerSlitPos(5.0f, 6.0f);         // dark 2x3 arrow slit, centred on the 12px face
+const Vector2f towerSlitSize(2.0f, 3.0f);
+const float towerArcNudgePx = 3.0f;              // tower centre sits this far (arc px) past its slot centre, away from the
+                                                 // gate: keeps any rotation of the 12x16 box off slot 0's arc
+const float towerPoleH = 3.0f;                   // pennant pole rises this far above the right corner merlon
+const Vector2f towerPolePos(towerSize.x - 1.0f, -towerPoleH);
+const Vector2f towerFlagSize(2.0f, 1.0f);        // tiny, flies right from the pole top
+const Vector2f towerStandOffset(5.0f, towerSize.y); // builder hitbox top-left relative to the tower: just below it
+const Color towerPlinthColor(40, 44, 44);        // 1px darker ground row, same family as the wall stone
+const Color towerPennantColors[raceCount] = {    // muted and darker than every barb task colour and the keep banners
+    Color(168, 58, 52),                          // human: brick red
+    Color(92, 80, 160),                          // dwarf: indigo
+    Color(40, 120, 84),                          // elf: dark jade
+};
 
 // UI red (UIO-F1/F2/F3): one muted brick red for every "starving" mark in the UI (minimap dots, inspect panel, hunger lens)
 const Color uiStarvingRed = healthBarFillColor;
@@ -1242,6 +1266,32 @@ int wallTimer[raceCount] = {0, 0, 0};
 int wallFlashTick[raceCount] = {-wallFlashTicks, -wallFlashTicks, -wallFlashTicks};  // wallClock of the last placement
 int wallFlashSegId[raceCount] = {-1, -1, -1};
 
+// R33-F2: one gatehouse tower; x,y = top-left (world px). race >= 0 once placed at wall completion; id from nextTowerId
+// when it stands. towerReservedStone[r] is set on claim (with keepQueued[r], keepBuilderId[r] and jobKeep, reused from
+// the keep, which is already built by then) and cleared on completion or cancelTower().
+struct gatetower {int id = -1; int race = -1; int x = 0, y = 0; bool built = false;};
+gatetower towers[raceCount][towerCount];
+int nextTowerId = 0;
+int towerReservedStone[raceCount] = {0, 0, 0};
+
+// R33-F2: tower footprint: pennant above, the silhouette, and its builder's stand spot below
+FloatRect towerZone(const gatetower& t) {
+    return FloatRect(Vector2f((float)t.x, (float)t.y - towerPoleH),
+                     Vector2f(towerSize.x + towerFlagSize.x, towerPoleH + towerSize.y + keepStandRoomPx));
+}
+
+// R33-F2: false if r comes within keepClearPx of any placed tower's zone (reserved from placement, built or not)
+bool towerClear(const FloatRect& r) {
+    for (int k = 0; k < raceCount; k++)
+        for (auto& t : towers[k]) {
+            if (t.race < 0) continue;
+            FloatRect z = towerZone(t);
+            FloatRect zone(z.position - Vector2f(keepClearPx, keepClearPx), z.size + Vector2f(2 * keepClearPx, 2 * keepClearPx));
+            if (r.findIntersection(zone).has_value()) return false;
+        }
+    return true;
+}
+
 // R31-F1: race k's keep footprint: banner pole/flag above, the silhouette, and its builder's stand spot below
 FloatRect keepZone(int k) {
     return FloatRect(Vector2f((float)keeps[k].x, (float)keeps[k].y - keepPoleH),
@@ -1260,10 +1310,10 @@ bool keepClear(const FloatRect& r) {
 
 // False if r comes within forgeClearPx of the forge footprint (reserved from the start, built or not).
 // R29-F1: also keeps the storehouse spots clear, so every placement that avoids the forge avoids them too.
-// INBOX2-F1: and every race's smokehouse spot. R31-F1: and every race's keep spot.
+// INBOX2-F1: and every race's smokehouse spot. R31-F1: and every race's keep spot. R33-F2: and every placed gate tower.
 bool forgeClear(const FloatRect& r) {
     FloatRect zone(forgePos - Vector2f(forgeClearPx, forgeClearPx), forgeParts[0].size + Vector2f(2 * forgeClearPx, 2 * forgeClearPx));
-    return !r.findIntersection(zone).has_value() && storehouseClear(r) && smokehouseClear(r) && keepClear(r);
+    return !r.findIntersection(zone).has_value() && storehouseClear(r) && smokehouseClear(r) && keepClear(r) && towerClear(r);
 }
 
 // R30-F1: race quarters
@@ -1322,6 +1372,8 @@ void placeQuarters() {
             wallNextOrder[k] = wallTimer[k] = 0;                           // R31-F2
             wallFlashTick[k] = -wallFlashTicks;
             wallFlashSegId[k] = -1;
+            for (auto& t : towers[k]) t = gatetower{};                     // R33-F2
+            towerReservedStone[k] = 0;
         }
         wallsegs.clear();
     };
@@ -5076,6 +5128,83 @@ void wallArcBlocks(int r, int s, vector<Vector2f>& out) {
 // R31-F2: rise order: slots beside the gate first, alternating sides, ending opposite the gate
 int wallOrderSlot(int i) { return i % 2 == 0 ? wallGateSlots / 2 + 1 + i / 2 : wallSlots - wallGateSlots / 2 - 1 - i / 2; }
 
+// R33-F2: called once, when race r's curtain wall completes. Places one tower on each side of the gate slot (slot 0),
+// centred on the ring at the neighbouring gate-gap slots (1 and wallSlots-1), nudged away from the gate. A spot is
+// dropped for good if its zone is off the map, in another quarter or the village clearing, on the forge/crates/huts/
+// keeps (forgeClear), water (lakeClear), plots/mills, the stall, a house, shrine, rock or bush, a paved cell, or on the
+// gate slot's arc (the passage stays open and unpaved). Trees in an accepted zone are felled once.
+void placeTowers(int r, vector<barb>& barbs, vector<tree>& trees, vector<CircleShape>& tris, vector<RectangleShape>& stumps,
+                 const vector<CircleShape>& octs, const vector<CircleShape>& bushshapes, const vector<RectangleShape>& houseshapes,
+                 const vector<shrine>& shrines, const fieldGrid& fields) {
+    static vector<Vector2f> gateBlocks;
+    wallArcBlocks(r, 0, gateBlocks);
+    Vector2f kc = wallCentre(r);
+    float gate = atan2(villageCenter.y - kc.y, villageCenter.x - kc.x);
+    for (int k = 0; k < towerCount; k++) {
+        float side = k == 0 ? -1.0f : 1.0f;
+        float a = gate + side * (6.2831853f / wallSlots + towerArcNudgePx / wallRingRadius);
+        Vector2f c = kc + Vector2f(cos(a), sin(a)) * wallRingRadius;
+        gatetower t;
+        Vector2f tl = snapPx(c - towerSize / 2.0f);
+        t.x = (int)tl.x;
+        t.y = (int)tl.y;
+        FloatRect z = towerZone(t);
+        bool ok = z.position.x >= 0.0f && z.position.y >= hudBarHeight
+               && z.position.x + z.size.x <= worldSize && z.position.y + z.size.y <= worldSize;
+        Vector2f corners[4] = {z.position, z.position + Vector2f(z.size.x, 0.0f), z.position + Vector2f(0.0f, z.size.y), z.position + z.size};
+        for (auto& p : corners) {
+            for (int q = 0; ok && q < raceCount; q++) {   // never into another race's quarter
+                Vector2f d = p - quarterCentre(q);
+                if (q != r && d.x * d.x + d.y * d.y < quarterClearRadius * quarterClearRadius) ok = false;
+            }
+            Vector2f dv = p - villageCenter;
+            if (ok && dv.x * dv.x + dv.y * dv.y < clearRadiusSq) ok = false;
+        }
+        if (ok && (!forgeClear(z) || !lakeClear(z) || !fieldsClear(fields, z))) ok = false;
+        if (ok && z.findIntersection(FloatRect(stallPos, stallSize)).has_value()) ok = false;
+        for (int i = 0; ok && i < (int)houseshapes.size(); i++) {
+            Vector2f hc = houseshapes[i].getPosition() + houseshapes[i].getSize() / 2.0f;
+            if (z.findIntersection(FloatRect(hc - houseSlabSize / 2.0f, houseSlabSize)).has_value()) ok = false;
+        }
+        for (int i = 0; ok && i < (int)shrines.size(); i++)
+            if (z.findIntersection(FloatRect(Vector2f((float)shrines[i].x, (float)shrines[i].y - shrineCapH),
+                                             shrineSlabSize + Vector2f(0.0f, shrineCapH))).has_value()) ok = false;
+        for (int i = 0; ok && i < (int)octs.size(); i++)
+            if (z.findIntersection(octs[i].getGlobalBounds()).has_value()) ok = false;
+        for (int i = 0; ok && i < (int)bushshapes.size(); i++)
+            if (z.findIntersection(bushshapes[i].getGlobalBounds()).has_value()) ok = false;
+        if (ok) {   // any paved cell under the zone (it is inside the map here)
+            int cx0 = (int)(z.position.x / trailCellSize), cx1 = (int)((z.position.x + z.size.x - 0.01f) / trailCellSize);
+            int cy0 = (int)(z.position.y / trailCellSize), cy1 = (int)((z.position.y + z.size.y - 0.01f) / trailCellSize);
+            for (int cy = cy0; cy <= cy1; cy++)
+                for (int cx = cx0; cx <= cx1; cx++)
+                    if (cx >= 0 && cy >= 0 && cx < trailGridN && cy < trailGridN && trailPaved[cy * trailGridN + cx]) ok = false;
+        }
+        for (auto& bp : gateBlocks)
+            if (ok && z.findIntersection(FloatRect(bp, Vector2f(wallThickPx, wallThickPx))).has_value()) ok = false;
+        if (!ok) {
+            printf("Gate tower %d skipped - %s (blocked)\n", k, raceDefs[r].name);
+            continue;
+        }
+        for (int i = (int)tris.size() - 1; i >= 0; i--) {   // fell trees in the zone, once
+            if (!tris[i].getGlobalBounds().findIntersection(z).has_value()) continue;
+            Vector2f p = tris[i].getPosition();
+            int tix = (int)(p.x + 8), tiy = (int)(p.y + 15);   // same stand spot the clearing pass in main drops
+            for (auto& b : barbs) {
+                if (!b.garrisoned && b.target != targetBush && b.targetx == tix && b.targety == tiy) {
+                    b.moving = b.chopping = false;
+                    b.timer  = 0;
+                    b.targetx = b.targety = -1;
+                }
+            }
+            swapRemove(tris, i); swapRemove(stumps, i); swapRemove(trees, i);
+        }
+        t.race = r;
+        towers[r][k] = t;
+        printf("---GATE TOWER PLACED--- %s, tower %d at %d,%d\n", raceDefs[r].name, k, t.x, t.y);
+    }
+}
+
 // R31-F2: once per tick. For each race with a built keep, every wallRiseTicks tries the next slots in rise order until
 // one fits (blocked slots are skipped for good). All overlap checks and the one-off tree felling happen only here, at
 // placement; nothing scans per tick. Cosmetic: segments never block movement or placement.
@@ -5155,6 +5284,7 @@ void wallTick(vector<barb>& barbs, vector<tree>& trees, vector<CircleShape>& tri
             for (auto& w : wallsegs) if (w.race == r) built++;
             printf("---CURTAIN WALL DONE--- %s, %d of %d segments\n", raceDefs[r].name, built, wallSegMax);
             if (built > 0) logRaceEvent(string(racePlurals[r]) + " finish a curtain wall", r);
+            if (built > 0) placeTowers(r, barbs, trees, tris, stumps, octs, bushshapes, houseshapes, shrines, fields);   // R33-F2
         }
     }
 }
@@ -5175,6 +5305,90 @@ void drawWalls(RenderWindow& window, VertexArray& va) {
         for (auto& bp : blocks) pushQuad(va, bp, Vector2f(wallThickPx, wallThickPx), col);
     }
     if (va.getVertexCount() > 0) window.draw(va);
+}
+
+// R33-F2: the one undo for a claimed gate tower: refunds the reserved stone and frees the keep's builder guard
+// (keepQueued/keepBuilderId, unused once the keep stands) so the next tower can be claimed. No-op if nothing is claimed.
+void cancelTower(int r) {
+    if (r < 0 || r >= raceCount || !keeps[r].built || !keepQueued[r]) return;
+    stock[r].stone += towerReservedStone[r];
+    printf("GATE TOWER CANCELLED - %s, %d stone refunded\n", raceDefs[r].name, towerReservedStone[r]);
+    towerReservedStone[r] = 0;
+    keepQueued[r] = false;
+    keepBuilderId[r] = -1;
+}
+
+// R33-F2: runs after wallTick(). For each race with placed, unbuilt towers, raises them one at a time through the keep's
+// path: buildOneOff() with keepQueued[r] as the claim, jobKeep and keepBuildTicks of labour, a builder of that race.
+// The claim moves towerStoneCost into towerReservedStone[r], only from stone above keepStoneReserve.
+void towerTick(vector<barb>& barbs, vector<RectangleShape>& squares) {
+    for (int r = 0; r < raceCount; r++) {
+        if (!keeps[r].built) continue;
+        int k = 0;
+        while (k < towerCount && (towers[r][k].race < 0 || towers[r][k].built)) k++;
+        if (k == towerCount) continue;
+        gatetower& t = towers[r][k];
+        if (keepQueued[r]) {   // builder lost without releaseBarbWork() (should not happen): refund and free the guard
+            int i = findBarbById(barbs, keepBuilderId[r]);
+            if (i < 0 || barbs[i].jobKind != jobKeep || barbs[i].race != r) cancelTower(r);
+        }
+        bool done = buildOneOff(barbs, squares, keepQueued[r], jobKeep, Vector2f((float)t.x, (float)t.y) + towerStandOffset, "GATE TOWER",
+            [&](const barb& b) {
+                if (!canAfford(stock[r], 0, towerStoneCost + keepStoneReserve)) return -1;
+                spend(stock[r], 0, towerStoneCost);   // reserved together with keepQueued (set by buildOneOff on return 1)
+                towerReservedStone[r] = towerStoneCost;
+                keepBuilderId[r] = b.id;
+                return 1;
+            }, r);
+        if (!done) continue;
+        t.built = true;
+        t.id = nextTowerId++;
+        towerReservedStone[r] = 0;
+        keepQueued[r] = false;
+        keepBuilderId[r] = -1;
+        printf("---GATE TOWER BUILT--- %s, tower %d id %d (%d stone)\n", raceDefs[r].name, k, t.id, towerStoneCost);
+        bool more = false;
+        for (auto& o : towers[r]) if (o.race >= 0 && !o.built) more = true;
+        if (!more) logRaceEvent(string(racePlurals[r]) + " raise gatehouse towers", r);
+    }
+}
+
+// R33-F2: 12x16 tower in the wall's stone (wet tone while raining): 4 merlons over a solid face, a dark 2x3 arrow slit,
+// a 1px darker plinth, and a tiny race pennant on a 1px pole above the right corner merlon. Drawn with the keeps.
+void drawGateTowers(RenderWindow& window) {
+    RectangleShape s;
+    Color stone = raining ? wallRainColor : wallStoneColor;
+    for (int r = 0; r < raceCount; r++) {
+        for (auto& t : towers[r]) {
+            if (t.race < 0 || !t.built) continue;
+            Vector2f o((float)t.x, (float)t.y);
+            s.setFillColor(stone);
+            s.setSize(Vector2f(towerSize.x, towerSize.y - towerMerlonH));
+            s.setPosition(o + Vector2f(0.0f, towerMerlonH));
+            window.draw(s);
+            for (int m = 0; m < 4; m++) {
+                s.setSize(Vector2f(towerMerlonW[m], towerMerlonH));
+                s.setPosition(o + Vector2f(towerMerlonX[m], 0.0f));
+                window.draw(s);
+            }
+            s.setFillColor(towerPlinthColor);
+            s.setSize(Vector2f(towerSize.x, 1.0f));
+            s.setPosition(o + Vector2f(0.0f, towerSize.y - 1.0f));
+            window.draw(s);
+            s.setFillColor(keepGateColor);
+            s.setSize(towerSlitSize);
+            s.setPosition(o + towerSlitPos);
+            window.draw(s);
+            s.setFillColor(keepPoleColor);
+            s.setSize(Vector2f(1.0f, towerPoleH));
+            s.setPosition(o + towerPolePos);
+            window.draw(s);
+            s.setFillColor(towerPennantColors[r]);
+            s.setSize(towerFlagSize);
+            s.setPosition(o + towerPolePos + Vector2f(1.0f, 0.0f));
+            window.draw(s);
+        }
+    }
 }
 
 // R33-F3: Bresenham over the trail grid from the keep centre's cell out to the crate centre's cell. Every cell appears
@@ -5278,7 +5492,11 @@ void releaseBarbWork(barb& b, smokehouseSet& sh, forge& fg, storehouse (&stores)
             break;
         case jobPave:  clearPave(b); break;
         case jobSpear: clearSpearCraft(b); break;
-        case jobKeep:  if (b.race >= 0 && b.race < raceCount && keepBuilderId[b.race] == b.id) cancelKeep(b.race); break;   // R31-F1: refund, can requeue
+        case jobKeep:  if (b.race >= 0 && b.race < raceCount && keepBuilderId[b.race] == b.id) {   // R31-F1: refund, can requeue
+                           if (keeps[b.race].built) cancelTower(b.race);   // R33-F2: the job is a gate tower once the keep stands
+                           else cancelKeep(b.race);
+                       }
+                       break;
         default: break;
     }
     b.jobKind = jobNone;
@@ -6233,6 +6451,7 @@ void treespawn(vector<tree>& trees, vector<CircleShape>& tris, vector<RectangleS
     tree t{distrib(gen), distrib(gen), false};
     if (!lakeClear(FloatRect(Vector2f(t.x, t.y), Vector2f(treeFootprint, treeFootprint)))) return; // no trees in the water
     if (!fieldsClear(fields, FloatRect(Vector2f(t.x, t.y), Vector2f(treeFootprint, treeFootprint)))) return; // nor on a wheat plot
+    if (!towerClear(FloatRect(Vector2f(t.x, t.y), Vector2f(treeFootprint, treeFootprint)))) return;  // R33-F2: nor on a gate tower
     trees.push_back(t);
 
     tris.push_back(makeTreeTri(t.x, t.y));
@@ -6653,6 +6872,7 @@ int main() {
                 buildmills(barbs, squares, fields);   // FARM-F2
                 buildkeeps(barbs, squares, stores);   // R31-F1: Town era
                 wallTick(barbs, trees, tris, stumps, octs, bushshapes, houseshapes, shrines, fields);   // R31-F2: cosmetic curtain walls
+                towerTick(barbs, squares);   // R33-F2: gatehouse towers, after the wall completes
                 causewayTick();   // R33-F3: keep -> crate stone road
                 craftspear(barbs, squares, dwarfForge);
                 minematerials(squares, barbs, tris, stumps, trees, octs, rocks, bushes, bushshapes, catchRings, fields, stores, dwarfForge);
@@ -6744,6 +6964,7 @@ int main() {
 	}
 	drawHouses(window, houses, houseshapes);
 	drawKeeps(window, barbs);   // R31-F1; R31-F3 refuge windows + banner
+	drawGateTowers(window);     // R33-F2: with the keeps, over the wall ends and ground marks, under barbs
 	drawShrines(window, shrines);
 	drawSmokehouse(window, smoke, stores);
 	drawStall(window, activeTrader);
