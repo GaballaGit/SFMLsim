@@ -1077,7 +1077,7 @@ const uint8_t fishRingMaxAlpha = 150;      // fades linearly to 0
 // Ripe is derived from growth (no stored flag); no scarecrow. The harvest shares harvestTick() with berry picking.
 // Race farmsteads (FARM-F1): each race sows fieldsPerRace plots beside its own storehouse; only that race sows/reaps them.
 // R32-F1 Mill Fields: plot k (k > 0) unlocks at fieldMinHouses*k+1 homes and is sown in a fixed slot beside the mill.
-constexpr int fieldsPerRace = 3;
+constexpr int fieldsPerRace = 4;            // R46-F2b: 4th plot, opened by a 4th home or 4 * popPerPlot barbs
 const Vector2f fieldSize(8.0f, 8.0f);
 const float fieldBorderPx = 1.0f;          // race-tinted frame drawn outside the soil (10x10 overall)
 const int fieldWoodCost = 6;               // cheap: fences and a hoe
@@ -1147,7 +1147,10 @@ constexpr uint8_t millPuffAlpha = 110;        // faint at the start, fading to 0
 // (side +1). Both extra plots stack on the far side of the mill from plot 0, one above and one below the sail hub;
 // mirrored across the hub for side -1. x = 19: the plot zone's left edge just touches the mill zone (sail + clear px).
 // y = -11 / 12: the two plot zones touch each other, centred on the mill body. Index 0 is unused (plot 0 is placed freely).
-constexpr Vector2f fieldSlotOffsets[fieldsPerRace] = {{0.0f, 0.0f}, {19.0f, -11.0f}, {19.0f, 12.0f}};
+// R46-F2b: plot 3 sits above the mill, centred on the sail hub (x = 1 mirrors onto itself), its zone's bottom edge just
+// touching the top of the mill zone (y = -26); it clears plot 0, the other slots and the door lane on both sides.
+constexpr Vector2f fieldSlotOffsets[] = {{0.0f, 0.0f}, {19.0f, -11.0f}, {19.0f, 12.0f}, {1.0f, -26.0f}};
+static_assert(sizeof(fieldSlotOffsets) / sizeof(fieldSlotOffsets[0]) == fieldsPerRace, "one slot offset per plot");
 constexpr float millDoorLanePx = 12.0f;       // kept free below the mill stand spot: the haulers' approach to the door
 constexpr int fieldStaggerStages = 1;         // a replanted plot lies fallow until it is this many stages off its siblings
 // R37-F1: a blocked mill slot is retried every fieldSlotRetryTicks; after fieldSlotMaxFails failed checks (or if the slot
@@ -3490,12 +3493,15 @@ optional<hoverHit> pickHover(Vector2f p, float radius, const vector<barb>& barbs
         if (k > 0 && !fp.placed && fp.fallback) return string("re-siting");   // R37-F1: slot given up, ring spot pending
         if (k > 0 && mills[r].placed && !fp.placed && !fp.reserved) return string("no room");
         if (k < plotsOpen[r]) return string("unsown");   // R46-F2a: already unlocked (by homes or population)
-        return "unsown (needs " + to_string(fieldMinHouses * k + 1) + (fieldMinHouses * k + 1 == 1 ? " home)" : " homes)");
+        int homes = fieldMinHouses * k + 1;   // R46-F2b: either gate of plotsUnlocked() opens it
+        return "unlocks at " + to_string((k + 1) * popPerPlot) + " barbs or " + to_string(homes) + (homes == 1 ? " home" : " homes");
     };
     auto farmLine = [&](int r) {   // FARM-F2: "mill: built/none, plots n/cap" for race r; R32-F1: then one line per plot
-        int sown = 0;
+        int sown = 0, pop = 0;
         for (auto& fp : fields[r]) if (fp.built) sown++;
-        string s = string("mill: ") + (mills[r].built ? "built" : "none") + ", plots " + to_string(sown) + "/" + to_string(fieldsPerRace);
+        for (auto& b : barbs) if (b.race == r) pop++;   // R46-F2b: hover only, so no per-tick cost
+        string s = string("mill: ") + (mills[r].built ? "built" : "none") + ", plots " + to_string(sown) + "/" + to_string(fieldsPerRace)
+                 + "\n  pop " + to_string(pop) + " / plots " + to_string(plotsOpen[r]);
         for (int k = 0; k < fieldsPerRace; k++) s += "\n  plot " + to_string(k + 1) + ": " + plotState(r, k);
         return s;
     };
