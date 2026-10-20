@@ -702,7 +702,7 @@ const int forgeStoneCost = 8;              // the forge is where stone goes; hou
 const int forgeMinDwarfHouses = 2;
 const int forgeBuildTicks = 600;           // same work as a house
 const int houseBuildTicks = 600;
-const Vector2f forgePos(375.0f, 393.0f);   // forge top-left: west of the campfire
+const Vector2f forgePos = villageCenter + Vector2f(-25.0f, -7.0f);   // forge top-left: west of the campfire (R47-F7: was the literal (375, 393) of the 800 map)
 const Vector2f forgeStandOffset(-3.0f, 1.0f); // builder's spot relative to the forge: stands at its left wall
 const float forgeClearPx = 3.0f;           // houses and shrines keep this far from the forge footprint
 struct forgePart {Vector2f pos, size; Color color;};
@@ -741,6 +741,35 @@ constexpr float kTemperMineSpeed = 1.25f;     // 25% faster mining rate while ch
 static_assert(kTemperCharges * (1.0f - 1.0f / kTemperMineSpeed) < (float)kTemperStoneCost, "tempering must not pay for itself");
 const Vector2f temperPipSize(2.0f, 2.0f);     // beside the left foot of a charged dwarf
 const Color temperPipColor(170, 196, 222);    // pale tempered steel blue: reads on the dark green, apart from cap brown and horns
+// R47-F7: blacksmith phase 1. The forge is shared: once built, any race's barb that ends a stone haul with stone to spare
+// walks to forgePos + smeltStandOffset and smelts kSmeltStoneCost stone into kSmeltIngots of its race's ingots (one smelter
+// at the forge at a time). A race's ingot count picks its tool tier from toolTierIngots; a chop or mine started at tier t
+// runs toolTierSpeed[t] times faster. The tier is read once when the work starts (barb.jobTier). No ingots = tier 0, no stall.
+constexpr int kSmeltStoneCost = 3;
+constexpr int kSmeltStoneReserve = houseStoneCost;   // only stone above this is smelted, so the next house never waits on it
+constexpr int kSmeltIngots = 1;
+constexpr int kSmeltTicks = 240;                     // work ticks at the forge (half a rock), in barb.smeltTimer (never barb.timer)
+const Vector2f smeltStandOffset(8.0f, 1.0f);         // smelter hitbox top-left relative to the forge: right of the anvil, clear of the temper spot
+constexpr int toolTierCount = 4;
+constexpr int toolTierIngots[toolTierCount] = {0, 2, 5, 9};          // ingots a race needs for each tier
+constexpr float toolTierSpeed[toolTierCount] = {1.0f, 1.1f, 1.2f, 1.3f}; // work-rate multiplier per tier
+constexpr int kIngotCap = toolTierIngots[toolTierCount - 1];         // smelting stops at the top tier
+constexpr float kToolTierMaxStep = 0.15f;                            // at most +15% per tier
+constexpr bool toolTiersOk() {
+    if (toolTierIngots[0] != 0 || toolTierSpeed[0] != 1.0f) return false;   // empty stock = tier 0 = base speed
+    for (int t = 1; t < toolTierCount; t++)
+        if (toolTierIngots[t] <= toolTierIngots[t - 1] || toolTierSpeed[t] <= toolTierSpeed[t - 1]
+            || toolTierSpeed[t] - toolTierSpeed[t - 1] > kToolTierMaxStep + 1e-4f) return false;
+    return true;
+}
+static_assert(toolTiersOk(), "tool tiers: start at 0 ingots / 1x, rise strictly, at most +15% per tier");
+const Color toolTierMarkColor(204, 212, 222);        // 1px steel edge above the raised tool: a step paler than the Hand Axe head
+const int smeltWispPuffs = 3;                        // smoke wisp over the hearth while a smelt is under way
+const int smeltWispFrames = 90;                      // one puff's rise, ~1.5s (frames, frozen while paused)
+const float smeltWispRisePx = 7.0f;                  // how far a puff climbs above the roof
+const Vector2f smeltWispOrigin(2.0f, -1.0f);         // just above the roof row over the hearth mouth, offset from forgePos
+const Color smeltWispColor(150, 150, 146);           // muted ash grey
+const uint8_t smeltWispMaxAlpha = 120;               // translucent, fades out as it rises
 
 // Race storehouses (R29-F1): one per race at a fixed spot, built by a barb of that race. Chopped wood and mined stone
 // are carried to the hauler's own race's storehouse (the campfire while it isn't standing) and only counted on arrival.
@@ -1756,7 +1785,18 @@ int stallBonusLots = 0;     // extra lots the stall added to the current visit; 
 struct forge {bool built = false; bool claimed = false;}; // the one dwarf forge; claimed = a builder is on it
 // POL-F5a: the single forge gate (shared with forge phase 2): race r works at the forge only if it is dwarves and it is built
 bool forgeActive(const forge& fg, int r) { return r == raceDwarf && fg.built; }
-int gold = 0;              // R46-F1a: global nuggets, from gold rocks only
+// R47-F7: the smelt gate is separate: every race smelts at the forge once it is built
+bool forgeSmeltOpen(const forge& fg) { return fg.built; }
+int raceIngots[raceCount] = {0, 0, 0};   // R47-F7: per-race ingots, only ever added to (capped at kIngotCap)
+int forgeSmelterId = -1;                 // R47-F7: barb id at the forge smelting (never an index); -1 = free; reset by clearSmelt()
+// R47-F7: the tier lookup. Callers read it once, when a chop or mine starts, into barb.jobTier
+int toolTierOf(int r) {
+    if (r < 0 || r >= raceCount) return 0;
+    int n = raceIngots[r], t = 0;
+    while (t + 1 < toolTierCount && n >= toolTierIngots[t + 1]) t++;
+    return t;
+}
+int gold = 0;             // R46-F1a: global nuggets, from gold rocks only
 bool goldFound = false;    // R46-F1a: set by the first nugget; the HUD gold cell stays shown from then on
 char rollGoldRock() { return bernoulli_distribution(goldRockChance)(gen) ? 1 : 0; }   // one roll per spawned rock
 int forgeEmberFrames = 0;  // >0 = ember glows hot; set when a dwarf mines a rock, counted down per drawn frame
@@ -2377,6 +2417,10 @@ struct barb {
     bool temperPaid = false;     // R41-F2: kTemperStoneCost already taken; refunded by clearTemper() unless the temper finished
     int toolCharges = 0;         // R41-F2: tempered rock mines left; set on a finished temper, reset by clearTemper() and makeBarb()
     bool onExpedition = false;   // R45-F2: the one expedition flag; exclusive state owned by expeditionTick(), set/cleared only there
+    bool smelting = false;       // R47-F7: exclusive smelt state owned by smeltTick(); never set with chopping/building/tempering; cleared by clearSmelt()
+    int smeltTimer = 0;          // R47-F7: work ticks at the forge; separate from timer; cleared by clearSmelt()
+    bool smeltPaid = false;      // R47-F7: kSmeltStoneCost already taken; refunded by clearSmelt() unless the smelt finished
+    int jobTier = 0;             // R47-F7: tool tier read once when the current chop/mine started (toolTierOf); scales chopTicks/mineTicks
 };
 // R39-F1: the one route reset, called wherever moving/movingbspot is cleared and before a barb is swapRemoved
 void clearRoute(barb& b) {
@@ -2387,6 +2431,8 @@ void clearRoute(barb& b) {
 bool barbHidden(const barb& b) { return b.garrisoned && b.garrisonInside; }   // INBOX-F1
 // R45-F2: the one eligibility gate every job selector checks: false while bellTick() (garrison) or expeditionTick() owns the barb
 bool barbAvailable(const barb& b) { return !b.garrisoned && !b.onExpedition; }
+// R47-F7: busy at the forge (temperTick() or smeltTick() walks and works the barb); wander, hunts and orders skip it
+bool atForgeTask(const barb& b) { return b.tempering || b.smelting; }
 
 // R45-F2: the one party. Members are held by barb id (never an index) and re-resolved by expeditionTick() every tick;
 // removeBarb() invalidates a dying member's id through expeditionMemberLost(), so the party dissolves the next tick.
@@ -2470,7 +2516,13 @@ int findBarbById(const vector<barb>& barbs, int id) {
 bool isLeader(const barb& b) {
     return b.race >= 0 && b.race < raceCount && raceElected[b.race] && raceLeaderId[b.race] >= 0 && raceLeaderId[b.race] == b.id;
 }
-int mineTicks(const barb& b) { return (int)(rockMineTicks / raceOf(b).mineSpeed / (know.learned[techPickwork] ? pickworkMineSpeed : 1.0f)); }
+int mineTicks(const barb& b) {   // R47-F7: / the tool tier snapshotted at job start (b.jobTier), never looked up per tick
+    return (int)(rockMineTicks / raceOf(b).mineSpeed / (know.learned[techPickwork] ? pickworkMineSpeed : 1.0f)
+                 / toolTierSpeed[clamp(b.jobTier, 0, toolTierCount - 1)]);
+}
+int chopTicks(const barb& b) { return (int)(chopTicks() / toolTierSpeed[clamp(b.jobTier, 0, toolTierCount - 1)]); }   // R47-F7
+// R47-F7: called on the tick a chop or mine begins (the barb is not yet chopping): the one place the tier is read
+void startToolJob(barb& b) { if (!b.chopping) b.jobTier = toolTierOf(b.race); }
 
 // R29-F1: every way out of a haul other than the deposit itself; the load is lost. Safe on a barb that isn't hauling.
 void dropCarry(barb& b) {
@@ -2492,6 +2544,19 @@ void clearTemper(barb& b) {
     b.tempering = false;
     b.temperTimer = 0;
     b.toolCharges = 0;
+}
+
+// R47-F7: every way out of a smelt (finished, interrupted, reassigned, forge gone, sheltering, expedition, death) goes
+// through here. Refunds the stone if still owed and frees the forge; leaves movement alone like clearTemper().
+void clearSmelt(barb& b) {
+    if (b.smeltPaid) {
+        stockOf(b).stone += kSmeltStoneCost;
+        printf("SMELT REFUNDED - barb %d, %s +%d stone\n", b.id, racePlurals[clampRace(b.race)], kSmeltStoneCost);
+    }
+    if (b.smelting && forgeSmelterId == b.id) forgeSmelterId = -1;
+    b.smeltPaid = false;
+    b.smelting = false;
+    b.smeltTimer = 0;
 }
 
 // R34-F1: true if b's work target is its own race's shaft stand spot (the spot is fixed, so this holds in any shaft state)
@@ -2848,7 +2913,7 @@ int treeAtWorkSpot(const vector<CircleShape>& tris, int x, int y) {
 }
 
 // R44-F2: no task stripe -> idle. Shared by barbColor() and the H beacons so both agree on who is jobless
-bool barbIdle(const barb& b) { return !b.deertargeting && !b.building && !b.tempering && !b.chopping; }
+bool barbIdle(const barb& b) { return !b.deertargeting && !b.building && !atForgeTask(b) && !b.chopping; }   // R47-F7: or smelting
 
 // Priority when flags overlap: hunting > building > picking > harvesting > fishing > mining > chopping > idle
 Color barbColor(const barb& b) {
@@ -2856,6 +2921,7 @@ Color barbColor(const barb& b) {
     if (b.deertargeting) return barbHuntColor;
     if (b.building) return barbBuildColor;
     if (b.tempering) return barbMineColor;   // R41-F2: pick work at the forge; never overlaps chopping/building
+    if (b.smelting) return barbMineColor;    // R47-F7: stone work at the forge, same stripe
     if (b.chopping && b.target == targetBush) return barbPickColor;
     if (b.chopping && b.target == targetField) return barbHarvestColor;
     if (b.chopping && b.target == targetLake) return barbFishColor;
@@ -2873,6 +2939,7 @@ const char* barbTaskName(const barb& b) {
     if (b.deertargeting) return b.hasSpear ? "hunting (spear)" : "hunting";
     if (b.building) return "building";
     if (b.tempering) return "tempering pick";   // R41-F2
+    if (b.smelting) return "smelting ingots";   // R47-F7
     if (b.chopping && b.target == targetBush) return "picking";
     if (b.chopping && b.target == targetField) return "harvesting";
     if (b.chopping && b.target == targetLake) return "fishing";
@@ -2924,7 +2991,7 @@ void deerkilling(vector<deer>& deers, vector<RectangleShape>& deershape, vector<
 		for (int j = 0; j < (int)barbs.size(); ++j) {
 			auto& b = barbs[j];
 			auto& sq = squares[j];
-			if (!barbAvailable(b) || b.building || b.movingbspot || b.chopping || b.timer > 0 || b.carryKind != carryNone || b.tempering) continue;   // R29-F1: haulers finish the trip; R41-F2: so do temperers; R45-F2
+			if (!barbAvailable(b) || b.building || b.movingbspot || b.chopping || b.timer > 0 || b.carryKind != carryNone || atForgeTask(b)) continue;   // R29-F1: haulers finish the trip; R41-F2: so do temperers (R47-F7: and smelters); R45-F2
 			if (!b.deertargeting) {
 				Vector2f bpos = sq.getPosition();
 				float dx = deerpos.x - bpos.x, dy = deerpos.y - bpos.y;
@@ -3797,6 +3864,11 @@ void drawBarbs(RenderWindow& window, const vector<barb>& barbs, const vector<Rec
             if (b.chopping && b.target == targetNone && know.learned[techHandAxe]) tool.setFillColor(steelToolColor); // R20-F1: 1px axe head
             tool.setPosition(Vector2f(side, raised ? bodyTop - barbToolSize.y : bodyTop + 1.0f));
             window.draw(tool);
+            if (raised && b.chopping && (b.target == targetNone || b.target == targetRock) && b.jobTier > 0) {   // R47-F7: the one tier mark,
+                dot.setFillColor(toolTierMarkColor);                                                             // 1px steel edge on top of the raised tool
+                dot.setPosition(Vector2f(side, bodyTop - barbToolSize.y - 1.0f));
+                window.draw(dot);
+            }
             if (lk.axeGlint && raised && (phase / (barbToolFrames * 2)) % dwarfGlintEvery == 0)   // R35-F1: up-right of the head, clear of the horn
                 addLookQuad(Vector2f(side + 1.0f, bodyTop - barbToolSize.y - 1.0f), Vector2f(1.0f, 1.0f), dwarfGlintColor);
         } else if (b.jobKind == jobSpear && b.spearTimer > 0) {   // R20-F3: knapping flint at the fire, hand taps the stone
@@ -4119,7 +4191,7 @@ string ledgerLine(int target, const vector<barb>& barbs, const storehouse (&stor
     if (target < raceCount) races.push_back(target);
     else for (int r = 0; r < raceCount; r++) if (!stores[r].built) races.push_back(r);
     vector<int> key{target < raceCount ? 0 : campfireWood};
-    for (int r : races) key.insert(key.end(), {r, stock[r].wood, stock[r].stone, stock[r].food, hungry[r], spears[r]});
+    for (int r : races) key.insert(key.end(), {r, stock[r].wood, stock[r].stone, stock[r].food, hungry[r], spears[r], raceIngots[r]});
     if (ledgerCache.target == target && ledgerCache.key == key) return ledgerCache.text;
     string s = target < raceCount ? "" : "Campfire: fire wood " + to_string(campfireWood);
     bool full = races.size() == 1;   // several races at the campfire: stock only, so the single line stays short
@@ -4128,6 +4200,8 @@ string ledgerLine(int target, const vector<barb>& barbs, const storehouse (&stor
         s += string(racePlurals[r]) + (full ? ": " : " ") + to_string(stock[r].wood) + "w " + to_string(stock[r].stone) + "s "
            + to_string(stock[r].food) + "f";
         if (full) s += ", " + to_string(hungry[r]) + " hungry, " + to_string(spears[r]) + (spears[r] == 1 ? " spear" : " spears");
+        if (full && raceIngots[r] > 0)   // R47-F7: shown from the first ingot
+            s += "\n" + to_string(raceIngots[r]) + (raceIngots[r] == 1 ? " ingot" : " ingots") + ", tool tier " + to_string(toolTierOf(r));
     }
     ledgerCache = {target, key, s};
     return s;
@@ -5632,7 +5706,8 @@ void drawForgeSparks(RenderWindow& window, bool paused) {
 }
 
 // POL-F5b: bonusPending (forgeBonusPending) keeps the ember in the hot range while bonus stone is on its way
-void drawForge(RenderWindow& window, const forge& fg, int frame, bool bonusPending) {
+// R47-F7: smelting (forgeSmelting) adds a thin ash-grey wisp: smeltWispPuffs staggered 1px puffs rising over the hearth
+void drawForge(RenderWindow& window, const forge& fg, int frame, bool bonusPending, bool smelting) {
     if (!fg.built) return;
     RectangleShape r;
     for (auto& p : forgeParts) {
@@ -5649,6 +5724,17 @@ void drawForge(RenderWindow& window, const forge& fg, int frame, bool bonusPendi
     r.setPosition(forgePos + forgeEmberPos);
     r.setFillColor(Color(mix(lo.r, hi.r), mix(lo.g, hi.g), mix(lo.b, hi.b)));
     window.draw(r);
+    if (!smelting) return;
+    for (int k = 0; k < smeltWispPuffs; k++) {   // R47-F7: each puff climbs and fades, drifting a pixel side to side
+        int age = (frame + k * smeltWispFrames / smeltWispPuffs) % smeltWispFrames;
+        float u = (float)age / smeltWispFrames;
+        float sway = (age / (smeltWispFrames / 3)) % 2 == 0 ? 0.0f : 1.0f;
+        Color c = smeltWispColor;
+        c.a = (uint8_t)(smeltWispMaxAlpha * (1.0f - u));
+        r.setFillColor(c);
+        r.setPosition(snapPx(forgePos + smeltWispOrigin + Vector2f(sway, -u * smeltWispRisePx)));
+        window.draw(r);
+    }
 }
 
 // R29-F1: runs after buildforge(). One storehouse per race, built through buildOneOff() by a barb of that race once the
@@ -6393,6 +6479,9 @@ void makeBarb(Vector2i pos, vector<barb>& barbs, vector<RectangleShape>& squares
     b.tempering = b.temperPaid = false;   // R41-F2: no temper in progress, an untempered pick
     b.temperTimer = 0;
     b.toolCharges = 0;
+    b.smelting = b.smeltPaid = false;   // R47-F7: no smelt in progress, tier read fresh at the first job
+    b.smeltTimer = 0;
+    b.jobTier = 0;
     for (auto& m : b.mem) m = workMem{};   // INBOX-F2: a newborn remembers no spots
     b.memReturn = b.memShared = false;
     b.order = needNone;   // INBOX-F2b: a newborn holds no order
@@ -7254,6 +7343,7 @@ void releaseBarbWork(barb& b, smokehouseSet& sh, forge& fg, storehouse (&stores)
     b.reservedstone = 0;
     refundSpear(b);                              // POL-F3: paid spear craft goes back to its race before the swapRemove
     clearTemper(b);                              // R41-F2: mid-temper stone refunded, charges reset (death and sheltering)
+    clearSmelt(b);                               // R47-F7: mid-smelt stone refunded, forge freed
     switch (b.jobKind) {                         // claims paid at claim time stay spent; the next builder pays again
         case jobSmoke: if (b.race >= 0 && b.race < raceCount && !sh[b.race].built) sh[b.race].claimed = false; break;   // INBOX2-F1: own race's hut
         case jobForge: if (!fg.built) fg.claimed = false; break;
@@ -7555,7 +7645,7 @@ void rankRaceNeed(const vector<barb>& barbs, int r) {
 
 // INBOX-F2b: idle = no work, build, hunt, haul or job claim. Garrisoned barbs are never idle, so an order never touches shelter
 bool orderIdle(const barb& b) {
-    return barbAvailable(b) && !b.chopping && !b.building && !b.movingbspot && !b.deertargeting && b.jobKind == jobNone && b.carryKind == carryNone && !b.tempering;
+    return barbAvailable(b) && !b.chopping && !b.building && !b.movingbspot && !b.deertargeting && b.jobKind == jobNone && b.carryKind == carryNone && !atForgeTask(b);   // R47-F7
 }
 
 // INBOX-F2b: right after the leader names its need, it hands that need as an individual order to idle members (not
@@ -7673,6 +7763,7 @@ void expeditionReset(barb& b) {
     b.timer = 0;
     clearRoute(b);
     leaveMine(b);
+    clearSmelt(b);   // R47-F7: eligibility (orderIdle) already rules smelters out; this keeps the forge claim honest regardless
     b.stepTimer = 0;
     b.target = targetNone;
     b.targetBush = b.targetShore = -1;
@@ -8029,7 +8120,7 @@ void barbmove(vector<RectangleShape>& squares, vector<barb>& barbs) {
     for (int i = 0; i < (int)squares.size(); i++) {
         auto& sq = squares[i];
         auto& b  = barbs[i];
-        if (!barbAvailable(b) || b.chopping || b.timer > 0 || b.movingbspot || b.building || b.carryKind != carryNone || b.tempering) continue;   // R29-F1: haulTick() walks haulers; INBOX-F1: bellTick() walks garrisoned; R41-F2: temperTick() walks temperers; R45-F2: expeditionTick() walks parties
+        if (!barbAvailable(b) || b.chopping || b.timer > 0 || b.movingbspot || b.building || b.carryKind != carryNone || atForgeTask(b)) continue;   // R29-F1: haulTick() walks haulers; INBOX-F1: bellTick() walks garrisoned; R41-F2: temperTick() walks temperers (R47-F7: smeltTick() smelters); R45-F2: expeditionTick() walks parties
         Vector2f pos = sq.getPosition();
         if (!b.moving) {
             if (wanderChance(gen) != 0) continue;
@@ -8227,6 +8318,74 @@ void temperTick(barb& b, RectangleShape& sq, const forge& fg) {
     logRaceEvent(string(b.name) + " tempered pick (" + to_string(kTemperCharges) + ")", b.race);
 }
 
+// R47-F7: may b smelt after this stone deposit? Forge built and free, its race below the ingot cap, stone above the reserve
+bool smeltWanted(const barb& b, const forge& fg) {
+    return forgeSmeltOpen(fg) && forgeSmelterId < 0 && b.race >= 0 && b.race < raceCount && raceIngots[b.race] < kIngotCap
+        && canAfford(stockOf(b), 0, kSmeltStoneCost + kSmeltStoneReserve);
+}
+// R47-F7: started by haulTick() right after a stone deposit; paid here (smeltPaid), refunded by clearSmelt() on any abort
+void startSmelt(barb& b) {
+    spend(stockOf(b), 0, kSmeltStoneCost);
+    b.smeltPaid = true;
+    b.smelting = true;
+    b.smeltTimer = 0;
+    forgeSmelterId = b.id;
+    Vector2f spot = forgePos + smeltStandOffset;
+    b.targetx = (int)spot.x;
+    b.targety = (int)spot.y;
+    b.moving = true;
+    b.stepTimer = 0;
+    printf("SMELT STARTED - barb %d, %s -%d stone (stone: %d)\n", b.id, racePlurals[clampRace(b.race)], kSmeltStoneCost, stockOf(b).stone);
+}
+// R47-F7: smelting right now (standing at the forge, work begun): drives the smoke wisp
+bool forgeSmelting(const vector<barb>& barbs) {
+    for (auto& b : barbs) if (b.smelting && b.smeltTimer > 0 && b.id == forgeSmelterId) return true;
+    return false;
+}
+// R47-F7: one smelt step: walk to the smelt spot, kSmeltTicks work ticks, then the ingots and one spark burst.
+// The forge going away refunds via clearSmelt() and frees the barb.
+void smeltTick(barb& b, RectangleShape& sq, const forge& fg) {
+    auto release = [&]() {
+        b.moving = false; clearRoute(b);
+        b.stepTimer = 0;
+        b.targetx = b.targety = -1;
+    };
+    if (!forgeSmeltOpen(fg) || forgeSmelterId != b.id) {
+        printf("SMELT ABORTED - barb %d, %s\n", b.id, forgeSmeltOpen(fg) ? "forge taken" : "forge lost");
+        clearSmelt(b);
+        release();
+        return;
+    }
+    Vector2f spot = forgePos + smeltStandOffset;
+    b.targetx = (int)spot.x;
+    b.targety = (int)spot.y;
+    Vector2f diff = spot - sq.getPosition();
+    if (diff.x * diff.x + diff.y * diff.y >= 1.0f) {
+        b.moving = true;
+        walkStep(b, sq);   // R39-F1
+        return;
+    }
+    b.moving = false; clearRoute(b);   // standing at the anvil
+    if (!workTick(b)) return;
+    b.smeltTimer++;
+    if (b.smeltTimer < kSmeltTicks) return;
+    int r = clampRace(b.race);
+    int before = toolTierOf(r);
+    raceIngots[r] = min(kIngotCap, raceIngots[r] + kSmeltIngots);
+    int after = toolTierOf(r);
+    b.smeltPaid = false;   // finishing consumes the stone, so clearSmelt refunds nothing
+    clearSmelt(b);
+    release();
+    memEndTrip(b);   // INBOX-F2: head back to the remembered rock
+    spawnForgeSparks();   // one burst per finished smelt
+    forgeEmberFrames = forgeEmberBoostFrames;
+    printf("---INGOT SMELTED--- barb %d, %s ingots %d, tool tier %d\n", b.id, racePlurals[r], raceIngots[r], after);
+    if (after > before) {
+        printf("---TOOL TIER %d--- %s (%d ingots, %.0f%% faster work)\n", after, racePlurals[r], raceIngots[r], (toolTierSpeed[after] - 1.0f) * 100.0f);
+        logRaceEvent(string(racePlurals[r]) + " forge tier " + to_string(after) + " tools", r);
+    }
+}
+
 // R29-F1: one hauler step. The depot is re-resolved every tick, so a storehouse that is gone sends the load to the
 // campfire. On arrival the load is added to the stock, the storehouse flashes, and the barb is idle again.
 void haulTick(barb& b, RectangleShape& sq, storehouse (&stores)[raceCount], const forge& fg) {
@@ -8280,6 +8439,7 @@ void haulTick(barb& b, RectangleShape& sq, storehouse (&stores)[raceCount], cons
     // R41-F2: a dwarf's stone haul ends at the forge to temper an untempered pick, if the stone is there to pay for it
     bool temper = b.carryKind == carryStone && forgeActive(fg, b.race) && b.toolCharges == 0
                   && canAfford(stockOf(b), 0, kTemperStoneCost);
+    bool smelt = !temper && b.carryKind == carryStone && smeltWanted(b, fg);   // R47-F7: any race; temper goes first for a dwarf
     b.carryKind = carryNone;
     b.carryAmount = 1;   // R34-F1
     b.target = targetNone;
@@ -8288,6 +8448,7 @@ void haulTick(barb& b, RectangleShape& sq, storehouse (&stores)[raceCount], cons
     b.targetx = b.targety = -1;
     memEndTrip(b);   // INBOX-F2
     if (temper) startTemper(b);
+    else if (smelt) startSmelt(b);
 }
 
 void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<CircleShape>& tris, vector<RectangleShape>& stumps, vector<tree>& trees, vector<CircleShape>& octs, vector<rock>& rocks, vector<char>& rockGold,
@@ -8326,6 +8487,12 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
                 printf("TEMPER INTERRUPTED - barb %d\n", b.id);
                 clearTemper(b);
             } else { temperTick(b, sq, fg); continue; }
+        }
+        if (b.smelting) {   // R47-F7: same rule as the temper: any other state taken over the smelt refunds it
+            if (b.movingbspot || b.building || b.deertargeting || b.chopping || b.jobKind != jobNone || b.carryKind != carryNone || b.tempering) {
+                printf("SMELT INTERRUPTED - barb %d\n", b.id);
+                clearSmelt(b);
+            } else { smeltTick(b, sq, fg); continue; }
         }
         if (b.carryKind != carryNone) {   // R29-F1: any other state taken over the haul drops the load
             if (b.target != targetDepot || b.movingbspot || b.building || b.deertargeting || b.chopping || b.jobKind != jobNone) dropCarry(b);
@@ -8630,6 +8797,7 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
             Vector2f sp = shaftWorkSpot(b.race);
             float dx = sp.x - bpos.x, dy = sp.y - bpos.y;
             if (dx * dx + dy * dy >= 4.0f) continue;   // still walking (barbmove)
+            startToolJob(b);   // R47-F7: tier read once, on the first work tick
             b.chopping = true;
             if (!b.inMine) {   // R40-F1: at the mouth: down into the pit
                 b.inMine = true;
@@ -8661,10 +8829,11 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
                 b.moving  = false; clearRoute(b);
                 b.targetx = b.targety = -1;
             } else if (dx * dx + dy * dy < 4.0f) {
+                startToolJob(b);   // R47-F7: tier read once, on the first work tick
                 b.chopping = true;
                 trees[i].dying = true;
                 if (workTick(b)) b.timer++;
-                if (b.timer >= chopTicks()) {
+                if (b.timer >= chopTicks(b)) {
                     practice(techHandAxe);
                     memRecord(b, memTree, Vector2f((int)tix, (int)tiy));   // INBOX-F2: by position; the tree index dies with the swapRemove
                     swapRemove(trees,  i);
@@ -8690,6 +8859,7 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
 			}
 			float dx = rix - bpos.x, dy = riy - bpos.y;
 			if (dx * dx + dy * dy >= 4.0f) break;
+			startToolJob(b);   // R47-F7: tier read once, on the first work tick
 			b.chopping = true;
 			rocks[i].dying = true;
 			if (workTick(b)) b.timer++;
@@ -9692,7 +9862,7 @@ int main() {
 	drawCamps(window);
 	drawPois(window, camRect, frameCount);   // R47-F4: huts and wells, with the buildings
 	drawStall(window, activeTrader);
-	drawForge(window, dwarfForge, frameCount, forgeBonusPending(barbs, dwarfForge));
+	drawForge(window, dwarfForge, frameCount, forgeBonusPending(barbs, dwarfForge), forgeSmelting(barbs));   // R47-F7: smoke wisp
 	if (forgeEmberFrames > 0 && !paused) forgeEmberFrames--;
 	drawStorehouses(window, stores);
 	drawMineShafts(window, barbs, squares);   // R34-F1: beside the crates, under barbs
@@ -9728,7 +9898,7 @@ int main() {
 	for (int q = 0; q < (int)squares.size(); ++q) {
             auto& b = barbs[q];
             if (b.chopping && b.timer > 0 && b.target == targetNone)
-                drawBar(window, Vector2f(b.targetx - 10, b.targety - 20), (float)b.timer / chopTicks(), pal.barChop);
+                drawBar(window, Vector2f(b.targetx - 10, b.targety - 20), (float)b.timer / chopTicks(b), pal.barChop);
             if (b.chopping && b.timer > 0 && b.target == targetBush)
                 drawBar(window, Vector2f(b.targetx - 10, b.targety - 14), (float)b.timer / bushPickTicks, pal.barPick);
             if (b.chopping && b.timer > 0 && b.target == targetField)   // centred over the plot, above the bobbing ear
