@@ -1084,14 +1084,14 @@ const Color stockEmptyRaceColor(120, 118, 108); // a race with no living members
 // clearing (63) reaches at most 250+63 = 313 from the campfire, well inside the edges and HUD (1200 / 1176 away), and
 // stays >= 210-63 = 147 clear of the village clearing (50). quarterLayoutSweepOk() re-checks this at startup over a full
 // turn of rotations at both radii, so quarterLayoutOk() always passes and the fallback should never fire.
-// Lakes are placed after the quarters and keep quarterClearRadius + lakeMinGap off each one.
+// Lakes are placed after the quarters and keep quarterClearRadiusFor() (step 0) + lakeMinGap off each one.
 const float raceMinSeparation = 260.0f;      // min distance between two races' crates (startup check; R47-F3: was 185)
 const bool quarterForceFallback = false;     // R47-F3 test switch: true skips the random layout so the fixed fallback runs
 // R47-F3 Frontier Spacing: each race's frontier is the disc of frontierRadius round its crate centre. Crates are at least
 // raceMinSeparation apart, so frontiers never touch and the land between them is a gap the trader walks through. The wide
 // work look (barbWorkFallbackRadius) skips targets inside another race's frontier. Shown only as a faint dotted circle
 // on the minimap; nothing is drawn in the main view.
-const float frontierRadius = raceMinSeparation / 2.0f;   // 130 = houseSpreadFar, so homesteads stay inside their frontier
+const float frontierRadius = raceMinSeparation / 2.0f;   // 130 = houseSpreadFar at step 0 (R47-F10 steps may reach past it)
 const float frontierMinimapDotGap = 3.0f;    // minimap px between border dots (1px each)
 const uint8_t frontierMinimapAlpha = 80;     // faint: under the house/crate/barb dots on the dark backing
 const float quarterMinRadius = 210.0f;       // crate centre distance from the campfire (R44-F4b: was 165)
@@ -1101,7 +1101,6 @@ const int quarterPlaceTries = 50;            // random layouts tried before the 
 const int quarterSweepSteps = 360;           // R47-F2: startup check of quarterLayoutOk's rules at every 1 deg rotation
 const float quarterHouseRadius = 56.0f;      // house spot within this of the crate centre (+25% over R30-F1's 45)
 const float quarterClearMargin = 7.0f;       // clearing reaches past the house disc: 5px slab half + 2
-const float quarterClearRadius = quarterHouseRadius + quarterClearMargin; // trees/rocks cleared within this
 const float quarterResourceRadius = 140.0f;  // startup resource check: trees/rocks between the clearing and this radius
 const int quarterMinTrees = 25;              // fewer than this nearby -> plant more (expected ~140 at 2000 trees)
 const int quarterMinRocks = 3;               // fewer than this nearby -> place more (expected ~7 at 100 rocks)
@@ -1113,7 +1112,7 @@ const uint8_t quarterRingAlpha = 30;         // very faint, in the race's crate 
 // R44-F4a Outlying Homesteads: every homesteadEvery-th house a race claims is tried as a lone homestead in a wider ring
 // houseSpreadNear..houseSpreadFar px from its crate centre, on the side facing away from villageCenter (within
 // homesteadArc of straight out). Up to homesteadTries spots per claim; if none passes, the normal quarter disc is used.
-// Quarter radii (quarterMin/MaxRadius, quarterHouseRadius) are unchanged in this phase.
+// Quarter radii (quarterMin/MaxRadius, quarterHouseRadius) are unchanged in this phase (R47-F10 grows the house radii).
 const float houseSpreadNear = 90.0f;         // homestead distance from the crate centre
 const float houseSpreadFar = 130.0f;
 const int homesteadEvery = 4;                // every 4th house of a race is tried as a homestead
@@ -1121,6 +1120,23 @@ const float homesteadArc = 1.0471976f;       // +-60 deg around the crate's outw
 const int homesteadTries = 12;               // spots rolled per claim before falling back to the quarter disc
 const float homesteadHouseGap = 30.0f;       // no homestead within this of any house (or pending house spot), any race
 const float homesteadClutterPad = 2.0f;      // grass kept between the slab and a tree/rock/bush footprint
+// R47-F10 Living Build Radius: quarterHouseRadius / houseSpreadFar above are the step-0 values. A race's build radii grow
+// in steps with its living population (quarterRadiusFor / houseSpreadFarFor / quarterClearRadiusFor); the step is a
+// high-water mark, so it never shrinks. A step is taken only if the new reach disc (houseSpreadFar + slab half) passes
+// layoutDiscOk and stays clear of every neighbour's current reach disc; a rejected step leaves the mark unchanged.
+// With 3 steps the quarter clearing tops out at 56+24+7 = 87 < houseSpreadNear, so homesteads still read as outside it.
+const int quarterStepMax = 3;                 // steps above the startup radii
+const int quarterStepBasePop = 10;            // living barbs of a race for step 1 (5 founders each)
+const int quarterStepPopEach = 6;             // each further step needs this many more
+const float quarterStepPx = 8.0f;             // quarter house disc (and its clearing) grows this much per step
+const float houseSpreadStepPx = 8.0f;         // homestead ring's far edge grows this much per step
+const float quarterReachRingAlpha = 60.0f;    // hovered crate: faint reach ring in the race's lens colour (1 screen px)
+const int quarterReachRingPoints = 72;        // smooth at ~150px radius
+const int quarterPulseTicks = 75;             // dust ring on a step: expands old -> new clearing edge, then fades
+const float quarterPulseOvershoot = 4.0f;     // ends this far past the new clearing edge
+const Color quarterPulseColor(150, 132, 108); // grey-brown dust, a touch lighter than the shaft puffs
+const uint8_t quarterPulseMaxAlpha = 110;
+const float quarterPulseThickness = 1.0f;
 
 // Lakes (R19-F2): static ponds placed once at startup. Static rect + rim only in v1 (no glint/ripples).
 // Only wander paths (barbs, deer) avoid lakes; task paths (chop/mine/build/hunt/flee/wolves) are straight lines and may cross
@@ -1627,7 +1643,6 @@ uniform_int_distribution<int> wanderDX(-50, 50);
 uniform_int_distribution<int> wanderDY(-50, 50);
 uniform_int_distribution<int> spawnChance(0, 7500);
 uniform_int_distribution<int> treespawnChance(0, treeSpawnOneIn - 1);
-uniform_int_distribution<int> quarterSpotD(-(int)quarterHouseRadius, (int)quarterHouseRadius); // R30-F1: house offset per axis, disc-rejected
 uniform_int_distribution<int> DeerSpawnY((int)mapEdgeInset, (int)(worldSize - mapEdgeInset));
 uniform_int_distribution<int> DeerSpawnRL(0, 1);
 uniform_int_distribution<int> DeerSpawnXgotoL((int)mapEdgeInset, (int)(mapEdgeInset + deerEntryDepthPx));
@@ -1882,7 +1897,22 @@ bool forgeClear(const FloatRect& r) {
 
 // R30-F1: race quarters
 Vector2f quarterCentre(int r) { return storehousePos[r] + storehouseSize / 2.0f; }
-VertexArray quarterRingVerts(PrimitiveType::Triangles);   // dotted rings, built once in placeQuarters()
+VertexArray quarterRingVerts(PrimitiveType::Triangles);   // dotted rings, built in placeQuarters(); R47-F10: rebuilt per step
+
+// R47-F10: per-race build radius step (high-water mark, reset only by placeQuarters). Every runtime read of the
+// quarter house radius, its clearing and the homestead ring's far edge goes through these.
+int quarterStep[raceCount] = {};
+bool quarterStepCapped[raceCount] = {};   // a step was rejected: geometry only tightens, so it is not retried
+struct quarterPulse {int race; float from, to; int age = 0;};   // R47-F10: dust ring on a step
+vector<quarterPulse> quarterPulses;
+int quarterStepOf(int r) { return (r >= 0 && r < raceCount) ? quarterStep[r] : 0; }
+float quarterRadiusAt(int s) { return quarterHouseRadius + quarterStepPx * s; }   // radii at step s (candidate checks)
+float houseSpreadFarAt(int s) { return houseSpreadFar + houseSpreadStepPx * s; }
+float quarterReachAt(int s) { return max(quarterRadiusAt(s), houseSpreadFarAt(s)) + houseSlabSize.x / 2.0f; }   // outermost slab edge
+float quarterRadiusFor(int r) { return quarterRadiusAt(quarterStepOf(r)); }
+float quarterClearRadiusFor(int r) { return quarterRadiusFor(r) + quarterClearMargin; }
+float houseSpreadFarFor(int r) { return houseSpreadFarAt(quarterStepOf(r)); }
+float quarterReachFor(int r) { return quarterReachAt(quarterStepOf(r)); }
 
 // True if a tree/rock at top-left p is inside the village clearing or any race quarter's clearing (removed every frame)
 bool inClearing(Vector2f p) {
@@ -1890,7 +1920,8 @@ bool inClearing(Vector2f p) {
     if (dx * dx + dy * dy < clearRadiusSq) return true;
     for (int r = 0; r < raceCount; r++) {
         Vector2f d = p - quarterCentre(r);
-        if (d.x * d.x + d.y * d.y < quarterClearRadius * quarterClearRadius) return true;
+        float cr = quarterClearRadiusFor(r);   // R47-F10: grows with the race's step
+        if (d.x * d.x + d.y * d.y < cr * cr) return true;
     }
     return false;
 }
@@ -1924,7 +1955,7 @@ quarterLayout quarterLayoutAt(float a0, float r) {
 
 bool quarterLayoutOk(const quarterLayout& L) {
     for (int a = 0; a < raceCount; a++) {
-        if (!layoutDiscOk(L.crate[a] + storehouseSize / 2.0f, quarterClearRadius)) return false;
+        if (!layoutDiscOk(L.crate[a] + storehouseSize / 2.0f, quarterClearRadiusFor(a))) return false;   // step 0 at startup
         for (int b = a + 1; b < raceCount; b++) {
             Vector2f d = L.crate[a] - L.crate[b];
             if (hypot(d.x, d.y) < raceMinSeparation) return false;
@@ -1952,8 +1983,26 @@ bool inOtherFrontier(Vector2f p, int race) {
 // quarterLayoutOk(); if no try passes, the fixed layout (human north, others 120 deg apart) is used. Builds the rings.
 // R47-F3: every candidate is computed and checked without touching any state; only the chosen layout is committed.
 bool quarterFallbackUsed = false;   // INBOX-F3: set by placeQuarters() when the fixed layout was used
+
+// R47-F10: the faint dotted ring on each quarter's clearing edge, at its current step
+void buildQuarterRings() {
+    quarterRingVerts.clear();
+    for (int k = 0; k < raceCount; k++) {
+        Color col = storehouseColors[k];
+        col.a = quarterRingAlpha;
+        float cr = quarterClearRadiusFor(k);
+        int dots = (int)round(6.2831853f * cr / quarterRingDotGap);
+        for (int i = 0; i < dots; i++) {
+            float a = 6.2831853f * i / dots;
+            appendDot(quarterRingVerts, quarterCentre(k) + Vector2f(cos(a), sin(a)) * cr, col);
+        }
+    }
+}
+
 void placeQuarters() {
     quarterFallbackUsed = false;
+    for (int k = 0; k < raceCount; k++) { quarterStep[k] = 0; quarterStepCapped[k] = false; }   // R47-F10: startup radii
+    quarterPulses.clear();
     uniform_real_distribution<float> ang(0.0f, 6.2831853f), rad(quarterMinRadius, quarterMaxRadius);
     auto commit = [](const quarterLayout& L) {
         for (int k = 0; k < raceCount; k++) {
@@ -2015,16 +2064,7 @@ void placeQuarters() {
     }
     for (int k = 0; k < raceCount; k++)
         printf("Race quarter %s: crate at (%.0f, %.0f)\n", raceDefs[k].name, storehousePos[k].x, storehousePos[k].y);
-    quarterRingVerts.clear();
-    for (int k = 0; k < raceCount; k++) {
-        Color col = storehouseColors[k];
-        col.a = quarterRingAlpha;
-        int dots = (int)round(6.2831853f * quarterClearRadius / quarterRingDotGap);
-        for (int i = 0; i < dots; i++) {
-            float a = 6.2831853f * i / dots;
-            appendDot(quarterRingVerts, quarterCentre(k) + Vector2f(cos(a), sin(a)) * quarterClearRadius, col);
-        }
-    }
+    buildQuarterRings();
 }
 
 // Know-how (R20-F1): every counter, learned flag and pip pulse lives here; reset as a whole with resetKnowHow()
@@ -4046,6 +4086,7 @@ struct hoverHit {string label; optional<RectangleShape> rect; optional<CircleSha
                  int homeOfBarb = -1;     // hovered barb's home house id -> outline that house
                  int hoveredHouse = -1;   // hovered house id -> pip over each resident
                  int hoveredBarb = -1;    // INBOX-F2b: hovered barb id -> its order pip shows at any zoom
+                 int hoveredCrate = -1;   // R47-F10: hovered crate's race -> faint build reach ring
                  optional<Color> tint;   // POL-F1: ledger outline + text colour (default tooltip colours when unset)
                  optional<Vector2f> targetPos;}; // R44-F1: hovered barb's work target centre (world px), unset if none
 
@@ -4199,6 +4240,7 @@ optional<hoverHit> pickHover(Vector2f p, float radius, const vector<barb>& barbs
         if (!near(crate)) continue;
         hoverHit h{ledgerLine(r, barbs, stores), crate, nullopt};
         h.tint = lensRaceColors[r];
+        h.hoveredCrate = r;   // R47-F10
         return h;
     }
     {   // POL-F1: the campfire shows its shared fire wood plus any race still hauling there
@@ -5107,7 +5149,8 @@ void seedQuarterTrail(int r, const vector<house>& houses, const fieldGrid& field
 bool isHomestead(const house& h) {
     if (h.race < 0 || h.race >= raceCount) return false;
     Vector2f d = Vector2f((float)h.x + 2.0f, (float)h.y + 2.0f) - quarterCentre(h.race);
-    return d.x * d.x + d.y * d.y > quarterClearRadius * quarterClearRadius;
+    float cr = quarterClearRadiusFor(h.race);   // R47-F10
+    return d.x * d.x + d.y * d.y > cr * cr;
 }
 
 // R44-F4a: the checks every house spot (tx,ty = top-left of the 4px house) must pass: no overlap with other house slabs,
@@ -5153,7 +5196,7 @@ bool homesteadSpotOk(const vector<barb>& barbs, const vector<house>& houses, int
     for (int r = 0; r < raceCount; r++) {
         if (r == race) continue;
         Vector2f d = c - quarterCentre(r);
-        float m = quarterClearRadius + homesteadHouseGap;
+        float m = quarterClearRadiusFor(r) + homesteadHouseGap;   // R47-F10
         if (d.x * d.x + d.y * d.y < m * m) return false;
     }
     FloatRect slab(Vector2f(tx - 3.0f - homesteadClutterPad, ty - 3.0f - homesteadClutterPad),
@@ -5190,7 +5233,7 @@ void buildhouse(vector<barb>& barbs,vector<RectangleShape>& squares, vector<hous
             if ((own + 1) % homesteadEvery == 0) {
                 Vector2f out = qc - villageCenter;
                 float base = atan2(out.y, out.x);
-                uniform_real_distribution<float> arc(-homesteadArc, homesteadArc), spread(houseSpreadNear, houseSpreadFar);
+                uniform_real_distribution<float> arc(-homesteadArc, homesteadArc), spread(houseSpreadNear, houseSpreadFarFor(b.race));   // R47-F10
                 for (int k = 0; k < homesteadTries && !homestead; k++) {
                     float a = base + arc(gen), r = spread(gen);
                     tx = (int)floor(qc.x + cos(a) * r) - 2;   // house top-left; its centre is +2
@@ -5201,10 +5244,18 @@ void buildhouse(vector<barb>& barbs,vector<RectangleShape>& squares, vector<hous
                 triedHomestead = !homestead;
             }
             if (!homestead) {
+                int qr = (int)quarterRadiusFor(b.race);   // R47-F10: the race's current step
+                uniform_int_distribution<int> quarterSpotD(-qr, qr);   // R30-F1: house offset per axis, disc-rejected
                 int dx = quarterSpotD(gen), dy = quarterSpotD(gen);
-                if (dx * dx + dy * dy > quarterHouseRadius * quarterHouseRadius) continue; // R30-F1: inside the own quarter's disc
+                if (dx * dx + dy * dy > qr * qr) continue; // R30-F1: inside the own quarter's disc
                 tx = (int)qc.x + dx; ty = (int)qc.y + dy;
                 if (!houseSpotOk(barbs, houses, fields, b.race, qc, tx, ty)) continue;     // reroll next tick
+                {   // R47-F10: a grown disc can reach a bush clump (bushes are never cleared), so keep the slab off them
+                    FloatRect slab(Vector2f(tx - 3.0f, ty - 3.0f), houseSlabSize);
+                    bool onBush = false;
+                    for (auto& bs : bushshapes) if (slab.findIntersection(bs.getGlobalBounds())) { onBush = true; break; }
+                    if (onBush) continue;
+                }
                 if (triedHomestead)   // logged once, on the fallback claim itself
                     printf("HOMESTEAD - %s: no spot in %d tries, built in the quarter instead\n", raceDefs[b.race].name, homesteadTries);
             } else {
@@ -5806,7 +5857,8 @@ bool fieldInClearing(const FloatRect& zone, int r) {
     Vector2f c = quarterCentre(r);
     for (Vector2f p : {lo, Vector2f(hi.x, lo.y), Vector2f(lo.x, hi.y), hi}) {
         Vector2f d = p - c;
-        if (d.x * d.x + d.y * d.y > quarterClearRadius * quarterClearRadius) return false;
+        float cr = quarterClearRadiusFor(r);   // R47-F10
+        if (d.x * d.x + d.y * d.y > cr * cr) return false;
     }
     return true;
 }
@@ -6477,6 +6529,80 @@ void drawCatchRings(RenderWindow& window, const vector<birthRing>& rings) {
     }
 }
 
+// R47-F10: once per sim tick. A race whose living population earns a higher step tries exactly one step up; it is
+// taken only if the new reach disc passes layoutDiscOk and clears every neighbour's current reach disc. Steps never
+// go down (high-water mark); a rejected step leaves the mark as it was and caps that race (nothing ever loosens).
+void quarterReachTick(const vector<barb>& barbs) {
+    int pop[raceCount] = {};
+    for (auto& b : barbs) if (b.race >= 0 && b.race < raceCount) pop[b.race]++;
+    for (int r = 0; r < raceCount; r++) {
+        if (quarterStepCapped[r] || quarterStep[r] >= quarterStepMax) continue;
+        int earned = pop[r] < quarterStepBasePop ? 0 : 1 + (pop[r] - quarterStepBasePop) / quarterStepPopEach;
+        if (min(earned, quarterStepMax) <= quarterStep[r]) continue;
+        int next = quarterStep[r] + 1;
+        Vector2f qc = quarterCentre(r);
+        float reach = quarterReachAt(next);
+        bool ok = layoutDiscOk(qc, reach);
+        for (int q = 0; ok && q < raceCount; q++) {
+            if (q == r) continue;
+            Vector2f d = qc - quarterCentre(q);
+            if (hypot(d.x, d.y) < reach + quarterReachFor(q)) ok = false;
+        }
+        if (!ok) {
+            quarterStepCapped[r] = true;   // quarterStep[r] is not touched
+            printf("QUARTER REACH - %s: step %d rejected (reach %.0f overlaps a neighbour or the map/village edge), stays at %d\n",
+                   raceDefs[r].name, next, reach, quarterStep[r]);
+            continue;
+        }
+        float oldClear = quarterClearRadiusFor(r);
+        quarterStep[r] = next;
+        quarterPulses.push_back(quarterPulse{r, oldClear, quarterClearRadiusFor(r) + quarterPulseOvershoot});
+        buildQuarterRings();
+        printf("QUARTER REACH - %s: step %d at %d living, house disc %.0f, homesteads to %.0f\n", raceDefs[r].name, next, pop[r],
+               quarterRadiusFor(r), houseSpreadFarFor(r));
+        logRaceEvent(string(racePlurals[r]) + " build further out (reach " + to_string(next) + "/" + to_string(quarterStepMax) + ")", r);
+    }
+    for (auto& p : quarterPulses) p.age++;
+    for (int i = (int)quarterPulses.size() - 1; i >= 0; i--)
+        if (quarterPulses[i].age >= quarterPulseTicks) swapRemove(quarterPulses, i);
+}
+
+// R47-F10: the step's dust ring, eased out from the old clearing edge to just past the new one, fading as it goes
+void drawQuarterPulses(RenderWindow& window) {
+    CircleShape c;
+    c.setFillColor(Color::Transparent);
+    c.setOutlineThickness(quarterPulseThickness);
+    c.setPointCount(quarterReachRingPoints);
+    for (auto& p : quarterPulses) {
+        float t = (float)p.age / quarterPulseTicks;
+        float e = 1.0f - (1.0f - t) * (1.0f - t);
+        float rad = p.from + (p.to - p.from) * e;
+        Color col = quarterPulseColor;
+        col.a = (uint8_t)(quarterPulseMaxAlpha * (1.0f - t));
+        c.setRadius(rad);
+        c.setOrigin({rad, rad});
+        c.setPosition(quarterCentre(p.race));
+        c.setOutlineColor(col);
+        window.draw(c);
+    }
+}
+
+// R47-F10: hovered crate: a faint 1-screen-px ring at the race's outer build reach
+void drawQuarterReachRing(RenderWindow& window, const View& worldView, int r, float zoom) {
+    if (r < 0 || r >= raceCount) return;
+    window.setView(worldView);
+    float rad = quarterReachFor(r);
+    CircleShape c(rad, quarterReachRingPoints);
+    c.setOrigin({rad, rad});
+    c.setPosition(quarterCentre(r));
+    c.setFillColor(Color::Transparent);
+    c.setOutlineThickness(1.0f / zoom);
+    Color col = lensRaceColors[r];
+    col.a = (uint8_t)quarterReachRingAlpha;
+    c.setOutlineColor(col);
+    window.draw(c);
+}
+
 settlementEra currentEra = eraCamp;
 int eraCheckTimer = 0;
 
@@ -6785,7 +6911,7 @@ void placeTowers(int r, vector<barb>& barbs, vector<tree>& trees, vector<CircleS
         for (auto& p : corners) {
             for (int q = 0; ok && q < raceCount; q++) {   // never into another race's quarter
                 Vector2f d = p - quarterCentre(q);
-                if (q != r && d.x * d.x + d.y * d.y < quarterClearRadius * quarterClearRadius) ok = false;
+                if (q != r && d.x * d.x + d.y * d.y < quarterClearRadiusFor(q) * quarterClearRadiusFor(q)) ok = false;   // R47-F10
             }
             Vector2f dv = p - villageCenter;
             if (ok && dv.x * dv.x + dv.y * dv.y < clearRadiusSq) ok = false;
@@ -6857,7 +6983,7 @@ void wallTick(vector<barb>& barbs, vector<tree>& trees, vector<CircleShape>& tri
                 if (bp.x < 0.0f || bp.y < hudBarHeight || bp.x + wallThickPx > worldSize || bp.y + wallThickPx > worldSize) ok = false;
                 for (int q = 0; ok && q < raceCount; q++) {   // never into another race's quarter
                     Vector2f d = c - quarterCentre(q);
-                    if (q != r && d.x * d.x + d.y * d.y < quarterClearRadius * quarterClearRadius) ok = false;
+                    if (q != r && d.x * d.x + d.y * d.y < quarterClearRadiusFor(q) * quarterClearRadiusFor(q)) ok = false;   // R47-F10
                 }
                 Vector2f dv = c - villageCenter;
                 if (ok && dv.x * dv.x + dv.y * dv.y < clearRadiusSq) ok = false;
@@ -8672,7 +8798,7 @@ void spawnLakes(vector<tree>& trees, vector<CircleShape>& tris, vector<Rectangle
                 if (r.findIntersection(gap).has_value()) ok = false;
             }
             for (int q = 0; q < raceCount; q++) {   // R30-F1: race quarters stay dry (clearing + lakeMinGap)
-                float m = quarterClearRadius + lakeMinGap;
+                float m = quarterClearRadiusFor(q) + lakeMinGap;   // R47-F10: step 0 at startup
                 if (r.findIntersection(FloatRect(quarterCentre(q) - Vector2f(m, m), Vector2f(2 * m, 2 * m))).has_value()) ok = false;
             }
             if (!ok) continue;
@@ -8756,7 +8882,7 @@ void spawnBushes(vector<bush>& bushes, vector<CircleShape>& bushshapes, vector<t
         Vector2f cp;
         do cp = Vector2f((float)centre(gen), (float)centre(gen));
         while (hypot(cp.x - villageCenter.x, cp.y - villageCenter.y) < bushClumpMinCenterDist
-               || nearQuarter(cp, quarterClearRadius + bushClumpSpread + 2 * bushRadius)   // R30-F1: house space stays free
+               || nearQuarter(cp, quarterClearRadiusFor(0) + bushClumpSpread + 2 * bushRadius)   // R30-F1: house space stays free (R47-F10: step 0, same for every race at startup)
                || !lakeClear(FloatRect(cp - Vector2f(bushClumpSpread, bushClumpSpread),     // whole clump + work spots off the water
                                        Vector2f(2 * (bushClumpSpread + bushRadius), 2 * (bushClumpSpread + bushRadius) + bushWorkOffset.y))));
         for (int k = 0; k < bushesPerClump; k++) {
@@ -8805,7 +8931,7 @@ void checkQuarters(vector<tree>& trees, vector<CircleShape>& tris, vector<Rectan
         return true;
     };
     for (int q = 0; q < raceCount; q++) {
-        float m = quarterHouseRadius + houseSlabSize.x;
+        float m = quarterRadiusFor(q) + houseSlabSize.x;   // R47-F10: step 0 at startup
         if (!lakeClear(FloatRect(quarterCentre(q) - Vector2f(m, m), Vector2f(2 * m, 2 * m))))
             printf("Race quarter %s: WARNING water inside the house area\n", raceDefs[q].name);
         int nt = 0, nr = 0;
@@ -8813,7 +8939,7 @@ void checkQuarters(vector<tree>& trees, vector<CircleShape>& tris, vector<Rectan
         for (auto& o : octs) if (nearby(o.getPosition(), rockSz, q)) nr++;
         int addT = 0, addR = 0;
         mt19937 reseed(quarterReseedSeed + q);
-        uniform_real_distribution<float> ang(0.0f, 6.2831853f), rad(quarterClearRadius + treeFootprint, quarterResourceRadius - treeFootprint);
+        uniform_real_distribution<float> ang(0.0f, 6.2831853f), rad(quarterClearRadiusFor(q) + treeFootprint, quarterResourceRadius - treeFootprint);   // R47-F10: step 0
         for (int k = 0; k < quarterTopUpTries && (nt + addT < quarterMinTrees || nr + addR < quarterMinRocks); k++) {
             float a = ang(reseed), r = rad(reseed);
             Vector2f c = quarterCentre(q) + Vector2f(cos(a), sin(a)) * r;
@@ -9458,6 +9584,7 @@ int main() {
                 shinobiTick(barbs, squares, houseshapes, octs, shinobiPuffs);
                 treespawn(trees, tris, stumps, fields, houses, barbs);
                 barbspawner(squares, barbs, houses, houseshapes, birthRings);
+                quarterReachTick(barbs);   // R47-F10: after births, so a new barb can earn a step the same tick
                 birthRingTick(birthRings);
                 catchRingTick(catchRings);
                 deerspawn(deers, deershape);
@@ -9618,6 +9745,7 @@ int main() {
 	}
 	drawBirthRings(window, birthRings);
 	drawCatchRings(window, catchRings);
+	drawQuarterPulses(window);   // R47-F10: step dust ring, world layer under the overlay
 	drawShinobiPuffs(window, shinobiPuffs);   // world layer, under the day/night overlay
 	if (!paused) shinobiPuffTick(shinobiPuffs);
 
@@ -9666,6 +9794,7 @@ int main() {
                 hover = pickHover(mworld, tooltipPickRadius / zoom, barbs, squares, activeTrader, wolves, deers, deershape, rocks, octs, bushes, bushshapes, houses, houseshapes, fields, stores);
                 if (hover && hover->targetPos && hover->rect && hover->hoveredBarb != selectedBarbId)   // R44-F1: selected one drawn above
                     drawTargetLine(window, worldView, hover->rect->getPosition() + hover->rect->getSize() / 2.0f, *hover->targetPos, zoom, frameCount);
+                if (hover && hover->hoveredCrate >= 0) drawQuarterReachRing(window, worldView, hover->hoveredCrate, zoom);   // R47-F10: under the outline
                 if (hover) drawHoverOutline(window, worldView, *hover, zoom);
                 if (hover) drawHousehold(window, worldView, *hover, zoom, barbs, squares, houses, houseshapes);
             }
