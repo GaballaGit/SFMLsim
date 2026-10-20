@@ -1026,6 +1026,17 @@ const unsigned quarterReseedSeed = 3001;     // fixed seed (+ race) so the top-u
 const float quarterRingMinZoom = 2.0f;       // ring hidden below this zoom
 const float quarterRingDotGap = 6.0f;        // world px between ring dots (1px each)
 const uint8_t quarterRingAlpha = 30;         // very faint, in the race's crate colour
+// R44-F4a Outlying Homesteads: every homesteadEvery-th house a race claims is tried as a lone homestead in a wider ring
+// houseSpreadNear..houseSpreadFar px from its crate centre, on the side facing away from villageCenter (within
+// homesteadArc of straight out). Up to homesteadTries spots per claim; if none passes, the normal quarter disc is used.
+// Quarter radii (quarterMin/MaxRadius, quarterHouseRadius) are unchanged in this phase.
+const float houseSpreadNear = 90.0f;         // homestead distance from the crate centre
+const float houseSpreadFar = 130.0f;
+const int homesteadEvery = 4;                // every 4th house of a race is tried as a homestead
+const float homesteadArc = 1.0471976f;       // +-60 deg around the crate's outward direction
+const int homesteadTries = 12;               // spots rolled per claim before falling back to the quarter disc
+const float homesteadHouseGap = 30.0f;       // no homestead within this of any house (or pending house spot), any race
+const float homesteadClutterPad = 2.0f;      // grass kept between the slab and a tree/rock/bush footprint
 
 // Lakes (R19-F2): static ponds placed once at startup. Static rect + rim only in v1 (no glint/ripples).
 // Only wander paths (barbs, deer) avoid lakes; task paths (chop/mine/build/hunt/flee/wolves) are straight lines and may cross
@@ -1632,12 +1643,17 @@ void appendDot(VertexArray& va, Vector2f p, Color col) {
 }
 
 // Startup layout check: crates far enough apart, each quarter inside the map (below the HUD) and clear of the village clearing
+// R44-F4a: shared by quarterLayoutOk() and homestead placement: a disc of radius rad at c lies inside the map (below the
+// HUD) and clear of the village clearing
+bool layoutDiscOk(Vector2f c, float rad) {
+    if (c.x - rad < 0.0f || c.x + rad > worldSize || c.y - rad < hudBarHeight || c.y + rad > worldSize) return false;
+    return hypot(c.x - villageCenter.x, c.y - villageCenter.y) >= sqrt(clearRadiusSq) + rad;
+}
+
 bool quarterLayoutOk() {
     for (int a = 0; a < raceCount; a++) {
         Vector2f c = quarterCentre(a);
-        if (c.x - quarterClearRadius < 0.0f || c.x + quarterClearRadius > worldSize
-            || c.y - quarterClearRadius < hudBarHeight || c.y + quarterClearRadius > worldSize) return false;
-        if (hypot(c.x - villageCenter.x, c.y - villageCenter.y) < sqrt(clearRadiusSq) + quarterClearRadius) return false;
+        if (!layoutDiscOk(c, quarterClearRadius)) return false;
         for (int b = a + 1; b < raceCount; b++) {
             Vector2f d = storehousePos[a] - storehousePos[b];
             if (hypot(d.x, d.y) < raceMinSeparation) return false;
@@ -4323,10 +4339,12 @@ bool roadClearOfFields(const fieldGrid& fields, Vector2f a, Vector2f b) {
 // R43-F1: seeds race r's quarter road as real trail cells: an integer 4-connected grid walk from the crate's cell to
 // the nearest own house's cell. Each in-bounds cell that is not paved and not over a plot/mill zone is raised to
 // trailPathThreshold + trailSeedBoost (never lowered), then decays like any trail. Called only on crate/house placement.
-void seedQuarterTrail(int r, const vector<house>& houses, const fieldGrid& fields) {
+// R44-F4a: with `to` set, the walk goes to that point instead (a homestead's own road).
+void seedQuarterTrail(int r, const vector<house>& houses, const fieldGrid& fields, const Vector2f* to = nullptr) {
     if (r < 0 || r >= raceCount) return;
     Vector2f best;
-    if (!nearestQuarterHouse(r, houses, best)) return;
+    if (to) best = *to;
+    else if (!nearestQuarterHouse(r, houses, best)) return;
     int c0 = trailCell(quarterCentre(r)), c1 = trailCell(best);
     if (c0 < 0 || c1 < 0) return;
     int x = c0 % trailGridN, y = c0 / trailGridN, x1 = c1 % trailGridN, y1 = c1 / trailGridN;
@@ -4351,8 +4369,74 @@ void seedQuarterTrail(int r, const vector<house>& houses, const fieldGrid& field
     printf("QUARTER TRAIL SEEDED - %s, %d cells\n", raceDefs[r].name, seeded);
 }
 
+// R44-F4a: a house is a homestead if it stands outside its race's quarter disc
+bool isHomestead(const house& h) {
+    if (h.race < 0 || h.race >= raceCount) return false;
+    Vector2f d = Vector2f((float)h.x + 2.0f, (float)h.y + 2.0f) - quarterCentre(h.race);
+    return d.x * d.x + d.y * d.y > quarterClearRadius * quarterClearRadius;
+}
+
+// R44-F4a: the checks every house spot (tx,ty = top-left of the 4px house) must pass: no overlap with other house slabs,
+// reserved buildings, water or plots, and a quarter road from crate centre qc that misses plots, smokehouse and keep
+bool houseSpotOk(const vector<barb>& barbs, const vector<house>& houses, const fieldGrid& fields, int race, Vector2f qc, int tx, int ty) {
+    FloatRect slab(Vector2f(tx - 3.0f, ty - 3.0f), houseSlabSize);
+    Vector2f door(tx + 2.0f, ty + 2.0f);
+    if (!houseSpotFree(barbs, houses, tx, ty)) return false;  // packed quarter: no overlapping houses
+    if (!forgeClear(slab)) return false;                      // house + roof + slab
+    if (!lakeClear(slab)) return false;                       // same footprint, no houses in the water
+    if (!fieldsClear(fields, slab)) return false;             // nor on a wheat plot
+    if (!roadClearOfFields(fields, qc, door)) return false;   // FARM-F1: its road can't cross one
+    {   // INBOX2-F1: nor its own race's smokehouse
+        FloatRect h = smokehouseRect(race);
+        FloatRect pad(h.position - Vector2f(smokehouseRoadPadPx, smokehouseRoadPadPx), h.size + Vector2f(2 * smokehouseRoadPadPx, 2 * smokehouseRoadPadPx));
+        if (segmentHitsRect(qc, door, pad)) return false;
+    }
+    {   // R31-F1: nor its own race's keep
+        FloatRect z = keepZone(race);
+        FloatRect pad(z.position - Vector2f(keepRoadPadPx, keepRoadPadPx), z.size + Vector2f(2 * keepRoadPadPx, 2 * keepRoadPadPx));
+        if (segmentHitsRect(qc, door, pad)) return false;
+    }
+    return true;
+}
+
+// R44-F4a: extra checks for a homestead spot outside the quarter: map/HUD bounds and village clearing (shared with
+// quarterLayoutOk), homesteadHouseGap from every house and pending house spot, out of other races' quarters, no
+// tree/rock/bush on the slab, and a dry walk from the crate (reachable, not orphaned behind a lake)
+bool homesteadSpotOk(const vector<barb>& barbs, const vector<house>& houses, int race, Vector2f qc, int tx, int ty,
+                     const vector<tree>& trees, const vector<rock>& rocks, const vector<CircleShape>& bushshapes) {
+    Vector2f c(tx + 2.0f, ty + 2.0f);
+    if (!layoutDiscOk(c, houseSlabSize.x / 2.0f + homesteadClutterPad)) return false;
+    const float gapSq = homesteadHouseGap * homesteadHouseGap;
+    for (auto& h : houses) {
+        Vector2f d = c - Vector2f(h.x + 2.0f, h.y + 2.0f);
+        if (d.x * d.x + d.y * d.y < gapSq) return false;
+    }
+    for (auto& o : barbs) {
+        if (!(o.movingbspot && o.jobKind == jobNone)) continue;   // another barb's pending house spot (claims race each other)
+        Vector2f d = c - Vector2f(o.targetx + 2.0f, o.targety + 2.0f);
+        if (d.x * d.x + d.y * d.y < gapSq) return false;
+    }
+    for (int r = 0; r < raceCount; r++) {
+        if (r == race) continue;
+        Vector2f d = c - quarterCentre(r);
+        float m = quarterClearRadius + homesteadHouseGap;
+        if (d.x * d.x + d.y * d.y < m * m) return false;
+    }
+    FloatRect slab(Vector2f(tx - 3.0f - homesteadClutterPad, ty - 3.0f - homesteadClutterPad),
+                   houseSlabSize + Vector2f(2 * homesteadClutterPad, 2 * homesteadClutterPad));
+    for (auto& t : trees)
+        if (slab.findIntersection(FloatRect(Vector2f((float)t.x, (float)t.y), Vector2f(treeFootprint, treeFootprint)))) return false;
+    for (auto& k : rocks)
+        if (slab.findIntersection(FloatRect(Vector2f((float)k.x, (float)k.y), Vector2f(12.0f, 12.0f)))) return false; // 6px-radius pentagon
+    for (auto& bs : bushshapes)
+        if (slab.findIntersection(bs.getGlobalBounds())) return false;
+    Vector2f from = qc - houseSlabSize / 2.0f;   // lakeClear's path test works in slab top-left coordinates
+    if (!lakeClear(FloatRect(Vector2f(tx - 3.0f, ty - 3.0f), houseSlabSize), &from)) return false;
+    return true;
+}
+
 void buildhouse(vector<barb>& barbs,vector<RectangleShape>& squares, vector<house>& houses, vector<RectangleShape>& houseshapes, const fieldGrid& fields,
-                const storehouse (&stores)[raceCount]) {
+                const storehouse (&stores)[raceCount], const vector<tree>& trees, const vector<rock>& rocks, const vector<CircleShape>& bushshapes) {
     bool canclaim = (int)houses.size() < (int)barbs.size();
     for (int i = 0; i < (int)squares.size(); i++) {
         auto& sq = squares[i];
@@ -4363,24 +4447,35 @@ void buildhouse(vector<barb>& barbs,vector<RectangleShape>& squares, vector<hous
         if (!b.movingbspot && !b.moving) {
             if (b.race < 0 || b.race >= raceCount) continue;
             if (!canclaim || !canAfford(stockOf(b), houseWoodCost, 0)) continue;   // RACE-F1: the builder's race pays
-            int dx = quarterSpotD(gen), dy = quarterSpotD(gen);
-            if (dx * dx + dy * dy > quarterHouseRadius * quarterHouseRadius) continue; // R30-F1: inside the own quarter's disc
             Vector2f qc = quarterCentre(b.race);
-            int tx = (int)qc.x + dx, ty = (int)qc.y + dy;
-            if (!houseSpotFree(barbs, houses, tx, ty)) continue;  // packed quarter: no overlapping houses
-            if (!forgeClear(FloatRect(Vector2f(tx - 3.0f, ty - 3.0f), houseSlabSize))) continue; // house + roof + slab; reroll next tick
-            if (!lakeClear(FloatRect(Vector2f(tx - 3.0f, ty - 3.0f), houseSlabSize))) continue;  // same footprint, no houses in the water
-            if (!fieldsClear(fields, FloatRect(Vector2f(tx - 3.0f, ty - 3.0f), houseSlabSize))) continue; // nor on a wheat plot
-            if (!roadClearOfFields(fields, qc, Vector2f(tx + 2.0f, ty + 2.0f))) continue; // FARM-F1: its road can't cross one
-            {   // INBOX2-F1: nor its own race's smokehouse
-                FloatRect h = smokehouseRect(b.race);
-                FloatRect pad(h.position - Vector2f(smokehouseRoadPadPx, smokehouseRoadPadPx), h.size + Vector2f(2 * smokehouseRoadPadPx, 2 * smokehouseRoadPadPx));
-                if (segmentHitsRect(qc, Vector2f(tx + 2.0f, ty + 2.0f), pad)) continue;
+            int tx = 0, ty = 0;
+            bool homestead = false, triedHomestead = false;
+            int own = 0;   // R44-F4a: this race's houses, standing or claimed
+            for (auto& h : houses) if (h.race == b.race) own++;
+            for (auto& o : barbs) if (o.race == b.race && o.movingbspot && o.jobKind == jobNone) own++;
+            if ((own + 1) % homesteadEvery == 0) {
+                Vector2f out = qc - villageCenter;
+                float base = atan2(out.y, out.x);
+                uniform_real_distribution<float> arc(-homesteadArc, homesteadArc), spread(houseSpreadNear, houseSpreadFar);
+                for (int k = 0; k < homesteadTries && !homestead; k++) {
+                    float a = base + arc(gen), r = spread(gen);
+                    tx = (int)floor(qc.x + cos(a) * r) - 2;   // house top-left; its centre is +2
+                    ty = (int)floor(qc.y + sin(a) * r) - 2;
+                    homestead = homesteadSpotOk(barbs, houses, b.race, qc, tx, ty, trees, rocks, bushshapes)
+                             && houseSpotOk(barbs, houses, fields, b.race, qc, tx, ty);
+                }
+                triedHomestead = !homestead;
             }
-            {   // R31-F1: nor its own race's keep
-                FloatRect z = keepZone(b.race);
-                FloatRect pad(z.position - Vector2f(keepRoadPadPx, keepRoadPadPx), z.size + Vector2f(2 * keepRoadPadPx, 2 * keepRoadPadPx));
-                if (segmentHitsRect(qc, Vector2f(tx + 2.0f, ty + 2.0f), pad)) continue;
+            if (!homestead) {
+                int dx = quarterSpotD(gen), dy = quarterSpotD(gen);
+                if (dx * dx + dy * dy > quarterHouseRadius * quarterHouseRadius) continue; // R30-F1: inside the own quarter's disc
+                tx = (int)qc.x + dx; ty = (int)qc.y + dy;
+                if (!houseSpotOk(barbs, houses, fields, b.race, qc, tx, ty)) continue;     // reroll next tick
+                if (triedHomestead)   // logged once, on the fallback claim itself
+                    printf("HOMESTEAD - %s: no spot in %d tries, built in the quarter instead\n", raceDefs[b.race].name, homesteadTries);
+            } else {
+                printf("HOMESTEAD CLAIMED - %s at (%d, %d), %.0fpx from the crate\n", raceDefs[b.race].name, tx, ty,
+                       hypot(tx + 2.0f - qc.x, ty + 2.0f - qc.y));
             }
             raceStock& rs = stockOf(b);
             b.reservedwood = true;
@@ -4419,12 +4514,18 @@ void buildhouse(vector<barb>& barbs,vector<RectangleShape>& squares, vector<hous
                     hs.setOutlineColor(Color(54, 35, 16));
                     hs.setOutlineThickness(1);
                     houseshapes.push_back(hs);
-                    if (h.race >= 0 && h.race < raceCount && stores[h.race].built)
+                    bool far = isHomestead(h);   // R44-F4a
+                    if (h.race >= 0 && h.race < raceCount && stores[h.race].built) {
                         seedQuarterTrail(h.race, houses, fields);   // R43-F1: only on placement, never per tick
+                        if (far) {   // R44-F4a: a homestead gets its own road from the crate
+                            Vector2f c(h.x + 2.0f, h.y + 2.0f);
+                            seedQuarterTrail(h.race, houses, fields, &c);
+                        }
+                    }
                     b.building = b.moving = b.movingbspot = false; clearRoute(b);
                     b.timer = 0;
-		            printf("---HOUSE BUILT---\n");
-                    logEvent("House built");
+		            printf(far ? "---HOMESTEAD BUILT---\n" : "---HOUSE BUILT---\n");
+                    logEvent(far ? "Homestead built" : "House built");
                 }
             } else {
                 walkStep(b, sq);   // R39-F1
@@ -4795,6 +4896,8 @@ void buildstorehouses(vector<barb>& barbs, vector<RectangleShape>& squares, cons
             st.claimed = false;
             printf("---STOREHOUSE BUILT--- %s (%d wood)\n", raceDefs[r].name, storehouseWoodCost);
             seedQuarterTrail(r, houses, fields);   // R43-F1: crate placed -> seed its trail to the nearest house, once
+            for (auto& h : houses)                 // R44-F4a: and to each homestead built before the crate
+                if (h.race == r && isHomestead(h)) { Vector2f c(h.x + 2.0f, h.y + 2.0f); seedQuarterTrail(r, houses, fields, &c); }
             logEvent(string(racePlurals[r]) + " build a storehouse");
         }
         if (st.claimed) return;   // one under construction at a time
@@ -7354,7 +7457,8 @@ CircleShape makeTreeTri(int x, int y) {
     return tri;
 }
 
-void treespawn(vector<tree>& trees, vector<CircleShape>& tris, vector<RectangleShape>& stumps, const fieldGrid& fields) {
+void treespawn(vector<tree>& trees, vector<CircleShape>& tris, vector<RectangleShape>& stumps, const fieldGrid& fields,
+               const vector<house>& houses, const vector<barb>& barbs) {
     if (treespawnChance(gen) != 0) return;
     tree t{distrib(gen), distrib(gen), false};
     // R44-F3: reroll toward the frontier; the last roll stands after groveMaxRetries
@@ -7368,6 +7472,15 @@ void treespawn(vector<tree>& trees, vector<CircleShape>& tris, vector<RectangleS
     if (!lakeClear(FloatRect(Vector2f(t.x, t.y), Vector2f(treeFootprint, treeFootprint)))) return; // no trees in the water
     if (!fieldsClear(fields, FloatRect(Vector2f(t.x, t.y), Vector2f(treeFootprint, treeFootprint)))) return; // nor on a wheat plot
     if (!towerClear(FloatRect(Vector2f(t.x, t.y), Vector2f(treeFootprint, treeFootprint)))) return;  // R33-F2: nor on a gate tower
+    {   // R44-F4a: nor on a homestead (or its pending spot) out past the quarter clearing
+        FloatRect tr(Vector2f(t.x - homesteadClutterPad, t.y - homesteadClutterPad),
+                     Vector2f(treeFootprint + 2 * homesteadClutterPad, treeFootprint + 2 * homesteadClutterPad));
+        for (auto& h : houses)
+            if (tr.findIntersection(FloatRect(Vector2f(h.x - 3.0f, h.y - 3.0f), houseSlabSize))) return;
+        for (auto& o : barbs)
+            if (o.movingbspot && o.jobKind == jobNone
+                && tr.findIntersection(FloatRect(Vector2f(o.targetx - 3.0f, o.targety - 3.0f), houseSlabSize))) return;
+    }
     trees.push_back(t);
 
     tris.push_back(makeTreeTri(t.x, t.y));
@@ -7778,7 +7891,7 @@ int main() {
             if (ticksThisFrame >= maxTicksPerFrame) { timesincelastupdate = Time::Zero; break; }
             ticksThisFrame++;
             for (int rep = 0; rep < simSpeed; rep++) {
-                buildhouse(barbs, squares, houses, houseshapes, fields, stores);
+                buildhouse(barbs, squares, houses, houseshapes, fields, stores, trees, rocks, bushshapes);
                 buildshrine(barbs, squares, houses, shrines, fields);
                 buildsmokehouse(barbs, squares, houses, stores, smoke);
                 buildstall(barbs, squares);
@@ -7796,7 +7909,7 @@ int main() {
                 barbmove(squares, barbs);
                 shaftTick(barbs);   // R40-F1: dust puffs and lintel flash
                 shinobiTick(barbs, squares, houseshapes, octs, shinobiPuffs);
-                treespawn(trees, tris, stumps, fields);
+                treespawn(trees, tris, stumps, fields, houses, barbs);
                 barbspawner(squares, barbs, houses, houseshapes, birthRings);
                 birthRingTick(birthRings);
                 catchRingTick(catchRings);
