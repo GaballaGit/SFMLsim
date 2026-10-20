@@ -327,6 +327,9 @@ const int trailPathAlphaMin = 40, trailPathAlphaMax = 70;    // path tier: wear 
 const int trailRoadAlphaMin = 70, trailRoadAlphaMax = 110;   // road tier: wear trailRoadThreshold..trailMaxWear
 const int trailTierHysteresis = 8;   // a cell drops a tier only once wear falls this far below the threshold
 const int trailWearBucket = 8;       // drawTrails is rebuilt only when a cell's wear crosses one of these buckets
+// R43-F1: a crate/house placement seeds its quarter trail at trailPathThreshold + trailSeedBoost (= 80): faint path tier
+// (alpha ~50, under any worn path's top end), drops out of the path tint after ~80s unused (~40s in rain), gone in ~160s
+const int trailSeedBoost = 32;
 
 // Cobbled roads (R20-F2): from the Hamlet era an idle barb paves road-tier trail cells near the campfire; paved cells never decay
 const int paveScanTicks = 600;             // look for a new cell to pave this often (only while nobody is paving)
@@ -988,7 +991,6 @@ const unsigned quarterReseedSeed = 3001;     // fixed seed (+ race) so the top-u
 const float quarterRingMinZoom = 2.0f;       // ring hidden below this zoom
 const float quarterRingDotGap = 6.0f;        // world px between ring dots (1px each)
 const uint8_t quarterRingAlpha = 30;         // very faint, in the race's crate colour
-const Color quarterRoadColor(150, 125, 85, 56); // 1px crate -> nearest house trail: trail brown, dim
 
 // Lakes (R19-F2): static ponds placed once at startup. Static rect + rim only in v1 (no glint/ripples).
 // Only wander paths (barbs, deer) avoid lakes; task paths (chop/mine/build/hunt/flee/wolves) are straight lines and may cross
@@ -1571,7 +1573,6 @@ bool forgeClear(const FloatRect& r) {
 // R30-F1: race quarters
 Vector2f quarterCentre(int r) { return storehousePos[r] + storehouseSize / 2.0f; }
 VertexArray quarterRingVerts(PrimitiveType::Triangles);   // dotted rings, built once in placeQuarters()
-VertexArray quarterRoads[raceCount];                      // crate -> nearest own house, rebuilt only when a house is built
 
 // True if a tree/rock at top-left p is inside the village clearing or any race quarter's clearing (removed every frame)
 bool inClearing(Vector2f p) {
@@ -4132,7 +4133,6 @@ bool houseSpotFree(const vector<barb>& barbs, const vector<house>& houses, int t
     return true;
 }
 
-// R30-F1: 1px pixel line from race r's crate centre to the nearest house of that race. Called only when a house is built.
 // Centre of race r's house nearest its crate centre (the quarter road's far end); false if the race has no house
 bool nearestQuarterHouse(int r, const vector<house>& houses, Vector2f& best) {
     Vector2f a = quarterCentre(r);
@@ -4158,19 +4158,39 @@ bool roadClearOfFields(const fieldGrid& fields, Vector2f a, Vector2f b) {
     return true;
 }
 
-void rebuildQuarterRoad(int r, const vector<house>& houses) {
+// R43-F1: seeds race r's quarter road as real trail cells: an integer 4-connected grid walk from the crate's cell to
+// the nearest own house's cell. Each in-bounds cell that is not paved and not over a plot/mill zone is raised to
+// trailPathThreshold + trailSeedBoost (never lowered), then decays like any trail. Called only on crate/house placement.
+void seedQuarterTrail(int r, const vector<house>& houses, const fieldGrid& fields) {
     if (r < 0 || r >= raceCount) return;
-    VertexArray& va = quarterRoads[r];
-    va.setPrimitiveType(PrimitiveType::Triangles);
-    va.clear();
-    Vector2f a = quarterCentre(r), best;
+    Vector2f best;
     if (!nearestQuarterHouse(r, houses, best)) return;
-    Vector2f d = best - a;
-    int n = max(1, (int)ceil(max(fabs(d.x), fabs(d.y))));   // one dot per step along the long axis: an unbroken 1px line
-    for (int i = 0; i <= n; i++) appendDot(va, a + d * ((float)i / n), quarterRoadColor);
+    int c0 = trailCell(quarterCentre(r)), c1 = trailCell(best);
+    if (c0 < 0 || c1 < 0) return;
+    int x = c0 % trailGridN, y = c0 / trailGridN, x1 = c1 % trailGridN, y1 = c1 / trailGridN;
+    int dx = abs(x1 - x), dy = abs(y1 - y), sx = x1 > x ? 1 : -1, sy = y1 > y ? 1 : -1;
+    const int seedWear = trailPathThreshold + trailSeedBoost;
+    int seeded = 0;
+    for (int ix = 0, iy = 0;;) {
+        if (x >= 0 && y >= 0 && x < trailGridN && y < trailGridN) {
+            int c = y * trailGridN + x;
+            Vector2f lo((float)x * trailCellSize, (float)y * trailCellSize), hi = lo + Vector2f(trailCellSize, trailCellSize);
+            if (!trailPaved[c] && trailWear[c] < seedWear
+                && roadClearOfFields(fields, lo, hi) && roadClearOfFields(fields, Vector2f(hi.x, lo.y), Vector2f(lo.x, hi.y))) {
+                trailWear[c] = seedWear;
+                trailSetTier(c);
+                seeded++;
+            }
+        }
+        if (ix >= dx && iy >= dy) break;
+        // step the axis whose next cell boundary the crate->house line crosses first (ties go to y)
+        if ((1 + 2 * ix) * dy < (1 + 2 * iy) * dx) { x += sx; ix++; } else { y += sy; iy++; }
+    }
+    printf("QUARTER TRAIL SEEDED - %s, %d cells\n", raceDefs[r].name, seeded);
 }
 
-void buildhouse(vector<barb>& barbs,vector<RectangleShape>& squares, vector<house>& houses, vector<RectangleShape>& houseshapes, const fieldGrid& fields) {
+void buildhouse(vector<barb>& barbs,vector<RectangleShape>& squares, vector<house>& houses, vector<RectangleShape>& houseshapes, const fieldGrid& fields,
+                const storehouse (&stores)[raceCount]) {
     bool canclaim = (int)houses.size() < (int)barbs.size();
     for (int i = 0; i < (int)squares.size(); i++) {
         auto& sq = squares[i];
@@ -4237,7 +4257,8 @@ void buildhouse(vector<barb>& barbs,vector<RectangleShape>& squares, vector<hous
                     hs.setOutlineColor(Color(54, 35, 16));
                     hs.setOutlineThickness(1);
                     houseshapes.push_back(hs);
-                    rebuildQuarterRoad(h.race, houses);   // R30-F1: only here, never per tick
+                    if (h.race >= 0 && h.race < raceCount && stores[h.race].built)
+                        seedQuarterTrail(h.race, houses, fields);   // R43-F1: only on placement, never per tick
                     b.building = b.moving = b.movingbspot = false; clearRoute(b);
                     b.timer = 0;
 		            printf("---HOUSE BUILT---\n");
@@ -4585,7 +4606,8 @@ void drawForge(RenderWindow& window, const forge& fg, int frame, bool bonusPendi
 // R29-F1: runs after buildforge(). One storehouse per race, built through buildOneOff() by a barb of that race once the
 // race has a house of its own. All share jobStore, so only one is under construction at a time; if its builder is lost
 // before finishing (no barb holds jobStore), the claim is released.
-void buildstorehouses(vector<barb>& barbs, vector<RectangleShape>& squares, const vector<house>& houses, storehouse (&stores)[raceCount]) {
+void buildstorehouses(vector<barb>& barbs, vector<RectangleShape>& squares, const vector<house>& houses, storehouse (&stores)[raceCount],
+                      const fieldGrid& fields) {
     bool held = false;
     for (auto& b : barbs) if (b.jobKind == jobStore) held = true;
     int active = -1;
@@ -4610,6 +4632,7 @@ void buildstorehouses(vector<barb>& barbs, vector<RectangleShape>& squares, cons
             st.built = true;
             st.claimed = false;
             printf("---STOREHOUSE BUILT--- %s (%d wood)\n", raceDefs[r].name, storehouseWoodCost);
+            seedQuarterTrail(r, houses, fields);   // R43-F1: crate placed -> seed its trail to the nearest house, once
             logEvent(string(racePlurals[r]) + " build a storehouse");
         }
         if (st.claimed) return;   // one under construction at a time
@@ -4723,11 +4746,9 @@ void shaftTick(const vector<barb>& barbs) {
 
 // R29-F1: 10x10 race-coloured crate (R36-F1: lidded, see drawStorehouses). The fill eases toward white
 // for a moment after each deposit. Drawn with the forge, under barbs and trees.
-// R30-F1: ground layer. Each standing crate's 1px road to its race's nearest house (prebuilt on house build), then the
-// faint dotted quarter rings at zoom >= quarterRingMinZoom (at 1x a 1px dot ring is just noise).
-void drawQuarters(RenderWindow& window, const storehouse (&stores)[raceCount], float zoom) {
-    for (int r = 0; r < raceCount; r++)
-        if (stores[r].built && quarterRoads[r].getVertexCount() > 0) window.draw(quarterRoads[r]);
+// R30-F1: ground layer, the faint dotted quarter rings at zoom >= quarterRingMinZoom (at 1x a 1px dot ring is just
+// noise). R43-F1: the crate -> house road is now seeded trail cells (seedQuarterTrail), drawn by drawTrails.
+void drawQuarters(RenderWindow& window, float zoom) {
     if (zoom >= quarterRingMinZoom && quarterRingVerts.getVertexCount() > 0) window.draw(quarterRingVerts);
 }
 
@@ -7564,12 +7585,12 @@ int main() {
             if (ticksThisFrame >= maxTicksPerFrame) { timesincelastupdate = Time::Zero; break; }
             ticksThisFrame++;
             for (int rep = 0; rep < simSpeed; rep++) {
-                buildhouse(barbs, squares, houses, houseshapes, fields);
+                buildhouse(barbs, squares, houses, houseshapes, fields, stores);
                 buildshrine(barbs, squares, houses, shrines, fields);
                 buildsmokehouse(barbs, squares, houses, stores, smoke);
                 buildstall(barbs, squares);
                 buildforge(barbs, squares, houses, dwarfForge);
-                buildstorehouses(barbs, squares, houses, stores);
+                buildstorehouses(barbs, squares, houses, stores, fields);
                 buildshafts(barbs, squares, stores);   // R34-F1
                 buildfield(barbs, squares, houses, shrines, stores, fields);
                 buildmills(barbs, squares, fields);   // FARM-F2
@@ -7646,7 +7667,7 @@ int main() {
         drawTrails(window, trailVerts);
         drawWalls(window, wallVerts);    // R31-F2: under paving, quarter marks, buildings and barbs
         drawPaving(window, paveVerts);   // over the trail tint, under everything else
-        drawQuarters(window, stores, zoom);   // R30-F1: ground marks, under lakes, houses and crates
+        drawQuarters(window, zoom);   // R30-F1: ground marks, under lakes, houses and crates
         drawLakes(window);
         drawLens(window, lensVerts, worldView, lens, barbs, squares, houses, houseshapes, stores);   // UIO-F3: under rocks, buildings and barbs
 
