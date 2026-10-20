@@ -484,6 +484,37 @@ const Color houseWindowGlowColor(90, 60, 20, 255); // additive, so this is a gen
 const Color houseRoofDwarfColor(108, 106, 98);   // muted stone grey
 const Color houseChimneyDwarfColor(70, 68, 64);  // darker stone stack
 const Color houseRoofElfColor(146, 172, 128);    // pale sage green, a shade darker than the elf hat
+// R41-F1: race walls, doors and windows (same 6x4 wall footprint; offsets from the 4x4 house shape like the above).
+// Human: timber tan walls (houseWallColor), 2x2 door split into two 1px planks, 1x1 window (houseWindowPos/Size).
+const Color houseDoorPlankColor(92, 62, 36);     // right plank, a step lighter than houseDoorColor
+// Dwarf: cool ashlar grey, lighter and bluer than rocks (128,126,118) and the dwarf roof (108), with a darker footing row
+const Color houseWallDwarfColor(152, 152, 160);
+const Color houseFootingDwarfColor(104, 104, 112); // 1px course along the wall base
+const Vector2f houseDoorDwarfPos(0.0f, 2.0f);    // dark 2x3 arched door: top row is the lighter arch shadow
+const Vector2f houseDoorDwarfSize(2.0f, 3.0f);
+const Color houseDoorDwarfColor(30, 28, 30);
+const Color houseArchDwarfColor(66, 62, 60);
+const Vector2f houseWindowDwarfPos(3.0f, 2.0f);  // 1x2 slit window, 1px in from the right wall edge
+const Vector2f houseWindowDwarfSize(1.0f, 2.0f);
+// Elf: pale birch walls with two dark bark knots, a rounded lantern-green door (3x2 plus a 1px crown), 2x1 window
+const Color houseWallElfColor(214, 208, 186);
+const Color houseKnotElfColor(96, 92, 80);
+const Vector2f houseKnotElfPos[2] = {{-1.0f, 2.0f}, {4.0f, 4.0f}};
+const Vector2f houseDoorElfPos(0.0f, 3.0f);
+const Vector2f houseDoorElfSize(3.0f, 2.0f);
+const Vector2f houseDoorElfCrownPos(1.0f, 2.0f); // 1x1 on top of the door's middle column: the round top
+const Color houseDoorElfColor(84, 134, 80);      // lantern green: darker and more saturated than the sage roof
+const Vector2f houseWindowElfPos(3.0f, 2.0f);
+const Vector2f houseWindowElfSize(2.0f, 1.0f);
+// Night lamp colour and additive halo per race (drawHouseLights), glowing only around each style's window rect
+const Color houseWindowNightDwarfColor(236, 146, 72);  // forge orange
+const Color houseWindowGlowDwarfColor(90, 44, 16, 255);
+const Color houseWindowNightElfColor(196, 232, 150);   // pale lantern green
+const Color houseWindowGlowElfColor(52, 80, 36, 255);
+// Ranges into buildingParts for each race's walls/door/window (checked by the static_assert after the table)
+const int houseBodyHumanFirst = 22, houseBodyHumanCount = 4;
+const int houseBodyDwarfFirst = houseBodyHumanFirst + houseBodyHumanCount, houseBodyDwarfCount = 5;
+const int houseBodyElfFirst = houseBodyDwarfFirst + houseBodyDwarfCount, houseBodyElfCount = 6;
 const int houseStyleMaxRows = 4;
 struct houseStyle {
     int rows;
@@ -492,15 +523,21 @@ struct houseStyle {
     float top;                       // y of the first roof row
     Color roof;
     Vector2f chimneyPos, chimneySize; // 0x0 = no chimney
+    int bodyFirst, bodyCount;        // R41-F1: this race's walls/door/window in buildingParts
+    Vector2f windowPos, windowSize;  // must match the window part in that range
+    Color windowNight, windowGlow;
 };
 const houseStyle houseStyles[raceCount] = {
     // Human: the original 3-row stepped brick roof
     {houseRoofRows, {houseRoofLeft[0], houseRoofLeft[1], houseRoofLeft[2]}, {houseRoofWidth[0], houseRoofWidth[1], houseRoofWidth[2]},
-     houseRoofTop, houseRoofColor, {0.0f, 0.0f}, {0.0f, 0.0f}},
+     houseRoofTop, houseRoofColor, {0.0f, 0.0f}, {0.0f, 0.0f},
+     houseBodyHumanFirst, houseBodyHumanCount, houseWindowPos, houseWindowSize, houseWindowNightColor, houseWindowGlowColor},
     // Dwarf: squat 2-row flat roof with a 1x2 chimney on the right
-    {2, {-1.0f, -2.0f}, {6.0f, 8.0f}, -1.0f, houseRoofDwarfColor, {3.0f, -3.0f}, {1.0f, 2.0f}},
+    {2, {-1.0f, -2.0f}, {6.0f, 8.0f}, -1.0f, houseRoofDwarfColor, {3.0f, -3.0f}, {1.0f, 2.0f},
+     houseBodyDwarfFirst, houseBodyDwarfCount, houseWindowDwarfPos, houseWindowDwarfSize, houseWindowNightDwarfColor, houseWindowGlowDwarfColor},
     // Elf: tall 4-row pointed roof
-    {4, {1.0f, 0.0f, -1.0f, -2.0f}, {2.0f, 4.0f, 6.0f, 8.0f}, -3.0f, houseRoofElfColor, {0.0f, 0.0f}, {0.0f, 0.0f}},
+    {4, {1.0f, 0.0f, -1.0f, -2.0f}, {2.0f, 4.0f, 6.0f, 8.0f}, -3.0f, houseRoofElfColor, {0.0f, 0.0f}, {0.0f, 0.0f},
+     houseBodyElfFirst, houseBodyElfCount, houseWindowElfPos, houseWindowElfSize, houseWindowNightElfColor, houseWindowGlowElfColor},
 };
 
 // Shrine stones: build and placement only (no prayer yet). Houses always get first call on stone.
@@ -729,15 +766,31 @@ const partDef buildingParts[] = {
     {keepGatePos + Vector2f(0.0f, 1.0f), {keepGateSize.x, keepGateSize.y - 1.0f}, keepGateColor},
     // [21] house, fixed: ground shadow under the 6px walls (offsets from the 4x4 house shape)
     {houseWallPos + Vector2f(1.0f, houseWallSize.y), {houseWallSize.x, 1.0f}, buildingShadowColor},
-    // [22..24] house, fixed: walls, door, window (drawn after the race roof; drawHouseLights lights the window)
+    // R41-F1: per-race walls, door, window (drawn after the race roof; drawHouseLights lights the window from houseStyle)
+    // [22..25] human house, fixed: timber walls, two-plank door, 1x1 window
     {houseWallPos, houseWallSize, houseWallColor},
-    {houseDoorPos, houseDoorSize, houseDoorColor},
+    {houseDoorPos, {1.0f, houseDoorSize.y}, houseDoorColor},
+    {houseDoorPos + Vector2f(1.0f, 0.0f), {1.0f, houseDoorSize.y}, houseDoorPlankColor},
     {houseWindowPos, houseWindowSize, houseWindowDayColor},
+    // [26..30] dwarf house, fixed: ashlar walls, footing course, arched 2x3 door (arch row + dark door), slit window
+    {houseWallPos, houseWallSize, houseWallDwarfColor},
+    {houseWallPos + Vector2f(0.0f, houseWallSize.y - 1.0f), {houseWallSize.x, 1.0f}, houseFootingDwarfColor},
+    {houseDoorDwarfPos, {houseDoorDwarfSize.x, 1.0f}, houseArchDwarfColor},
+    {houseDoorDwarfPos + Vector2f(0.0f, 1.0f), houseDoorDwarfSize - Vector2f(0.0f, 1.0f), houseDoorDwarfColor},
+    {houseWindowDwarfPos, houseWindowDwarfSize, houseWindowDayColor},
+    // [31..36] elf house, fixed: birch walls, two bark knots, rounded door (body + crown), 2x1 window
+    {houseWallPos, houseWallSize, houseWallElfColor},
+    {houseKnotElfPos[0], {1.0f, 1.0f}, houseKnotElfColor},
+    {houseKnotElfPos[1], {1.0f, 1.0f}, houseKnotElfColor},
+    {houseDoorElfPos, houseDoorElfSize, houseDoorElfColor},
+    {houseDoorElfCrownPos, {1.0f, 1.0f}, houseDoorElfColor},
+    {houseWindowElfPos, houseWindowElfSize, houseWindowDayColor},
 };
 const partRange storeShadowParts{0, 1}, storeBodyParts{1, 4}, storeTrimParts{5, 1};
 const partRange keepShadowParts{6, 1}, keepStoneParts{7, 11}, keepTrimParts{18, 3};
-const partRange houseShadowParts{21, 1}, houseBodyParts{22, 3};
-static_assert(size(buildingParts) == 25, "partRange indices above must match the buildingParts table");
+const partRange houseShadowParts{21, 1};
+static_assert(houseBodyElfFirst + houseBodyElfCount == 37, "house body ranges must end the buildingParts table");
+static_assert(size(buildingParts) == 37, "partRange indices above must match the buildingParts table");
 // Curtain Wall and Gate (R31-F2): cosmetic only (no collision or pathing). Once a race's keep stands, a ring of
 // wallSlots arc slots centred on the keep gets one 2px-thick stone segment every wallRiseTicks, growing out from both
 // sides of a wallGateSlots-wide gate gap that faces the campfire. A slot whose arc would touch a building, plot, rock,
@@ -3004,23 +3057,27 @@ void drawHouses(RenderWindow& window, const vector<house>& houses, const vector<
         for (int k = 0; k < st.rows; k++)
             roof[k] = {Vector2f(st.left[k], st.top + k), Vector2f(st.width[k], 1.0f), k == st.rows - 1 ? partRampMid : partRampLight};
         drawParts(va, roof, st.rows, o, st.roof);
-        drawParts(va, houseBodyParts, o, Color::White);
+        drawParts(va, partRange{st.bodyFirst, st.bodyCount}, o, Color::White);   // R41-F1: race walls/door/window
     }
     if (va.getVertexCount() > 0) window.draw(va);
 }
 
-// Lit windows, drawn after the night overlay (which leaves the default view set) so they read as lamplight
-void drawHouseLights(RenderWindow& window, const View& worldView, const vector<RectangleShape>& houseshapes) {
+// Lit windows, drawn after the night overlay (which leaves the default view set) so they read as lamplight.
+// R41-F1: window rect, lamp and halo colour come from the house's race style.
+void drawHouseLights(RenderWindow& window, const View& worldView, const vector<house>& houses, const vector<RectangleShape>& houseshapes) {
     window.setView(worldView);
-    RectangleShape glow(houseWindowSize + Vector2f(2 * houseWindowGlowPx, 2 * houseWindowGlowPx));
-    glow.setFillColor(houseWindowGlowColor);
-    RectangleShape lamp(houseWindowSize);
-    lamp.setFillColor(houseWindowNightColor);
-    for (auto& hs : houseshapes) {
-        Vector2f w = snapPx(hs.getPosition()) + houseWindowPos;
-        glow.setPosition(w - Vector2f(houseWindowGlowPx, houseWindowGlowPx));
+    RectangleShape glow, lamp;
+    const Vector2f halo(houseWindowGlowPx, houseWindowGlowPx);
+    for (int i = 0; i < (int)houseshapes.size() && i < (int)houses.size(); i++) {
+        const houseStyle& st = houseStyles[clampRace(houses[i].race)];
+        Vector2f w = snapPx(houseshapes[i].getPosition()) + st.windowPos;
+        glow.setSize(st.windowSize + 2.0f * halo);
+        glow.setPosition(w - halo);
+        glow.setFillColor(st.windowGlow);
         window.draw(glow, BlendAdd);
+        lamp.setSize(st.windowSize);
         lamp.setPosition(w);
+        lamp.setFillColor(st.windowNight);
         window.draw(lamp);
     }
 }
@@ -7561,7 +7618,7 @@ int main() {
         drawOverlay(window, dnc, dncColor);
         if (raining) drawOverlay(window, dnc, rainOverlayColor);
         if (isNightHour(t)) drawCampfireGlow(window, worldView, fire, frameCount);
-        if (isNightHour(t)) drawHouseLights(window, worldView, houseshapes);
+        if (isNightHour(t)) drawHouseLights(window, worldView, houses, houseshapes);
         drawBallots(window, worldView, zoom, barbs, squares); // above the overlays so the pips read true; under hover marks
         if (ballotFramesLeft > 0 && !paused) ballotFramesLeft--;
         for (int k = 0; k < techCount; k++)
