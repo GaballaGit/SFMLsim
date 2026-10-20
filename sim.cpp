@@ -1181,6 +1181,65 @@ const float MM_RUIN_PX = 3.0f;
 const Color MM_RUIN_COLOR(206, 198, 176);
 const float MM_CAMP_PX = 2.0f;
 
+// R47-F4 Wayshrines, Huts and Wells: small sites scattered by band at startup (placePoi, after the ruins). Held in `pois`
+// with a parallel `poiShapes` footprint vector; both change only together (removePoi). A site is found when any barb
+// passes within poiDiscoverRadius or a party reaches it; a party searches it once for a small reward, and it is spent.
+// Spent sites stay dimmed for poiSpentLingerTicks, then crumble away (removePoi). Phase 1: huts and wells only.
+enum poiKind { poiHut, poiWell, poiKindCount };
+const char* const poiNames[poiKindCount] = {"hermit hut", "sunken well"};
+const Vector2f poiSizes[poiKindCount] = {Vector2f(5.0f, 4.0f), Vector2f(6.0f, 6.0f)};   // 5x4 lean-to, 6px ring
+const int poiBandCounts[zoneCount][poiKindCount] = {   // [band][kind]: none in the safe core, huts in the wilds, wells at the rocky edge
+    {0, 0},
+    {4, 2},
+    {1, 3},
+};
+const int poiPlaceTries = 300;             // per site; a site that finds no spot is skipped
+const float poiEdgeMargin = 16.0f;         // site centre from the map edges and the HUD strip
+const float poiMinGap = 150.0f;            // site centre -> any other site centre
+const float poiRuinGap = 90.0f;            // site centre -> ruin centre: clear of the cleared disc (40) and the ridge (50)
+const float poiQuarterGap = quarterResourceRadius + 60.0f; // site centre -> any crate
+const float poiClearPad = 4.0f;            // trees, rocks and bushes kept this far off a site's footprint (startup and regrowth)
+const float poiDiscoverRadius = 40.0f;     // a barb centre this close to a site centre finds it
+const int poiDiscoverEveryTicks = 30;      // the discovery scan runs this often (O(sites x barbs))
+const int poiSpentLingerTicks = 36000;     // ~10 min at 1x: a spent site stays, dimmed, then crumbles away
+const int poiSearchTicks = 300;            // ~5s at 1x: a party searching a site (shorter than a ruin delve)
+// Rewards: small and varied, rolled once per search. Food chance, then stone chance, else a relic (stone if relics are capped)
+struct poiRewardDef { float foodChance, stoneChance; };
+const poiRewardDef poiRewards[poiKindCount] = {
+    {0.50f, 0.25f},                        // hut: the hermit's stores; 25% relic
+    {0.30f, 0.50f},                        // well: dressed stone from the shaft; 20% relic
+};
+const int poiFoodMin = 3, poiFoodMax = 6;  // food reward range
+const int poiStoneMin = 2, poiStoneMax = 4; // stone reward range
+// Hut: neutral thatch (not a race colour), sloping down to the left (camps slope right), stone chimney with a smoke pixel
+const Color poiThatchColor(146, 126, 84);
+const Color poiThatchLitColor(170, 150, 104);
+const Color poiThatchEaveColor(116, 98, 66);
+const Color poiHutWallColor(96, 72, 48);
+const Color poiHutInsideColor(30, 24, 18);
+const Color poiChimneyColor(112, 108, 102);
+const Color poiSmokeColor(196, 196, 190, 150);
+const int poiSmokeFrames = 24;             // smoke pixel rises one row every this many frames, 3 rows then restarts
+// Well: grey stone ring (lit top, shaded bottom) round dark water with a 1px glint; dry earth once spent
+const Color poiWellStoneColor(122, 120, 112);
+const Color poiWellStoneLitColor(152, 150, 140);
+const Color poiWellStoneShadeColor(92, 90, 84);
+const Color poiWellWaterColor(38, 58, 84);
+const Color poiWellWaterShadowColor(22, 32, 46);
+const Color poiWellGlintColor(128, 166, 196);
+const Color poiWellDryColor(48, 40, 30);
+const float poiSpentShade = 0.7f;          // spent sites draw at this brightness
+// Glow (additive, after the day/night overlay, any hour): found = soft violet, spent = one faint small layer
+const Color poiGlowColor(150, 140, 200);   // same muted violet as the ruins
+const int poiGlowLayers = 2;
+const float poiGlowRadius = 12.0f;
+const uint8_t poiGlowLayerAlpha = 10;
+const float poiSpentGlowRadius = 6.0f;
+const uint8_t poiSpentGlowAlpha = 4;
+const Color MM_POI_COLOR(176, 158, 214);   // found sites on the minimap (undiscovered ones are not shown)
+const Color MM_POI_SPENT_COLOR(96, 90, 116);
+const float MM_POI_PX = 2.0f;
+
 // Expeditions (R45-F2, phase 1): one party at a time of expPartySize same-race barbs walks from its crate to its race's
 // lean-to, delves at the ruin stones, and walks home with a relic (or nothing). Rations are paid from the race's food.
 const int expPartySize = 2;                // members per party, all one race
@@ -2121,6 +2180,38 @@ bool ruinsClear(const FloatRect& r) {
     return dx * dx + dy * dy > ruinSiteRadius * ruinSiteRadius;
 }
 
+// R47-F4: sites. pois[i] and poiShapes[i] (footprint rect) always describe the same site; only spawnPois() adds and only
+// removePoi() removes, touching both. Anything held across ticks holds poi.id and re-looks it up with findPoiById().
+struct poi {
+    int id = -1;
+    poiKind kind = poiHut;
+    bool found = false;        // a barb or a party has been there; glows from now on
+    bool spent = false;        // searched once; dimmed, never a party target again
+    int spentTicks = 0;        // ticks since spent; removed at poiSpentLingerTicks
+};
+vector<poi> pois;
+vector<RectangleShape> poiShapes;
+int nextPoiId = 0;
+int findPoiById(int id) {
+    for (int i = 0; i < (int)pois.size(); i++) if (pois[i].id == id) return i;
+    return -1;
+}
+Vector2f poiCentre(int i) { return poiShapes[i].getPosition() + poiShapes[i].getSize() / 2.0f; }
+void removePoi(int i) {
+    if (i < 0 || i >= (int)pois.size()) return;
+    printf("Site gone: %s %d crumbles away\n", poiNames[pois[i].kind], pois[i].id);
+    pois[i] = move(pois.back()); pois.pop_back();
+    poiShapes[i] = move(poiShapes.back()); poiShapes.pop_back();
+}
+// False if r touches any site's footprint grown by poiClearPad
+bool poiClear(const FloatRect& r) {
+    for (auto& s : poiShapes) {
+        FloatRect z(s.getPosition() - Vector2f(poiClearPad, poiClearPad), s.getSize() + Vector2f(2 * poiClearPad, 2 * poiClearPad));
+        if (r.findIntersection(z)) return false;
+    }
+    return true;
+}
+
 // Work target of a barb. targetNone with a set targetx is a tree (or a hunt/wander/build spot, which own their flags).
 enum targetKind {targetNone, targetBush, targetRock, targetLake, targetField, targetDepot}; // targetDepot: hauling a load (R29-F1)
 enum memKind {memNone, memTree, memRock, memBush};   // INBOX-F2
@@ -2215,6 +2306,9 @@ struct expeditionParty {
     int woundCooldown = 0;
     bool relic = false;                 // found on the delve; memberIds[0] carries it home
     const char* lostName = nullptr;     // name of a member removed by removeBarb() (names point into static tables)
+    int poiId = -1;                     // R47-F4: target site (poi.id, re-looked up every tick); -1 = the ruins
+    poiKind siteKind = poiHut;          // R47-F4: kept for the ticker after the site is gone
+    int rewardFood = 0, rewardStone = 0; // R47-F4: a site's reward, carried home and paid on return
 };
 expeditionParty party;
 int raceRelics[raceCount] = {0, 0, 0};   // relics each race has brought home, capped at expRelicCap
@@ -3933,6 +4027,15 @@ optional<hoverHit> pickHover(Vector2f p, float radius, const vector<barb>& barbs
         body.setPosition(snapPx(c.pos));
         if (near(body)) return hoverHit{string(raceDefs[clampRace(c.race)].name) + " lean-to camp", body, nullopt};
     }
+    for (int i = 0; i < (int)pois.size() && i < (int)poiShapes.size(); i++) {   // R47-F4
+        RectangleShape body(poiShapes[i].getSize() + Vector2f(2 * ruinHoverPad, 2 * ruinHoverPad));
+        body.setPosition(poiShapes[i].getPosition() - Vector2f(ruinHoverPad, ruinHoverPad));
+        if (!near(body)) continue;
+        string label = pois[i].kind == poiHut ? "Hermit hut" : "Sunken well";
+        if (pois[i].spent) label += pois[i].kind == poiHut ? ": searched, abandoned" : ": searched, dry";
+        else if (pois[i].found) label += ": found, not yet searched";
+        return hoverHit{label, body, nullopt};
+    }
     for (auto& st : ruinStones) {   // R45-F1b: any stone outlines that stone
         RectangleShape stone(st.size + Vector2f(2 * ruinHoverPad, 2 * ruinHoverPad));
         stone.setPosition(st.position - Vector2f(ruinHoverPad, ruinHoverPad));
@@ -4484,6 +4587,8 @@ void drawMinimap(RenderWindow& window, VertexArray& va, const View& worldView,
         if (stores[k].built) minimapDot(va, inner, quarterCentre(k), MM_STORE_PX, MM_STORE_COLORS[k]);
     if (hasRuins()) minimapDot(va, inner, ruinCentre, MM_RUIN_PX, MM_RUIN_COLOR);   // R45-F1b: site, then camps over it
     for (auto& c : camps) minimapDot(va, inner, c.pos + campSize / 2.0f, MM_CAMP_PX, MM_STORE_COLORS[clampRace(c.race)]);
+    for (int i = 0; i < (int)pois.size() && i < (int)poiShapes.size(); i++)   // R47-F4: found sites only, spent ones dim
+        if (pois[i].found) minimapDot(va, inner, poiCentre(i), MM_POI_PX, pois[i].spent ? MM_POI_SPENT_COLOR : MM_POI_COLOR);
     for (int i = 0; i < (int)barbs.size(); i++)
         if (!barbHidden(barbs[i]))   // INBOX-F1
         minimapDot(va, inner, squares[i].getPosition() + squares[i].getSize() / 2.0f, MM_BARB_PX,
@@ -7285,8 +7390,8 @@ bool expeditionEligible(const barb& b, int r) {
 Vector2f expeditionGoal(int k) {
     int r = clampRace(party.race);
     Vector2f along(-expMemberGapPx * k, 0.0f);
-    if (party.phase == expeditionParty::Out) return campSpot[r] + campStandOffset + along;
-    if (party.phase == expeditionParty::Delve) return party.delveSpot[k];
+    if (party.phase == expeditionParty::Out && party.poiId < 0) return campSpot[r] + campStandOffset + along;
+    if (party.phase != expeditionParty::Back) return party.delveSpot[k];   // R47-F4: a site trip walks straight to the site
     return storehousePos[r] + storehouseStandOffset + along;
 }
 
@@ -7303,20 +7408,52 @@ void endExpedition(vector<barb>& barbs, const int (&idx)[expPartySize]) {
     party.rations = party.timer = party.woundCooldown = 0;
     party.relic = false;
     party.lostName = nullptr;
+    party.poiId = -1;
+    party.rewardFood = party.rewardStone = 0;
     expeditionCooldown = expCooldownTicks;
+}
+
+// R47-F4: the one way a site is found (a passing barb or an arriving party): flag, printf and one ticker line
+void discoverPoi(int i, int r, const char* who) {
+    if (i < 0 || i >= (int)pois.size() || pois[i].found) return;
+    pois[i].found = true;
+    Vector2f c = poiCentre(i);
+    printf("---SITE FOUND--- %s %d at (%.0f, %.0f) by %s (%s)\n", poiNames[pois[i].kind], pois[i].id, c.x, c.y, who, racePlurals[clampRace(r)]);
+    logRaceEvent(string(who) + " comes upon a " + poiNames[pois[i].kind], r);
+}
+
+// R47-F4: where a party of race r goes. The nearest undiscovered unspent site competes with the ruins (if ruinsOk) by
+// distance from the crate; then the ruins; then the nearest found but unspent site. Spent sites are never picked.
+// Returns a pois index (valid only until the next removal: the caller stores the id), -1 = the ruins, -2 = nowhere.
+int pickExpeditionSite(int r, bool ruinsOk) {
+    Vector2f from = storehousePos[clampRace(r)];
+    float far = 2.0f * worldSize, uDSq = 0.0f;
+    int n = (int)pois.size();
+    int u = findNearest(from, far, n, [&](int i) { return poiCentre(i); },
+                        [&](int i) { return pois[i].spent || pois[i].found; }, &uDSq);
+    if (ruinsOk) {
+        Vector2f d = ruinCentre - from;
+        if (u < 0 || d.x * d.x + d.y * d.y < uDSq) return -1;
+    }
+    if (u >= 0) return u;
+    int f = findNearest(from, far, n, [&](int i) { return poiCentre(i); }, [&](int i) { return pois[i].spent; });
+    return f >= 0 ? f : -2;
 }
 
 // R45-F2: tries one race (random start, fair) with a lean-to, a crate, a silent bell, relics under the cap and food for
 // the rations plus expFoodReserve. Members: the nearest eligible barbs to the crate via findNearest, each skipping the
 // ones already picked; delve stones the same way from the camp.
 void tryLaunchExpedition(vector<barb>& barbs, vector<RectangleShape>& squares, const storehouse (&stores)[raceCount]) {
-    if (!hasRuins() || uniform_int_distribution<int>(0, expLaunchOneIn - 1)(gen) != 0) return;
+    if ((!hasRuins() && pois.empty()) || uniform_int_distribution<int>(0, expLaunchOneIn - 1)(gen) != 0) return;
     int start = uniform_int_distribution<int>(0, raceCount - 1)(gen);
     int n = min((int)barbs.size(), (int)squares.size());
     for (int o = 0; o < raceCount; o++) {
         int r = (start + o) % raceCount;
-        if (!campBuilt(r) || !stores[r].built || raceBell[r] > 0 || raceRelics[r] >= expRelicCap) continue;
+        if (!stores[r].built || raceBell[r] > 0) continue;
         if (stock[r].food < expRationFood + expFoodReserve) continue;
+        // R47-F4: the ruins still need the race's lean-to and relics under the cap; sites need neither
+        int site = pickExpeditionSite(r, hasRuins() && campBuilt(r) && raceRelics[r] < expRelicCap);
+        if (site == -2) continue;
         int pick[expPartySize];
         bool ok = true;
         for (int k = 0; k < expPartySize && ok; k++) {
@@ -7330,8 +7467,8 @@ void tryLaunchExpedition(vector<barb>& barbs, vector<RectangleShape>& squares, c
         }
         if (!ok) continue;
         Vector2f camp = campSpot[r] + campSize / 2.0f;
-        int stone[expPartySize];
-        for (int k = 0; k < expPartySize; k++) {
+        int stone[expPartySize] = {};
+        for (int k = 0; k < expPartySize && site < 0; k++) {   // R47-F4: ruin trips only
             stone[k] = findNearest(camp, worldSize, (int)ruinStones.size(),
                                    [&](int i) { return ruinStones[i].position + ruinStones[i].size / 2.0f; },
                                    [&](int i) { for (int q = 0; q < k; q++) if (stone[q] == i) return true; return false; });
@@ -7343,6 +7480,7 @@ void tryLaunchExpedition(vector<barb>& barbs, vector<RectangleShape>& squares, c
         party.phase = expeditionParty::Out;
         spend(stock[r], 0, 0, expRationFood);
         party.rations = expRationFood;
+        if (site >= 0) { party.poiId = pois[site].id; party.siteKind = pois[site].kind; }   // R47-F4: the id, never the index
         string names;
         for (int k = 0; k < expPartySize; k++) {
             barb& b = barbs[pick[k]];
@@ -7351,12 +7489,21 @@ void tryLaunchExpedition(vector<barb>& barbs, vector<RectangleShape>& squares, c
             b.order = needNone;
             b.orderTicks = 0;
             party.memberIds[k] = b.id;
-            const FloatRect& s = ruinStones[stone[k]];   // stand at the stone's foot, centred under it
-            party.delveSpot[k] = snapPx(Vector2f(s.position.x + s.size.x / 2.0f - 1.0f, s.position.y + s.size.y));
+            if (site >= 0) {   // R47-F4: members flank the site at its foot, even k on the left, odd on the right
+                Vector2f p = poiShapes[site].getPosition(), s = poiShapes[site].getSize();
+                float row = p.y + s.y - squares[pick[k]].getSize().y;
+                float out = (k / 2) * expMemberGapPx;
+                party.delveSpot[k] = snapPx(k % 2 == 0 ? Vector2f(p.x - squares[pick[k]].getSize().x - 1.0f - out, row)
+                                                       : Vector2f(p.x + s.x + 1.0f + out, row));
+            } else {
+                const FloatRect& s = ruinStones[stone[k]];   // stand at the stone's foot, centred under it
+                party.delveSpot[k] = snapPx(Vector2f(s.position.x + s.size.x / 2.0f - 1.0f, s.position.y + s.size.y));
+            }
             names += string(k ? " and " : "") + b.name;
         }
-        printf("---EXPEDITION OUT--- %s: %s, %d rations (food %d left)\n", racePlurals[r], names.c_str(), party.rations, stock[r].food);
-        logRaceEvent(string(racePlurals[r]) + " send " + names + " to the ruins", r);
+        string dest = site >= 0 ? string(pois[site].found ? "the " : "an unexplored ") + poiNames[party.siteKind] : string("the ruins");
+        printf("---EXPEDITION OUT--- %s: %s to %s, %d rations (food %d left)\n", racePlurals[r], names.c_str(), dest.c_str(), party.rations, stock[r].food);
+        logRaceEvent(string(racePlurals[r]) + " send " + names + " to " + dest, r);
         return;
     }
 }
@@ -7387,6 +7534,17 @@ void expeditionTick(vector<barb>& barbs, vector<RectangleShape>& squares, const 
         return;
     }
     if (party.woundCooldown > 0) party.woundCooldown--;
+    int site = -1;   // R47-F4: re-looked up by id every tick, used only within this tick
+    if (party.poiId >= 0 && party.phase != expeditionParty::Back) {
+        site = findPoiById(party.poiId);
+        if (site < 0 || pois[site].spent) {   // gone or already searched: turn for home empty-handed
+            printf("EXPEDITION SITE GONE - %s turn home from the %s\n", racePlurals[r], poiNames[party.siteKind]);
+            party.phase = expeditionParty::Back;
+            party.relic = false;
+            party.rewardFood = party.rewardStone = 0;
+            site = -1;
+        }
+    }
     for (int k = 0; k < expPartySize; k++) {   // rations: a member eats on the road instead of from the larder
         barb& b = barbs[idx[k]];
         if (!isHungry(b) || party.rations <= 0) continue;
@@ -7432,20 +7590,45 @@ void expeditionTick(vector<barb>& barbs, vector<RectangleShape>& squares, const 
     if (party.phase == expeditionParty::Out) {
         party.phase = expeditionParty::Delve;
         party.timer = 0;
-        printf("EXPEDITION AT CAMP - %s, to the stones\n", racePlurals[r]);
+        if (site >= 0) {   // R47-F4: arriving finds the site, through the same path as a passing barb
+            discoverPoi(site, r, barbs[idx[0]].name);
+            printf("EXPEDITION AT SITE - %s, searching the %s\n", racePlurals[r], poiNames[party.siteKind]);
+        } else printf("EXPEDITION AT CAMP - %s, to the stones\n", racePlurals[r]);
     } else if (party.phase == expeditionParty::Delve) {
-        if (++party.timer < expDelveTicks) return;
-        party.relic = raceRelics[r] < expRelicCap && uniform_real_distribution<float>(0.0f, 1.0f)(gen) < expRelicChance;
+        if (++party.timer < (site >= 0 ? poiSearchTicks : expDelveTicks)) return;
+        uniform_real_distribution<float> roll01(0.0f, 1.0f);
+        if (site >= 0) {   // R47-F4: one small reward per site, then it is spent
+            const poiRewardDef& w = poiRewards[party.siteKind];
+            float roll = roll01(gen);
+            if (roll < w.foodChance) party.rewardFood = uniform_int_distribution<int>(poiFoodMin, poiFoodMax)(gen);
+            else if (roll < w.foodChance + w.stoneChance || raceRelics[r] >= expRelicCap)
+                party.rewardStone = uniform_int_distribution<int>(poiStoneMin, poiStoneMax)(gen);
+            else party.relic = true;
+            pois[site].spent = true;
+            pois[site].spentTicks = 0;
+            printf("EXPEDITION SEARCHED - %s, %s: %s\n", racePlurals[r], poiNames[party.siteKind],
+                   party.relic ? "relic" : party.rewardFood > 0 ? "food" : "stone");
+        } else {
+            party.relic = raceRelics[r] < expRelicCap && roll01(gen) < expRelicChance;
+            printf("EXPEDITION DELVED - %s, %s\n", racePlurals[r], party.relic ? "relic found" : "nothing found");
+        }
         party.phase = expeditionParty::Back;
-        printf("EXPEDITION DELVED - %s, %s\n", racePlurals[r], party.relic ? "relic found" : "nothing found");
     } else {
         stock[r].food += party.rations;   // leftovers back to the larder
         string outcome;
-        if (party.relic) {
+        string from = party.poiId >= 0 ? string(" from the ") + poiNames[party.siteKind] : string();   // R47-F4
+        if (party.relic && raceRelics[r] < expRelicCap) {
             raceRelics[r] = min(expRelicCap, raceRelics[r] + 1);
             stock[r].stone += expRelicStone;
-            outcome = "return with a relic (+" + to_string(expRelicStone) + " stone, " + to_string(raceRelics[r]) + "/" + to_string(expRelicCap) + ")";
-        } else outcome = "return empty-handed";
+            outcome = "return with a relic" + from + " (+" + to_string(expRelicStone) + " stone, " + to_string(raceRelics[r]) + "/" + to_string(expRelicCap) + ")";
+        } else if (party.relic || party.rewardStone > 0) {   // a relic found after the cap filled counts as stone
+            int st = party.rewardStone > 0 ? party.rewardStone : expRelicStone;
+            stock[r].stone += st;
+            outcome = "return with " + to_string(st) + " stone" + from;
+        } else if (party.rewardFood > 0) {
+            stock[r].food += party.rewardFood;
+            outcome = "return with " + to_string(party.rewardFood) + " food" + from;
+        } else outcome = "return empty-handed" + from;
         printf("---EXPEDITION HOME--- %s %s, %d rations returned\n", racePlurals[r], outcome.c_str(), party.rations);
         logRaceEvent(string(racePlurals[r]) + "' expedition " + outcome, r);
         endExpedition(barbs, idx);
@@ -8222,6 +8405,7 @@ void treespawn(vector<tree>& trees, vector<CircleShape>& tris, vector<RectangleS
                 && tr.findIntersection(FloatRect(Vector2f(o.targetx - 3.0f, o.targety - 3.0f), houseSlabSize))) return;
     }
     if (!ruinsClear(FloatRect(Vector2f(t.x, t.y), Vector2f(treeFootprint, treeFootprint)))) return;  // R45-F1b: nor in the ruin site
+    if (!poiClear(FloatRect(Vector2f(t.x, t.y), Vector2f(treeFootprint, treeFootprint)))) return;    // R47-F4: nor on a hut or well
     trees.push_back(t);
 
     tris.push_back(makeTreeTri(t.x, t.y));
@@ -8436,23 +8620,33 @@ void checkQuarters(vector<tree>& trees, vector<CircleShape>& tris, vector<Rectan
 // the HUD, and dry over its whole square. No spot = no ruins (and so no ridge or camps). Startup trees (trees/tris/stumps),
 // rocks (rocks/octs) and bushes (bushes/bushshapes) touching the site disc are removed together; then the ridge's rocks
 // are added on the far side, and each race's lean-to spot is fixed on the village-facing side.
+// R47-F4: the one site placer (ruins, huts, wells): rolls up to `tries` whole-pixel centres at least `margin` inside the
+// map (below the HUD strip) and keeps the first that ok(c) accepts. Places nothing itself.
+template<typename OkFn>
+bool placePoi(float margin, int tries, OkFn ok, Vector2f& out) {
+    uniform_real_distribution<float> sx(margin, worldSize - margin), sy(hudBarHeight + margin, worldSize - margin);
+    for (int k = 0; k < tries; k++) {
+        Vector2f c(round(sx(gen)), round(sy(gen)));
+        if (!ok(c)) continue;
+        out = c;
+        return true;
+    }
+    return false;
+}
+
 void spawnRuins(vector<tree>& trees, vector<CircleShape>& tris, vector<RectangleShape>& stumps, vector<rock>& rocks,
                 vector<CircleShape>& octs, vector<char>& rockGold, vector<bush>& bushes, vector<CircleShape>& bushshapes) {
     ruinStones.clear();
     camps.clear();
     float lo = ruinSiteRadius + ruinEdgeMargin;
-    uniform_real_distribution<float> sx(lo, worldSize - lo), sy(hudBarHeight + lo, worldSize - lo);
     bool found = false;
     for (float minDist : {ruinMinDist, ruinFallbackDist}) {
         minDist = max(minDist, ruinCoreMinDist);   // R47-F2: both passes keep the site disc outside the safe core
-        for (int k = 0; k < ruinPlaceTries && !found; k++) {
-            Vector2f c(round(sx(gen)), round(sy(gen)));
-            if (hypot(c.x - villageCenter.x, c.y - villageCenter.y) < minDist) continue;
-            if (nearQuarter(c, ruinQuarterGap)) continue;
-            if (!lakeClear(FloatRect(c - Vector2f(ruinSiteRadius, ruinSiteRadius), Vector2f(2 * ruinSiteRadius, 2 * ruinSiteRadius)))) continue;
-            ruinCentre = c;
-            found = true;
-        }
+        found = placePoi(lo, ruinPlaceTries, [&](Vector2f c) {
+            if (hypot(c.x - villageCenter.x, c.y - villageCenter.y) < minDist) return false;
+            if (nearQuarter(c, ruinQuarterGap)) return false;
+            return lakeClear(FloatRect(c - Vector2f(ruinSiteRadius, ruinSiteRadius), Vector2f(2 * ruinSiteRadius, 2 * ruinSiteRadius)));
+        }, ruinCentre);
         if (found) break;
     }
     if (!found) { printf("Ruins: no spot found, none placed\n"); return; }
@@ -8529,6 +8723,79 @@ void spawnRuins(vector<tree>& trees, vector<CircleShape>& tris, vector<Rectangle
     printf("Ruins at (%.0f, %.0f), %.0f px out: %zu stones, %d ridge rocks (cleared %d trees, %d rocks, %d bushes)\n",
            ruinCentre.x, ruinCentre.y, hypot(ruinCentre.x - villageCenter.x, ruinCentre.y - villageCenter.y), ruinStones.size(),
            (int)octs.size() - ridgeFirst, clearedT, clearedR, clearedB);
+}
+
+// R47-F4: huts and wells, poiBandCounts per band, after the ruins. Each goes through placePoi: in its band, clear of
+// the quarters, the ruin site and ridge, every other site and the water. Then startup trees (trees/tris/stumps), rocks
+// (rocks/octs/rockGold) and bushes (bushes/bushshapes) on or beside a footprint are removed together.
+void spawnPois(vector<tree>& trees, vector<CircleShape>& tris, vector<RectangleShape>& stumps, vector<rock>& rocks,
+               vector<CircleShape>& octs, vector<char>& rockGold, vector<bush>& bushes, vector<CircleShape>& bushshapes) {
+    pois.clear();
+    poiShapes.clear();
+    int placed[poiKindCount] = {}, missed = 0;
+    for (int z = 0; z < zoneCount; z++)
+        for (int kind = 0; kind < poiKindCount; kind++)
+            for (int n = 0; n < poiBandCounts[z][kind]; n++) {
+                Vector2f sz = poiSizes[kind], c;
+                bool ok = placePoi(poiEdgeMargin, poiPlaceTries, [&](Vector2f p) {
+                    if (zoneAt(p) != z || nearQuarter(p, poiQuarterGap)) return false;
+                    if (hasRuins() && hypot(p.x - ruinCentre.x, p.y - ruinCentre.y) < poiRuinGap) return false;
+                    for (int i = 0; i < (int)pois.size(); i++) {
+                        Vector2f d = poiCentre(i) - p;
+                        if (d.x * d.x + d.y * d.y < poiMinGap * poiMinGap) return false;
+                    }
+                    return lakeClear(FloatRect(p - sz / 2.0f - Vector2f(poiClearPad, poiClearPad), sz + Vector2f(2 * poiClearPad, 2 * poiClearPad)));
+                }, c);
+                if (!ok) { missed++; continue; }
+                poi s;
+                s.id = nextPoiId++;
+                s.kind = (poiKind)kind;
+                pois.push_back(s);
+                RectangleShape shape(sz);
+                shape.setPosition(snapPx(c - sz / 2.0f));
+                poiShapes.push_back(shape);
+                placed[kind]++;
+            }
+    int clearedT = 0, clearedR = 0, clearedB = 0;
+    for (int i = (int)tris.size() - 1; i >= 0; i--) {
+        if (poiClear(FloatRect(tris[i].getPosition(), Vector2f(treeFootprint, treeFootprint)))) continue;
+        swapRemove(trees, i); swapRemove(tris, i); swapRemove(stumps, i);
+        clearedT++;
+    }
+    for (int i = (int)octs.size() - 1; i >= 0; i--) {
+        if (poiClear(octs[i].getGlobalBounds())) continue;
+        swapRemove(rocks, i); swapRemove(octs, i); swapRemove(rockGold, i);
+        clearedR++;
+    }
+    for (int i = (int)bushshapes.size() - 1; i >= 0; i--) {
+        if (poiClear(bushshapes[i].getGlobalBounds())) continue;
+        swapRemove(bushes, i); swapRemove(bushshapes, i);
+        clearedB++;
+    }
+    printf("Sites: %d hermit huts, %d sunken wells (%d unplaced; cleared %d trees, %d rocks, %d bushes)\n",
+           placed[poiHut], placed[poiWell], missed, clearedT, clearedR, clearedB);
+}
+
+// R47-F4: per tick, after expeditionTick(). Spent sites age and crumble (removePoi, iterating down so no index is reused);
+// every poiDiscoverEveryTicks the first visible barb near an unfound site finds it.
+void poiTick(const vector<barb>& barbs, const vector<RectangleShape>& squares) {
+    for (int i = (int)pois.size() - 1; i >= 0; i--)
+        if (pois[i].spent && ++pois[i].spentTicks >= poiSpentLingerTicks) removePoi(i);
+    static int discoverTimer = 0;
+    if (++discoverTimer < poiDiscoverEveryTicks) return;
+    discoverTimer = 0;
+    int n = min((int)barbs.size(), (int)squares.size());
+    for (int i = 0; i < (int)pois.size(); i++) {
+        if (pois[i].found) continue;
+        Vector2f c = poiCentre(i);
+        for (int j = 0; j < n; j++) {
+            if (barbHidden(barbs[j])) continue;
+            Vector2f d = squares[j].getPosition() + squares[j].getSize() / 2.0f - c;
+            if (d.x * d.x + d.y * d.y >= poiDiscoverRadius * poiDiscoverRadius) continue;
+            discoverPoi(i, barbs[j].race, barbs[j].name);
+            break;
+        }
+    }
 }
 
 // R45-F1b: one lean-to per race at the ruins, through buildOneOff (jobCamp) by a builder of that race, once its crate
@@ -8610,6 +8877,78 @@ void drawRuinGlow(RenderWindow& window, const View& worldView, int frame) {
         c.setRadius(r);
         c.setOrigin({r, r});
         window.draw(c, BlendAdd);
+    }
+}
+
+// R47-F4: huts and wells in one vertex array, with the buildings (under barbs and trees), culled to the view.
+// Hut (5x4): mirrored lean-to in neutral thatch sloping down to the left, timber back wall on the right, a stone
+// chimney pixel at the high end and, while unspent, a 1px smoke pixel rising above it. Well (6x6): stone ring with
+// the corners cut (lit top row, shaded bottom row) round dark water with a shadowed top row and a 1px glint; dry once
+// spent. Spent sites draw at poiSpentShade.
+void drawPois(RenderWindow& window, const FloatRect& camRect, int frame) {
+    static VertexArray va(PrimitiveType::Triangles);
+    va.clear();
+    for (int i = 0; i < (int)pois.size() && i < (int)poiShapes.size(); i++) {
+        Vector2f o = snapPx(poiShapes[i].getPosition()), s = poiShapes[i].getSize();
+        if (!camRect.findIntersection(FloatRect(o - Vector2f(0.0f, 4.0f), s + Vector2f(0.0f, 4.0f)))) continue;
+        bool spent = pois[i].spent;
+        auto col = [&](Color c) { return spent ? shade(c, poiSpentShade) : c; };
+        if (pois[i].kind == poiHut) {
+            pushQuad(va, o + Vector2f(1.0f, 2.0f), Vector2f(3.0f, 2.0f), col(poiHutInsideColor));   // open front
+            pushQuad(va, o + Vector2f(4.0f, 1.0f), Vector2f(1.0f, 3.0f), col(poiHutWallColor));     // back wall, high side
+            pushQuad(va, o + Vector2f(0.0f, 3.0f), Vector2f(1.0f, 1.0f), col(poiHutWallColor));     // short front pole
+            pushQuad(va, o + Vector2f(2.0f, 0.0f), Vector2f(2.0f, 1.0f), col(poiThatchLitColor));   // thatch, top row
+            pushQuad(va, o + Vector2f(4.0f, 0.0f), Vector2f(1.0f, 1.0f), col(poiChimneyColor));     // chimney stone
+            pushQuad(va, o + Vector2f(1.0f, 1.0f), Vector2f(3.0f, 1.0f), col(poiThatchColor));      // thatch, middle row
+            pushQuad(va, o + Vector2f(0.0f, 2.0f), Vector2f(2.0f, 1.0f), col(poiThatchEaveColor));  // eave
+            if (!spent) {   // smoke: rises 1..3 rows over the chimney, fading as it goes
+                int step = (frame / poiSmokeFrames) % 3;
+                Color sm = poiSmokeColor;
+                sm.a = (uint8_t)(poiSmokeColor.a * (3 - step) / 3);
+                pushQuad(va, o + Vector2f(4.0f, -1.0f - step), Vector2f(1.0f, 1.0f), sm);
+            }
+        } else {
+            pushQuad(va, o + Vector2f(1.0f, 0.0f), Vector2f(4.0f, 1.0f), col(poiWellStoneLitColor));    // top rim
+            pushQuad(va, o + Vector2f(0.0f, 1.0f), Vector2f(1.0f, 4.0f), col(poiWellStoneColor));       // left rim
+            pushQuad(va, o + Vector2f(5.0f, 1.0f), Vector2f(1.0f, 4.0f), col(poiWellStoneColor));       // right rim
+            pushQuad(va, o + Vector2f(1.0f, 5.0f), Vector2f(4.0f, 1.0f), col(poiWellStoneShadeColor));  // bottom rim
+            if (spent) pushQuad(va, o + Vector2f(1.0f, 1.0f), Vector2f(4.0f, 4.0f), poiWellDryColor);  // dry bed
+            else {
+                pushQuad(va, o + Vector2f(1.0f, 1.0f), Vector2f(4.0f, 1.0f), poiWellWaterShadowColor);  // sunken: rim shadow
+                pushQuad(va, o + Vector2f(1.0f, 2.0f), Vector2f(4.0f, 3.0f), poiWellWaterColor);
+                pushQuad(va, o + Vector2f(3.0f, 3.0f), Vector2f(1.0f, 1.0f), poiWellGlintColor);
+            }
+        }
+    }
+    if (va.getVertexCount() > 0) window.draw(va);
+}
+
+// R47-F4: found sites glow soft violet (additive, after the day/night overlay, any hour, dimmed by rain like the ruins);
+// spent sites keep one faint small layer; undiscovered sites have none.
+void drawPoiGlow(RenderWindow& window, const View& worldView, const FloatRect& camRect, int frame) {
+    window.setView(worldView);
+    float breath = 1.0f + ruinGlowBreathDepth * sin(frame * 6.2831853f / ruinGlowBreathFrames);
+    float rain = raining ? ruinGlowRainMult : 1.0f;
+    CircleShape c;
+    c.setPointCount(24);
+    for (int i = 0; i < (int)pois.size() && i < (int)poiShapes.size(); i++) {
+        if (!pois[i].found) continue;
+        Vector2f p = poiCentre(i);
+        if (!camRect.contains(p)) continue;
+        bool spent = pois[i].spent;
+        int layers = spent ? 1 : poiGlowLayers;
+        float outer = spent ? poiSpentGlowRadius : poiGlowRadius;
+        Color col = poiGlowColor;
+        col.a = (uint8_t)((spent ? poiSpentGlowAlpha : poiGlowLayerAlpha * breath) * rain);
+        if (col.a == 0) continue;
+        c.setFillColor(col);
+        c.setPosition(p);
+        for (int k = 1; k <= layers; k++) {
+            float r = outer * k / layers;
+            c.setRadius(r);
+            c.setOrigin({r, r});
+            window.draw(c, BlendAdd);
+        }
     }
 }
 
@@ -8721,6 +9060,7 @@ int main() {
     spawnBushes(bushes, bushshapes, trees, tris, stumps);
     checkQuarters(trees, tris, stumps, rocks, octs, rockGold, bushshapes);   // R30-F1: no quarter short of wood/stone
     spawnRuins(trees, tris, stumps, rocks, octs, rockGold, bushes, bushshapes);   // R45-F1b: last, so it clears whatever landed on the site
+    spawnPois(trees, tris, stumps, rocks, octs, rockGold, bushes, bushshapes);    // R47-F4: after the ruins, so sites keep clear of them
     for (auto& s : stock) {   // RACE-F1: every race starts with at least startStock
         s.wood = max(s.wood, startStock.wood);
         s.stone = max(s.stone, startStock.stone);
@@ -8861,6 +9201,7 @@ int main() {
                 bellTick(barbs, squares, houses, houseshapes, wolves, stores, smoke, dwarfForge, fields,
                          trees, tris, rocks, octs, bushes);   // INBOX-F1: after the wolves move
                 expeditionTick(barbs, squares, wolves, stores);   // R45-F2: after the wolves and the bell, before hungerTick()
+                poiTick(barbs, squares);   // R47-F4: site discovery and spent-site crumbling, after the party's tick
                 clockk();
                 weatherTick();
                 traderTick(activeTrader, barbs, stores);
@@ -8953,6 +9294,7 @@ int main() {
 	drawSmokehouse(window, smoke, stores);
 	drawRuins(window);   // R45-F1b: with the buildings, under barbs and trees
 	drawCamps(window);
+	drawPois(window, camRect, frameCount);   // R47-F4: huts and wells, with the buildings
 	drawStall(window, activeTrader);
 	drawForge(window, dwarfForge, frameCount, forgeBonusPending(barbs, dwarfForge));
 	if (forgeEmberFrames > 0 && !paused) forgeEmberFrames--;
@@ -9019,6 +9361,7 @@ int main() {
         drawOverlay(window, dnc, dncColor);
         if (raining) drawOverlay(window, dnc, rainOverlayColor);
         if (t >= eveningStartHour && t < nightStartHour) drawRuinGlow(window, worldView, frameCount);   // R45-F1b: dusk only
+        drawPoiGlow(window, worldView, camRect, frameCount);   // R47-F4: found sites, any hour
         if (isNightHour(t)) drawCampfireGlow(window, worldView, fire, frameCount);
         if (isNightHour(t)) drawHouseLights(window, worldView, houses, houseshapes);
         drawBallots(window, worldView, zoom, barbs, squares); // above the overlays so the pips read true; under hover marks
