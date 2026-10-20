@@ -1503,6 +1503,18 @@ const Vector2f spearTipSize(2.0f, 1.0f);      // flint head on top of the shaft:
 const Color spearShaftColor(156, 120, 76);    // light ash wood: much lighter than campfire logs so it reads on dark ground
 const Color spearTipColor(214, 208, 192);     // pale flint
 const int spearKnapFrames = 8;                // crafter's knapping hand ticks up/down every this many frames
+// R47-F8: spear and axe tiers. Dwarves make an axe, every other race a spear (no bow); both use the spear glyph above.
+// The weapon's tier is the race's F7 tool tier (toolTierOf) read once when the craft finishes, kept for life, and adds
+// weaponTierBonus[tier] to the weapon's base hit damage. Every acquire/pay/refund goes through setWeapon().
+enum weaponKind { weaponSpear, weaponAxe, weaponKindCount };
+struct weaponDef { const char* name; const char* plural; const char* article; const char* killVerb; const char* huntLabel; int baseDamage; };
+const weaponDef weaponDefs[weaponKindCount] = {
+    {"spear", "spears", "a",  "speared", "hunting (spear)", spearHitDamage},
+    {"axe",   "axes",   "an", "cleaved", "hunting (axe)",   spearHitDamage},   // same base: the axe is a dwarf flavour, not a buff
+};
+const weaponKind raceWeapon[raceCount] = {weaponSpear, weaponAxe, weaponSpear};   // human, dwarf (axe), elf
+constexpr int weaponTierBonus[toolTierCount] = {0, 2, 4, 6};   // extra hit damage per tier (15 -> 17/19/21)
+static_assert(weaponTierBonus[0] == 0, "an untiered weapon hits for its base damage");
 
 // Build jobs: which structure a barb's movingbspot/building belongs to. jobNone = no job, or a house (buildhouse()).
 // jobSpear is a craft, not a structure: it uses movingbspot (so no other system grabs the barb) but never building/timer.
@@ -2395,6 +2407,7 @@ struct barb {
     int spearTimer = 0;          // R20-F3: craft progress while jobKind == jobSpear; separate from timer; cleared by clearSpearCraft()
     bool spearPaid = false;      // POL-F3: craft cost already taken from the race stock; cleared only by refundSpear() or on completion
     bool spearAtForge = false;   // POL-F5a: this craft is at the forge (forgeActive at claim); cleared by clearSpearCraft()
+    int weaponTier = 0;          // R47-F8: tool tier snapshotted when the weapon was made (setWeapon(weaponEquip)); 0 when unarmed
     const char* name = "";       // R25-F1: points into barbNames (no heap strings); set in makeBarb()
     barbTrait trait = traitSwift; // R25-F1: rolled once in makeBarb()
     bool shinobi = false;        // R25-F2: Sasuke; set once in makeBarb()
@@ -2929,6 +2942,11 @@ Color barbColor(const barb& b) {
     return barbChopColor;   // only chopping is left once barbIdle() is false
 }
 
+// R47-F8: the weapon a race makes, its hit damage at the barb's snapshotted tier, and the tooltip text ("spear, tier 2")
+const weaponDef& weaponOf(const barb& b) { return weaponDefs[raceWeapon[clampRace(b.race)]]; }
+int weaponDamage(const barb& b) { return weaponOf(b).baseDamage + weaponTierBonus[clamp(b.weaponTier, 0, toolTierCount - 1)]; }
+string weaponLabel(const barb& b) { return string(weaponOf(b).name) + ", tier " + to_string(b.weaponTier); }
+
 // Same priority as barbColor() so the tooltip always matches the colour on screen
 const char* barbTaskName(const barb& b) {
     if (b.garrisoned) return b.garrisonInside ? "sheltering" : "running to shelter";   // INBOX-F1
@@ -2936,7 +2954,7 @@ const char* barbTaskName(const barb& b) {
         return party.phase == expeditionParty::Out ? "expedition: setting out"
              : party.phase == expeditionParty::Delve ? (party.hollow ? "expedition: below the Hollow" : "expedition: delving")   // R47-F5
              : "expedition: heading home";
-    if (b.deertargeting) return b.hasSpear ? "hunting (spear)" : "hunting";
+    if (b.deertargeting) return b.hasSpear ? weaponOf(b).huntLabel : "hunting";   // R47-F8: "hunting (axe)" for dwarves
     if (b.building) return "building";
     if (b.tempering) return "tempering pick";   // R41-F2
     if (b.smelting) return "smelting ingots";   // R47-F7
@@ -3008,7 +3026,7 @@ void deerkilling(vector<deer>& deers, vector<RectangleShape>& deershape, vector<
 			b.moving = true;
 			if (!d.invincible && sq.getGlobalBounds().findIntersection(ds.getGlobalBounds()).has_value()) {
 				bool speared = b.hasSpear;
-				d.health -= speared ? spearHitDamage : animalHitDamage;
+				d.health -= speared ? weaponDamage(b) : animalHitDamage;   // R47-F8: base + tier bonus
 				d.invincible = true;
 				d.invincibleTimer = animalHitInvincibleTicks;
 				ds.setFillColor(Color::Red);
@@ -3024,8 +3042,9 @@ void deerkilling(vector<deer>& deers, vector<RectangleShape>& deershape, vector<
 					raceStock& rs = stockOf(b);   // RACE-F1: the hunter's race eats it
 					rs.food += yield + smoked;
 					if (smoked > 0) sh[b.race].puffFrames = smokePuffFrames;   // short faint puff over that race's hut
-					printf("%s KILLED%s - %s food: %d (+%d, +%d smoked)\n", name, speared ? " (spear)" : "", racePlurals[clampRace(b.race)], rs.food, yield, smoked);
-					logRaceEvent(string(b.name) + (speared ? " speared a " : " killed a ") + name + " (+" + to_string(yield) + " food"
+					string arms = speared ? " (" + weaponLabel(b) + ")" : string();   // R47-F8
+					printf("%s KILLED%s - %s food: %d (+%d, +%d smoked)\n", name, arms.c_str(), racePlurals[clampRace(b.race)], rs.food, yield, smoked);
+					logRaceEvent(string(b.name) + (speared ? string(" ") + weaponOf(b).killVerb + " a " : string(" killed a ")) + name + " (+" + to_string(yield) + " food"
 					         + (smoked > 0 ? ", +" + to_string(smoked) + " smoked" : string()) + ", " + to_string(rs.food) + ")", b.race);
 					break;
 				}
@@ -4176,7 +4195,7 @@ optional<Vector2f> barbTargetPos(const barb& b, const RectangleShape& sq, const 
     return Vector2f((float)b.targetx, (float)b.targety) + sq.getSize() / 2.0f;   // targetx/y is where the body's top-left goes
 }
 
-int spearsOfRace(const vector<barb>& barbs, int r);   // POL-F3, defined with craftspear
+int weaponsOfRace(const vector<barb>& barbs, int r);   // POL-F3 (R47-F8: was spearsOfRace), defined with craftspear
 
 // POL-F1: ledger string cached on the hover target (race index, raceCount = campfire) and the numbers it shows;
 // the string is only rebuilt when either changes
@@ -4186,7 +4205,7 @@ ledgerCacheT ledgerCache;
 string ledgerLine(int target, const vector<barb>& barbs, const storehouse (&stores)[raceCount]) {
     int hungry[raceCount] = {}, spears[raceCount] = {};
     for (auto& b : barbs) if (isHungry(b)) hungry[clampRace(b.race)]++;
-    for (int r = 0; r < raceCount; r++) spears[r] = spearsOfRace(barbs, r);
+    for (int r = 0; r < raceCount; r++) spears[r] = weaponsOfRace(barbs, r);
     vector<int> races;   // storehouse: its race; campfire: every race still hauling there (no crate yet)
     if (target < raceCount) races.push_back(target);
     else for (int r = 0; r < raceCount; r++) if (!stores[r].built) races.push_back(r);
@@ -4199,7 +4218,8 @@ string ledgerLine(int target, const vector<barb>& barbs, const storehouse (&stor
         if (!s.empty()) s += "; ";
         s += string(racePlurals[r]) + (full ? ": " : " ") + to_string(stock[r].wood) + "w " + to_string(stock[r].stone) + "s "
            + to_string(stock[r].food) + "f";
-        if (full) s += ", " + to_string(hungry[r]) + " hungry, " + to_string(spears[r]) + (spears[r] == 1 ? " spear" : " spears");
+        if (full) s += ", " + to_string(hungry[r]) + " hungry, " + to_string(spears[r]) + " "
+                       + (spears[r] == 1 ? weaponDefs[raceWeapon[r]].name : weaponDefs[raceWeapon[r]].plural);   // R47-F8: dwarves count axes
         if (full && raceIngots[r] > 0)   // R47-F7: shown from the first ingot
             s += "\n" + to_string(raceIngots[r]) + (raceIngots[r] == 1 ? " ingot" : " ingots") + ", tool tier " + to_string(toolTierOf(r));
     }
@@ -4226,6 +4246,7 @@ optional<hoverHit> pickHover(Vector2f p, float radius, const vector<barb>& barbs
         if (!barbHidden(barbs[i]) && !barbUnderground(barbs[i]) && near(squares[i])) {   // INBOX-F1: sheltering barbs can't be hovered; R40-F1: miners below via their shaft
             const barb& b = barbs[i];
             string label = string(b.name) + ", " + traitOf(b).name + ", " + raceOf(b).name + ": " + barbTaskName(b) + (isStarving(b) ? " (starving)" : isHungry(b) ? " (hungry)" : "");
+            if (b.hasSpear) label += ", " + weaponLabel(b);   // R47-F8: "spear, tier 2" / "axe, tier 0"
             if (b.homeHouse >= 0) {   // kin counted here, on hover only
                 int kin = 0;
                 for (auto& o : barbs) if (o.id != b.id && o.homeHouse == b.homeHouse) kin++;
@@ -6231,18 +6252,47 @@ void buildmills(vector<barb>& barbs, vector<RectangleShape>& squares, const fiel
 
 // POL-F3: the single refund path. Every abort of a paid spear craft (death, interrupt, reassignment) ends here;
 // returns the up-front cost to the crafter's race stock exactly once. No-op if nothing is owed.
+// R47-F8: only ever called from setWeapon(weaponRefund / weaponDrop).
 void refundSpear(barb& b) {
     if (!b.spearPaid) return;
     b.spearPaid = false;
     raceStock& rs = stockOf(b);
     rs.wood += spearRefundWood;
     rs.stone += spearRefundStone;
-    printf("SPEAR REFUNDED - barb %d, %s +%d wood +%d stone\n", b.id, racePlurals[clampRace(b.race)], spearRefundWood, spearRefundStone);
-    logRaceEvent(string(b.name) + "'s spear refunded", b.race);
+    printf("SPEAR REFUNDED - barb %d, %s +%d wood +%d stone (%s)\n", b.id, racePlurals[clampRace(b.race)], spearRefundWood, spearRefundStone, weaponOf(b).name);
+    logRaceEvent(string(b.name) + "'s " + weaponOf(b).name + " refunded", b.race);
 }
 
-// POL-F3: spears held or being made by race r (the per-race cap counts both)
-int spearsOfRace(const vector<barb>& barbs, int r) {
+// R47-F8: the one equip/unequip helper. Every write of hasSpear/spearPaid/weaponTier outside makeBarb() goes through here.
+//   weaponPay    - craft claimed: take the cost from the race stock up front (spearPaid)
+//   weaponEquip  - craft finished: the cost is consumed, the barb holds its race's weapon at the race's current tool tier
+//   weaponRefund - craft aborted: refundSpear() returns the cost if still owed; a held weapon is untouched
+//   weaponDrop   - barb leaves (death/removal): refund any owed cost and unarm
+enum weaponChange { weaponPay, weaponEquip, weaponRefund, weaponDrop };
+void setWeapon(barb& b, weaponChange c) {
+    switch (c) {
+        case weaponPay:
+            spend(stockOf(b), spearWoodCost, spearStoneCost);
+            b.spearPaid = true;
+            break;
+        case weaponEquip:
+            b.spearPaid = false;   // POL-F3: paid at claim; finishing consumes it, so a later refund returns nothing
+            b.hasSpear = true;
+            b.weaponTier = toolTierOf(b.race);   // read once, here; kept for life
+            break;
+        case weaponRefund:
+            refundSpear(b);
+            break;
+        case weaponDrop:
+            refundSpear(b);
+            b.hasSpear = false;
+            b.weaponTier = 0;
+            break;
+    }
+}
+
+// POL-F3: weapons (spears, dwarf axes) held or being made by race r (the per-race cap counts both)
+int weaponsOfRace(const vector<barb>& barbs, int r) {
     int n = 0;
     for (auto& b : barbs)
         if (b.race == r && (b.hasSpear || b.jobKind == jobSpear)) n++;
@@ -6252,7 +6302,7 @@ int spearsOfRace(const vector<barb>& barbs, int r) {
 // R20-F3: every way out of a spear craft (finished, interrupted, removed) clears the same barb fields.
 // POL-F3: refunds via refundSpear() first; the finish path clears spearPaid beforehand so nothing is returned.
 void clearSpearCraft(barb& b) {
-    refundSpear(b);
+    setWeapon(b, weaponRefund);   // R47-F8
     b.jobKind = jobNone;
     b.moving = b.movingbspot = b.building = false; clearRoute(b);
     b.spearTimer = 0;
@@ -6271,13 +6321,13 @@ void craftspear(vector<barb>& barbs, vector<RectangleShape>& squares, const forg
     int crafter = -1;
     for (int i = 0; i < (int)barbs.size(); i++) {
         if (barbs[i].jobKind == jobSpear) crafter = i;
-        else if (barbs[i].spearPaid) refundSpear(barbs[i]);   // reassigned without going through clearSpearCraft
+        else if (barbs[i].spearPaid) setWeapon(barbs[i], weaponRefund);   // reassigned without going through clearSpearCraft
     }
     Vector2f stand = villageCenter + spearStandOffset;
     if (crafter < 0) {
         int members[raceCount] = {}, spears[raceCount] = {};
         for (auto& b : barbs) members[clampRace(b.race)]++;
-        for (int r = 0; r < raceCount; r++) spears[r] = spearsOfRace(barbs, r);
+        for (int r = 0; r < raceCount; r++) spears[r] = weaponsOfRace(barbs, r);
         bool tried[raceCount] = {};
         for (int pass = 0; pass < raceCount; pass++) {
             int pick = -1;   // fewest spears per barb among races under their cap that can pay
@@ -6292,8 +6342,7 @@ void craftspear(vector<barb>& barbs, vector<RectangleShape>& squares, const forg
             for (auto& b : barbs) {
                 if (!barbAvailable(b) || b.race != pick || b.hasSpear || b.jobKind != jobNone || b.deertargeting || b.chopping || b.timer > 0
                     || b.moving || b.movingbspot || b.building) continue;
-                spend(stockOfRace(pick), spearWoodCost, spearStoneCost);   // POL-F3: paid up front by the crafter's race
-                b.spearPaid = true;
+                setWeapon(b, weaponPay);   // POL-F3: paid up front by the crafter's race (R47-F8: via the helper)
                 b.jobKind = jobSpear;
                 b.target = targetNone;
                 b.spearAtForge = forgeActive(fg, pick);   // POL-F5a
@@ -6302,10 +6351,10 @@ void craftspear(vector<barb>& barbs, vector<RectangleShape>& squares, const forg
                 b.targety = (int)spot.y;
                 b.moving = b.movingbspot = true;
                 b.spearTimer = 0;
-                printf("SPEAR CLAIMED - barb %d, %s %d/%d spears (paid %d wood, %d stone)%s\n", b.id, racePlurals[pick],
-                       spears[pick] + 1, members[pick] / spearBarbsPerSpear, spearWoodCost, spearStoneCost,
+                printf("SPEAR CLAIMED - barb %d, %s %d/%d %s (paid %d wood, %d stone)%s\n", b.id, racePlurals[pick],
+                       spears[pick] + 1, members[pick] / spearBarbsPerSpear, weaponOf(b).plural, spearWoodCost, spearStoneCost,
                        b.spearAtForge ? " at the forge" : "");
-                logRaceEvent(string(b.name) + " begins a spear", b.race);
+                logRaceEvent(string(b.name) + " begins " + weaponOf(b).article + " " + weaponOf(b).name, b.race);
                 return;
             }
         }
@@ -6330,11 +6379,10 @@ void craftspear(vector<barb>& barbs, vector<RectangleShape>& squares, const forg
     b.moving = false; clearRoute(b);   // standing at the fire: no walking bob while knapping
     if (workTick(b)) b.spearTimer++;
     if (b.spearTimer < (b.spearAtForge ? spearForgeTicks : spearCraftTicks)) return;
-    b.spearPaid = false;   // POL-F3: cost was taken at claim; finishing consumes it, so clearSpearCraft refunds nothing
-    b.hasSpear = true;
+    setWeapon(b, weaponEquip);   // R47-F8: consumes the cost (so clearSpearCraft refunds nothing) and snapshots the tier
     clearSpearCraft(b);
-    printf("---SPEAR MADE--- barb %d, %s\n", b.id, racePlurals[clampRace(b.race)]);
-    logRaceEvent(string(b.name) + " made a flint spear", b.race);
+    printf("---SPEAR MADE--- barb %d, %s, %s\n", b.id, racePlurals[clampRace(b.race)], weaponLabel(b).c_str());
+    logRaceEvent(string(b.name) + " made " + weaponOf(b).article + " " + weaponLabel(b), b.race);
 }
 
 void fieldTick(fieldGrid& fields) {
@@ -6476,6 +6524,7 @@ void makeBarb(Vector2i pos, vector<barb>& barbs, vector<RectangleShape>& squares
     b.spearTimer = 0;
     b.spearPaid = false;  // POL-F3
     b.spearAtForge = false;   // POL-F5a
+    b.weaponTier = 0;         // R47-F8
     b.tempering = b.temperPaid = false;   // R41-F2: no temper in progress, an untempered pick
     b.temperTimer = 0;
     b.toolCharges = 0;
@@ -7341,7 +7390,7 @@ void releaseBarbWork(barb& b, smokehouseSet& sh, forge& fg, storehouse (&stores)
     stockOf(b).stone += b.reservedstone;                    // house foundation or shrine stone
     b.reservedwood = false;
     b.reservedstone = 0;
-    refundSpear(b);                              // POL-F3: paid spear craft goes back to its race before the swapRemove
+    setWeapon(b, weaponRefund);                  // POL-F3: paid spear craft goes back to its race before the swapRemove (R47-F8: via the helper)
     clearTemper(b);                              // R41-F2: mid-temper stone refunded, charges reset (death and sheltering)
     clearSmelt(b);                               // R47-F7: mid-smelt stone refunded, forge freed
     switch (b.jobKind) {                         // claims paid at claim time stay spent; the next builder pays again
@@ -7392,6 +7441,7 @@ void removeBarb(vector<barb>& barbs, vector<RectangleShape>& squares, int i,
     releaseBarbWork(b, sh, fg, stores, fields);   // garrison state (INBOX-F1) lives in the struct and goes with the swapRemove
     ungarrison(b);                                // R31-F3: the shared reset also frees any keep slot before the swapRemove
     expeditionMemberLost(b);                      // R45-F2: invalidates its party id; expeditionTick() dissolves the party
+    setWeapon(b, weaponDrop);                     // R47-F8: the unequip half of the helper (craft already refunded above)
     if (isLeader(b)) loseLeader(b.race);
     printf("BARB DIED - %s the %s (%s, %s), id %d - %d left\n", b.name, traitOf(b).name, raceOf(b).name,
            isGentry(b) ? "Gentry" : "Commoner", b.id, (int)barbs.size() - 1);
