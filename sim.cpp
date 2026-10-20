@@ -1019,6 +1019,48 @@ const Color kShaftPuffColor(140, 124, 104);      // grey-brown dust
 const int kShaftFlashTicks = 12;                 // lintel flash countdown when the miner climbs out with stone
 const float kShaftFlashMix = 0.55f;              // peak blend of the lintel toward the flash colour
 const Color kShaftFlashColor(222, 198, 150);     // pale sandy highlight
+// Barracks and Drill Yard (R47-F6, phase 1): once a race's keep stands, a barb of that race builds one 10x8 grey-roofed
+// hall left of its crate (buildOneOff, jobBarracks) with a straw dummy in front. Idle barbs of that race nearby walk to
+// one of kDrillSlots slots beside the dummy and drill (barb.training, owned by drillTick(), cleared only by
+// clearTraining()); every hit adds to the barb's drill counter and shakes the dummy. No combat bonus or expedition
+// preference yet. The spot is reserved from the start (forgeClear), like the shaft.
+const int barracksWoodCost = 16;                 // from the race's own stock, with a house's wood and stone kept back
+const int barracksStoneCost = 6;
+const int barracksBuildTicks = houseBuildTicks;
+const Vector2f barracksSize(10.0f, 8.0f);
+const Vector2f barracksCrateOffset(-20.0f, -1.0f); // hall top-left relative to the crate: left of it, past the hauler's stand spot
+const float barracksRoofH = 3.0f;                // top 3 rows: grey roof, the top row inset 1px each side, the 3rd an eave
+const Vector2f barracksDoorPos(4.0f, 5.0f);      // dark 2x3 door centred on the 10px front, on the ground line
+const Vector2f barracksDoorSize(2.0f, 3.0f);
+const Vector2f barracksWindowPos[2] = {{1.0f, 4.0f}, {8.0f, 4.0f}};   // 1x1 dark windows either side of the door
+const Vector2f barracksStandOffset(4.0f, 9.0f);  // builder hitbox top-left relative to the hall: just below the door
+const Vector2f dummyOffset(4.0f, 10.0f);         // dummy top-left relative to the hall: in front, 1px row of grass between
+const Vector2f dummySize(3.0f, 5.0f);            // 1px head, 3px arms, 1px torso, 2px post (centre column)
+const int kDrillSlots = 2;                       // drillers per race at once: left and right of the dummy
+const Vector2f drillSlotOffset[kDrillSlots] = {{1.0f, 11.0f}, {8.0f, 11.0f}};   // barb hitbox top-left relative to the hall:
+                                                 // 1px of grass between body and arms, feet about level with the post foot
+const Vector2f barracksZoneSize(11.0f, 17.0f);   // hall + shadow + dummy + both slots (dwarf width, elf height)
+const float barracksClearPx = 3.0f;              // houses, plots, mills, walls and towers keep this far from the zone
+const float barracksRoadPadPx = 1.0f;            // quarter roads keep this far from the zone
+const float kDrillJoinRadius = 90.0f;            // idle barbs within this of their hall may join the drill...
+const int kDrillJoinOneIn = 240;                 // ...each idle tick with chance 1 in this (~4 s at 1x), so not all at once
+const int kDrillHitTicks = 50;                   // work ticks per hit on the dummy
+const int kDrillSessionHits = 12;                // hits per session (~10 s), then the barb goes back to looking for work
+const int kDrillJabTicks = 10;                   // the jab pixel shows this long after each hit
+const int kDummyShakeTicks = 12;                 // dummy top sways +-1px this long after a hit...
+const int kDummyShakeStepTicks = 3;              // ...flipping side every this many ticks
+const int kDrillPipCount = 24;                   // drill counter at which the barb wears the pip (two sessions)
+const float drillPipMinZoom = 2.0f;              // 1px pip (bottom-right body pixel, under stripe and sash) hidden below this zoom
+const Color barracksWallColor(102, 84, 64);      // weathered timber: lighter than the smokehouse, warmer than the keep
+const Color barracksRoofColor(118, 120, 124);    // flat mid grey, a touch warmer and lighter than the keep slate
+const Color barracksEaveColor(86, 88, 92);       // eave row, one step darker
+const Color barracksDoorColor(30, 24, 20);
+const Color barracksWindowColor(44, 38, 34);
+const Color dummyStrawColor(186, 158, 92);       // muted straw, dimmer than the harvest gold stripe
+const Color dummyHeadColor(206, 182, 118);       // sack head, a little lighter
+const Color dummyPostColor(88, 66, 42);          // dark timber, same as the shaft frame
+const Color drillJabColor(222, 214, 196);        // pale fist/stick pixel toward the dummy
+const Color drillPipColor(132, 30, 36);          // dark red on the off-white body: darker than the health bar brick and the hunt stripe
 
 // UI red (UIO-F1/F2/F3): one muted brick red for every "starving" mark in the UI (minimap dots, inspect panel, hunger lens)
 const Color uiStarvingRed = healthBarFillColor;
@@ -1540,8 +1582,8 @@ static_assert(weaponTierBonus[0] == 0, "an untiered weapon hits for its base dam
 // Build jobs: which structure a barb's movingbspot/building belongs to. jobNone = no job, or a house (buildhouse()).
 // jobSpear is a craft, not a structure: it uses movingbspot (so no other system grabs the barb) but never building/timer.
 // jobPave (R20-F2) is run by paveTick(): movingbspot while walking, building/timer while laying the cobbles.
-enum buildJob {jobNone, jobShrine, jobSmoke, jobStall, jobForge, jobField, jobSpear, jobPave, jobStore, jobMill, jobKeep, jobShaft, jobCamp, buildJobCount};
-const int buildJobTicks[buildJobCount] = {houseBuildTicks, shrineBuildTicks, smokehouseBuildTicks, stallBuildTicks, forgeBuildTicks, fieldBuildTicks, spearCraftTicks, paveTicks, storehouseBuildTicks, millBuildTicks, keepBuildTicks, shaftBuildTicks, campBuildTicks};
+enum buildJob {jobNone, jobShrine, jobSmoke, jobStall, jobForge, jobField, jobSpear, jobPave, jobStore, jobMill, jobKeep, jobShaft, jobCamp, jobBarracks, buildJobCount};
+const int buildJobTicks[buildJobCount] = {houseBuildTicks, shrineBuildTicks, smokehouseBuildTicks, stallBuildTicks, forgeBuildTicks, fieldBuildTicks, spearCraftTicks, paveTicks, storehouseBuildTicks, millBuildTicks, keepBuildTicks, shaftBuildTicks, campBuildTicks, barracksBuildTicks};
 // Game animals share the deer code (deers/deershape vectors); per-species numbers live in speciesDefs below.
 // Sprite offsets are relative to the logic shape (body = hitbox), written for an animal facing right.
 enum animalSpecies {speciesDeer, speciesRabbit, speciesCount};
@@ -1876,6 +1918,24 @@ bool shaftClear(const FloatRect& rect) {
     return true;
 }
 
+// R47-F6: one per race (index = barbRace), at storehousePos + barracksCrateOffset. The claim is not stored: it is "a barb
+// of this race holds jobBarracks" (like the lean-to). slotId[s] = barb id drilling in slot s (never an index), -1 = free;
+// set only by startTraining(), freed only by clearTraining() and buildbarracks()' per-tick validation. Reset in placeQuarters().
+struct barracksHall {bool built = false; int shakeTicks = 0; int slotId[kDrillSlots] = {-1, -1};};
+barracksHall halls[raceCount];
+Vector2f barracksPos(int r) { return storehousePos[r] + barracksCrateOffset; }
+Vector2f drillSlotSpot(int r, int s) { return barracksPos(r) + drillSlotOffset[clamp(s, 0, kDrillSlots - 1)]; }
+FloatRect barracksZone(int r) { return FloatRect(barracksPos(r), barracksZoneSize); }
+// False if rect comes within barracksClearPx of any race's barracks zone (reserved from the start, built or not)
+bool barracksClear(const FloatRect& rect) {
+    for (int k = 0; k < raceCount; k++) {
+        FloatRect z = barracksZone(k);
+        FloatRect zone(z.position - Vector2f(barracksClearPx, barracksClearPx), z.size + Vector2f(2 * barracksClearPx, 2 * barracksClearPx));
+        if (rect.findIntersection(zone).has_value()) return false;
+    }
+    return true;
+}
+
 // False if r comes within storehouseClearPx of any race's crate or its stand spot (reserved from the start, built or not)
 bool storehouseClear(const FloatRect& r) {
     for (int k = 0; k < raceCount; k++) {
@@ -1973,7 +2033,8 @@ bool keepClear(const FloatRect& r) {
 bool forgeClear(const FloatRect& r) {
     FloatRect zone(forgePos - Vector2f(forgeClearPx, forgeClearPx), forgeParts[0].size + Vector2f(2 * forgeClearPx, 2 * forgeClearPx));
     return !r.findIntersection(zone).has_value() && storehouseClear(r) && smokehouseClear(r) && keepClear(r) && towerClear(r)
-        && shaftClear(r);   // R34-F1
+        && shaftClear(r)   // R34-F1
+        && barracksClear(r);   // R47-F6
 }
 
 // R30-F1: race quarters
@@ -2098,6 +2159,7 @@ void placeQuarters() {
             for (auto& t : towers[k]) t = gatetower{};                     // R33-F2
             towerReservedStone[k] = 0;
             mineShafts[k] = mineShaft{};                                   // R34-F1: unbuilt, full seam
+            halls[k] = barracksHall{};                                     // R47-F6: unbuilt, slots free
         }
         wallsegs.clear();
     };
@@ -2463,6 +2525,11 @@ struct barb {
     int smeltTimer = 0;          // R47-F7: work ticks at the forge; separate from timer; cleared by clearSmelt()
     bool smeltPaid = false;      // R47-F7: kSmeltStoneCost already taken; refunded by clearSmelt() unless the smelt finished
     int jobTier = 0;             // R47-F7: tool tier read once when the current chop/mine started (toolTierOf); scales chopTicks/mineTicks
+    bool training = false;       // R47-F6: exclusive drill state owned by drillTick(); set only by startTraining(), cleared only by clearTraining()
+    int drillSlot = -1;          // R47-F6: slot index in its race's halls[].slotId while training; -1 otherwise
+    int drillTimer = 0;          // R47-F6: work ticks since the last hit (separate from timer); reset by clearTraining()
+    int drillHits = 0;           // R47-F6: hits this session; reset by clearTraining()
+    int drillCount = 0;          // R47-F6: the drill counter, hits over the barb's life; reset only in makeBarb()
 };
 // R39-F1: the one route reset, called wherever moving/movingbspot is cleared and before a barb is swapRemoved
 void clearRoute(barb& b) {
@@ -2475,6 +2542,19 @@ bool barbHidden(const barb& b) { return b.garrisoned && b.garrisonInside; }   //
 bool barbAvailable(const barb& b) { return !b.garrisoned && !b.onExpedition; }
 // R47-F7: busy at the forge (temperTick() or smeltTick() walks and works the barb); wander, hunts and orders skip it
 bool atForgeTask(const barb& b) { return b.tempering || b.smelting; }
+
+// R47-F6: the one way out of the drill state (session done, interrupted, reassigned, barracks gone, sheltering, death).
+// Frees the barb's slot if it still holds it and leaves the drill counter alone. Like clearSmelt() it leaves movement
+// alone, so a new assignment made right after is not undone (drillTick() clears movement on its own exits). Safe on a
+// barb that isn't training; every claim path that sets moving/chopping/building/timer on an idle barb calls it first.
+void clearTraining(barb& b) {
+    if (b.race >= 0 && b.race < raceCount && b.drillSlot >= 0 && b.drillSlot < kDrillSlots && halls[b.race].slotId[b.drillSlot] == b.id)
+        halls[b.race].slotId[b.drillSlot] = -1;
+    b.training = false;
+    b.drillSlot = -1;
+    b.drillTimer = 0;
+    b.drillHits = 0;
+}
 
 // R45-F2: the one party. Members are held by barb id (never an index) and re-resolved by expeditionTick() every tick;
 // removeBarb() invalidates a dying member's id through expeditionMemberLost(), so the party dissolves the next tick.
@@ -2987,6 +3067,7 @@ const char* barbTaskName(const barb& b) {
     if (b.building) return "building";
     if (b.tempering) return "tempering pick";   // R41-F2
     if (b.smelting) return "smelting ingots";   // R47-F7
+    if (b.training) return "drilling";          // R47-F6: no stripe (idle colour); the tooltip names it
     if (b.chopping && b.target == targetBush) return "picking";
     if (b.chopping && b.target == targetField) return "harvesting";
     if (b.chopping && b.target == targetLake) return "fishing";
@@ -3043,6 +3124,7 @@ void deerkilling(vector<deer>& deers, vector<RectangleShape>& deershape, vector<
 				Vector2f bpos = sq.getPosition();
 				float dx = deerpos.x - bpos.x, dy = deerpos.y - bpos.y;
 				if (dx * dx + dy * dy >= deerInfluenceDSq) continue;
+				clearTraining(b);   // R47-F6: a deer at the yard pulls a driller off the dummy
 				b.deertargeting = true;
 				b.targetDeerId = d.id;
 				b.target = targetNone;   // a hunt drops any walk to a bush or shore point (work in progress is never hijacked)
@@ -3861,6 +3943,14 @@ void drawBarbs(RenderWindow& window, const vector<barb>& barbs, const vector<Rec
             stripe.setPosition(Vector2f(base.x, bodyTop));
             window.draw(stripe);
         }
+        if (zoom >= drillPipMinZoom && b.drillCount >= kDrillPipCount) {   // R47-F6: 1px dark-red pip, bottom-right body pixel,
+            float row = bodyH - 1.0f;                                      // only on a row below the task stripe and off the sash
+            if (row > barbStripeTop && !(isGentry(b) && row >= gentrySashTop && row < gentrySashTop + gentrySashH)) {
+                dot.setFillColor(drillPipColor);
+                dot.setPosition(Vector2f(base.x + bodySize.x - 1.0f, bodyTop + row));
+                window.draw(dot);
+            }
+        }
         if (rd.hatSize.x > 0.0f) {                       // race mark above the head, never on the body
             float hatTop = bodyTop - rd.hatSize.y;
             hat.setSize(rd.hatSize);
@@ -3924,6 +4014,15 @@ void drawBarbs(RenderWindow& window, const vector<barb>& barbs, const vector<Rec
             tool.setFillColor(spearTipColor);
             tool.setPosition(Vector2f(side, raised ? bodyTop + 1.0f : bodyTop + 2.0f));
             window.draw(tool);
+        } else if (b.training && !b.moving) {   // R47-F6: at the dummy: wind up (head row) just before a hit, jab (arm row) just after
+            bool windUp = b.drillTimer >= kDrillHitTicks - kDrillJabTicks;
+            bool jab = b.drillHits > 0 && b.drillTimer < kDrillJabTicks;
+            if (windUp || jab) {
+                tool.setFillColor(drillJabColor);
+                float x = b.drillSlot == 0 ? side : base.x - 1.0f;   // slot 0 stands left of the dummy, slot 1 right
+                tool.setPosition(Vector2f(x, windUp ? bodyTop : bodyTop + 1.0f));
+                window.draw(tool);
+            }
         }
         if (b.toolCharges > 0) {   // R41-F2: tempered pick: 2x2 steel pip beside the left foot, one column clear of the trait dot
             stripe.setSize(temperPipSize);
@@ -4280,6 +4379,7 @@ optional<hoverHit> pickHover(Vector2f p, float radius, const vector<barb>& barbs
             const barb& b = barbs[i];
             string label = string(b.name) + ", " + traitOf(b).name + ", " + raceOf(b).name + ": " + barbTaskName(b) + (isStarving(b) ? " (starving)" : isHungry(b) ? " (hungry)" : "");
             if (b.hasSpear) label += ", " + weaponLabel(b);   // R47-F8: "spear, tier 2" / "axe, tier 0"
+            if (b.drillCount > 0) label += ", " + to_string(b.drillCount) + " drills";   // R47-F6: the drill counter
             if (b.homeHouse >= 0) {   // kin counted here, on hover only
                 int kin = 0;
                 for (auto& o : barbs) if (o.id != b.id && o.homeHouse == b.homeHouse) kin++;
@@ -5324,6 +5424,11 @@ bool houseSpotOk(const vector<barb>& barbs, const vector<house>& houses, const f
         FloatRect pad(z.position - Vector2f(keepRoadPadPx, keepRoadPadPx), z.size + Vector2f(2 * keepRoadPadPx, 2 * keepRoadPadPx));
         if (segmentHitsRect(qc, door, pad)) return false;
     }
+    {   // R47-F6: nor its own race's barracks and drill yard
+        FloatRect z = barracksZone(race);
+        FloatRect pad(z.position - Vector2f(barracksRoadPadPx, barracksRoadPadPx), z.size + Vector2f(2 * barracksRoadPadPx, 2 * barracksRoadPadPx));
+        if (segmentHitsRect(qc, door, pad)) return false;
+    }
     return true;
 }
 
@@ -5414,6 +5519,7 @@ void buildhouse(vector<barb>& barbs,vector<RectangleShape>& squares, vector<hous
                        hypot(tx + 2.0f - qc.x, ty + 2.0f - qc.y));
             }
             raceStock& rs = stockOf(b);
+            clearTraining(b);   // R47-F6: a house claim outranks the drill
             b.reservedwood = true;
             b.reservedstone = canAfford(rs, houseWoodCost, houseStoneCost) ? houseStoneCost : 0; // 0 stone -> plain house
             spend(rs, houseWoodCost, b.reservedstone);
@@ -5524,6 +5630,7 @@ void buildshrine(vector<barb>& barbs, vector<RectangleShape>& squares, const vec
             canclaim = false;   // one claim attempt per tick; keep looping so builders already en route still progress
             if (!found) continue;
             spend(stockOf(b), 0, shrineStoneCost);
+            clearTraining(b);   // R47-F6
             b.reservedstone = shrineStoneCost;
             b.jobKind = jobShrine;
             b.targetx = tx;
@@ -5598,6 +5705,7 @@ bool buildOneOff(vector<barb>& barbs, vector<RectangleShape>& squares, bool& cla
             if (r < 0) return false;
             if (r == 0) continue;
             claimed = true;
+            clearTraining(b);   // R47-F6: any one-off build claim outranks the drill
             b.jobKind = kind;
             b.targetx = (int)stand.x;
             b.targety = (int)stand.y;
@@ -6399,6 +6507,7 @@ void craftspear(vector<barb>& barbs, vector<RectangleShape>& squares, const forg
                 if (!barbAvailable(b) || b.race != pick || b.hasSpear || b.jobKind != jobNone || b.deertargeting || b.chopping || b.timer > 0
                     || b.moving || b.movingbspot || b.building) continue;
                 setWeapon(b, weaponPay);   // POL-F3: paid up front by the crafter's race (R47-F8: via the helper)
+                clearTraining(b);          // R47-F6
                 b.jobKind = jobSpear;
                 b.target = targetNone;
                 b.spearAtForge = forgeActive(fg, pick);   // POL-F5a
@@ -6587,6 +6696,9 @@ void makeBarb(Vector2i pos, vector<barb>& barbs, vector<RectangleShape>& squares
     b.smelting = b.smeltPaid = false;   // R47-F7: no smelt in progress, tier read fresh at the first job
     b.smeltTimer = 0;
     b.jobTier = 0;
+    b.training = false;   // R47-F6: not drilling, no slot, counter at 0
+    b.drillSlot = -1;
+    b.drillTimer = b.drillHits = b.drillCount = 0;
     for (auto& m : b.mem) m = workMem{};   // INBOX-F2: a newborn remembers no spots
     b.memReturn = b.memShared = false;
     b.order = needNone;   // INBOX-F2b: a newborn holds no order
@@ -6641,7 +6753,8 @@ void shinobiTick(vector<barb>& barbs, vector<RectangleShape>& squares, const vec
     for (int i = 0; i < (int)barbs.size() && i < (int)squares.size(); i++) {
         barb& b = barbs[i];
         if (!b.shinobi) continue;
-        if (!barbAvailable(b) || b.moving || b.chopping || b.building || b.movingbspot || b.deertargeting || b.timer > 0 || b.jobKind != jobNone) continue;
+        if (!barbAvailable(b) || b.moving || b.chopping || b.building || b.movingbspot || b.deertargeting || b.timer > 0 || b.jobKind != jobNone
+            || b.training) continue;   // R47-F6: no blinking off the drill slot
         if (blinkChance(gen) != 0) continue;
         Vector2f from = squares[i].getPosition(), size = squares[i].getSize();
         for (int t = 0; t < shinobiBlinkTries; t++) {
@@ -6905,6 +7018,7 @@ void paveTick(vector<barb>& barbs, vector<RectangleShape>& squares) {
     barb& b = barbs[who];
     Vector2f stand = bestCentre - squares[who].getSize() / 2.0f;   // hitbox centred on the cell
     paveClaim = best;
+    clearTraining(b);   // R47-F6
     b.jobKind = jobPave;
     b.target = targetNone;
     b.targetx = (int)stand.x;
@@ -7449,6 +7563,7 @@ void releaseBarbWork(barb& b, smokehouseSet& sh, forge& fg, storehouse (&stores)
     setWeapon(b, weaponRefund);                  // POL-F3: paid spear craft goes back to its race before the swapRemove (R47-F8: via the helper)
     clearTemper(b);                              // R41-F2: mid-temper stone refunded, charges reset (death and sheltering)
     clearSmelt(b);                               // R47-F7: mid-smelt stone refunded, forge freed
+    clearTraining(b);                            // R47-F6: drill slot freed (death and sheltering)
     switch (b.jobKind) {                         // claims paid at claim time stay spent; the next builder pays again
         case jobSmoke: if (b.race >= 0 && b.race < raceCount && !sh[b.race].built) sh[b.race].claimed = false; break;   // INBOX2-F1: own race's hut
         case jobForge: if (!fg.built) fg.claimed = false; break;
@@ -7751,7 +7866,8 @@ void rankRaceNeed(const vector<barb>& barbs, int r) {
 
 // INBOX-F2b: idle = no work, build, hunt, haul or job claim. Garrisoned barbs are never idle, so an order never touches shelter
 bool orderIdle(const barb& b) {
-    return barbAvailable(b) && !b.chopping && !b.building && !b.movingbspot && !b.deertargeting && b.jobKind == jobNone && b.carryKind == carryNone && !atForgeTask(b);   // R47-F7
+    return barbAvailable(b) && !b.chopping && !b.building && !b.movingbspot && !b.deertargeting && b.jobKind == jobNone && b.carryKind == carryNone && !atForgeTask(b)   // R47-F7
+        && !b.training;   // R47-F6: drillers take no orders and join no party (expedition preference deferred)
 }
 
 // INBOX-F2b: right after the leader names its need, it hands that need as an individual order to idle members (not
@@ -7870,6 +7986,7 @@ void expeditionReset(barb& b) {
     clearRoute(b);
     leaveMine(b);
     clearSmelt(b);   // R47-F7: eligibility (orderIdle) already rules smelters out; this keeps the forge claim honest regardless
+    clearTraining(b);   // R47-F6: likewise for drillers and their slot
     b.stepTimer = 0;
     b.target = targetNone;
     b.targetBush = b.targetShore = -1;
@@ -8222,13 +8339,93 @@ void barbspawner(vector<RectangleShape>& squares, vector<barb>& barbs, const vec
     }
 }
 
+// R47-F6: a free drill slot in race r's built barracks, or -1
+int freeDrillSlot(int r) {
+    if (r < 0 || r >= raceCount || !halls[r].built) return -1;
+    for (int s = 0; s < kDrillSlots; s++) if (halls[r].slotId[s] < 0) return s;
+    return -1;
+}
+
+// R47-F6: may this idle, standing barb (top-left pos) join its race's drill? Called from barbmove() only, which has
+// already ruled out work, builds, hauls and forge tasks; orderIdle() adds hunts and job claims, and no live order.
+bool drillWanted(const barb& b, Vector2f pos) {
+    if (b.training || b.moving || b.timer > 0 || b.inMine || b.target != targetNone || b.order != needNone || !orderIdle(b)) return false;
+    if (freeDrillSlot(b.race) < 0) return false;
+    Vector2f d = barracksPos(b.race) + barracksSize / 2.0f - pos;
+    return d.x * d.x + d.y * d.y < kDrillJoinRadius * kDrillJoinRadius;
+}
+
+// R47-F6: the only place the drill state is set. The slot is held by barb id from here until clearTraining().
+void startTraining(barb& b, int s) {
+    halls[b.race].slotId[s] = b.id;
+    b.training = true;
+    b.drillSlot = s;
+    b.drillTimer = b.drillHits = 0;
+    Vector2f spot = drillSlotSpot(b.race, s);
+    b.target = targetNone;
+    b.targetx = (int)spot.x;
+    b.targety = (int)spot.y;
+    b.wanderX = b.wanderY = -1;
+    b.moving = true;
+    b.stepTimer = 0;
+    printf("DRILL STARTED - barb %d (%s), slot %d, counter %d\n", b.id, racePlurals[clampRace(b.race)], s, b.drillCount);
+}
+
+// R47-F6: one drill step, called from minematerials() for a training barb: walk to the slot, then a hit on the dummy
+// every kDrillHitTicks work ticks (drill counter +1, dummy shakes). After kDrillSessionHits the barb is released to look
+// for work again. A lost barracks or slot ends the session through clearTraining().
+void drillTick(barb& b, RectangleShape& sq) {
+    auto release = [&]() {
+        b.moving = false; clearRoute(b);
+        b.stepTimer = 0;
+        b.targetx = b.targety = -1;
+    };
+    int r = b.race;
+    if (r < 0 || r >= raceCount || !halls[r].built || b.drillSlot < 0 || b.drillSlot >= kDrillSlots || halls[r].slotId[b.drillSlot] != b.id) {
+        printf("DRILL ABORTED - barb %d, slot lost\n", b.id);
+        clearTraining(b);
+        release();
+        return;
+    }
+    Vector2f spot = drillSlotSpot(r, b.drillSlot);
+    b.targetx = (int)spot.x;
+    b.targety = (int)spot.y;
+    Vector2f diff = spot - sq.getPosition();
+    if (diff.x * diff.x + diff.y * diff.y >= 1.0f) {
+        b.moving = true;
+        walkStep(b, sq);   // R39-F1
+        return;
+    }
+    b.moving = false; clearRoute(b);   // squared up to the dummy
+    if (!workTick(b)) return;
+    if (++b.drillTimer < kDrillHitTicks) return;
+    b.drillTimer = 0;
+    b.drillHits++;
+    b.drillCount++;
+    halls[r].shakeTicks = kDummyShakeTicks;
+    if (b.drillCount == kDrillPipCount) {
+        printf("---DRILLED--- barb %d (%s) reaches %d drills\n", b.id, racePlurals[r], b.drillCount);
+        logRaceEvent(string(b.name) + " is drilled (" + to_string(b.drillCount) + " hits)", r);
+    }
+    if (b.drillHits < kDrillSessionHits) return;
+    printf("DRILL DONE - barb %d (%s), %d hits, counter %d\n", b.id, racePlurals[r], b.drillHits, b.drillCount);
+    clearTraining(b);
+    release();
+}
+
 void barbmove(vector<RectangleShape>& squares, vector<barb>& barbs) {
+    static uniform_int_distribution<int> drillJoin(0, kDrillJoinOneIn - 1);   // R47-F6
     for (int i = 0; i < (int)squares.size(); i++) {
         auto& sq = squares[i];
         auto& b  = barbs[i];
         if (!barbAvailable(b) || b.chopping || b.timer > 0 || b.movingbspot || b.building || b.carryKind != carryNone || atForgeTask(b)) continue;   // R29-F1: haulTick() walks haulers; INBOX-F1: bellTick() walks garrisoned; R41-F2: temperTick() walks temperers (R47-F7: smeltTick() smelters); R45-F2: expeditionTick() walks parties
+        if (b.training) continue;   // R47-F6: drillTick() walks drillers
         Vector2f pos = sq.getPosition();
         if (!b.moving) {
+            if (drillWanted(b, pos) && drillJoin(gen) == 0) {   // R47-F6: an idle barb near its barracks may drill instead
+                startTraining(b, freeDrillSlot(b.race));
+                continue;
+            }
             if (wanderChance(gen) != 0) continue;
             int tx = (int)pos.x + wanderDX(gen);
             int ty = (int)pos.y + wanderDY(gen);
@@ -8265,7 +8462,8 @@ void buildWorkClaims(const vector<barb>& barbs, const vector<CircleShape>& tris,
     unordered_map<long long, int> treeSpots, rockSpots;
     for (int j = 0; j < (int)barbs.size(); j++) {
         const barb& b = barbs[j];
-        if (!barbAvailable(b) || b.targetx == -1 || b.target == targetBush || b.target == targetLake || b.target == targetField || b.target == targetDepot || b.deertargeting || b.movingbspot || b.building) continue;
+        if (!barbAvailable(b) || b.targetx == -1 || b.target == targetBush || b.target == targetLake || b.target == targetField || b.target == targetDepot || b.deertargeting || b.movingbspot || b.building
+            || b.training) continue;   // R47-F6: a drill slot is not a tree spot
         (b.target == targetRock ? rockSpots : treeSpots).emplace(workSpotKey(b.targetx, b.targety), j); // first claimant kept
     }
     treeClaim.assign(tris.size(), -1);
@@ -8649,6 +8847,13 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
                 printf("SMELT INTERRUPTED - barb %d\n", b.id);
                 clearSmelt(b);
             } else { smeltTick(b, sq, fg); continue; }
+        }
+        if (b.training) {   // R47-F6: backstop: any other state set on a driller without clearTraining() ends the session
+            if (b.movingbspot || b.building || b.deertargeting || b.chopping || b.timer > 0 || b.jobKind != jobNone
+                || b.carryKind != carryNone || atForgeTask(b) || b.target != targetNone) {
+                printf("DRILL INTERRUPTED - barb %d\n", b.id);
+                clearTraining(b);
+            } else { drillTick(b, sq); continue; }   // no work search while drilling: the session is short
         }
         if (b.carryKind != carryNone) {   // R29-F1: any other state taken over the haul drops the load
             if (b.target != targetDepot || b.movingbspot || b.building || b.deertargeting || b.chopping || b.jobKind != jobNone) dropCarry(b);
@@ -9521,6 +9726,74 @@ void buildcamps(vector<barb>& barbs, vector<RectangleShape>& squares, const vect
     }
 }
 
+// R47-F6: runs after buildkeeps(). Each race whose keep stands builds one barracks at its fixed spot left of the crate,
+// through buildOneOff (jobBarracks) by a barb of that race, paid at claim with a house's wood and stone kept back. The
+// claim is not stored ("a barb of this race holds jobBarracks"), so a lost builder frees it through releaseBarbWork().
+// Also, every tick: each drill slot must name a live training barb of that race in that slot, and the dummy shake counts down.
+void buildbarracks(vector<barb>& barbs, vector<RectangleShape>& squares, const storehouse (&stores)[raceCount],
+                   const vector<CircleShape>& bushshapes) {
+    for (int r = 0; r < raceCount; r++) {
+        barracksHall& hall = halls[r];
+        for (int s = 0; s < kDrillSlots; s++) {
+            int id = hall.slotId[s];
+            if (id < 0) continue;
+            int j = findBarbById(barbs, id);
+            if (j < 0 || !barbs[j].training || barbs[j].drillSlot != s || barbs[j].race != r) {
+                printf("DRILL SLOT FREED - %s slot %d, barb %d\n", racePlurals[r], s, id);
+                hall.slotId[s] = -1;
+            }
+        }
+        if (hall.shakeTicks > 0) hall.shakeTicks--;
+        if (hall.built || !stores[r].built || !keeps[r].built) continue;
+        bool claimed = false;
+        for (auto& b : barbs) if (b.jobKind == jobBarracks && b.race == r) claimed = true;
+        bool done = buildOneOff(barbs, squares, claimed, jobBarracks, barracksPos(r) + barracksStandOffset, "BARRACKS",
+            [&](const barb&) {
+                FloatRect z = barracksZone(r);
+                if (!lakeClear(z)) return -1;   // fixed spot: a lake or bush on it means no barracks for this race
+                for (auto& bs : bushshapes) if (z.findIntersection(bs.getGlobalBounds())) return -1;
+                if (!canAfford(stock[r], barracksWoodCost + houseWoodCost, barracksStoneCost + houseStoneCost)) return -1;
+                spend(stock[r], barracksWoodCost, barracksStoneCost);
+                return 1;
+            }, r);
+        if (!done) continue;
+        hall.built = true;
+        printf("---BARRACKS BUILT--- %s (%d wood, %d stone), %d drill slots\n", raceDefs[r].name, barracksWoodCost, barracksStoneCost, kDrillSlots);
+        logRaceEvent(string(racePlurals[r]) + " raise a barracks", r);
+    }
+}
+
+// R47-F6: 10x8 hall (inset grey roof row, full roof row, darker eave, timber walls, 2x3 door, two 1px windows) with a
+// 1px ground shadow, and the straw dummy in front: fixed post and torso, head and arms swaying 1px after each hit.
+// World layer with the other buildings, under barbs and trees.
+void drawBarracks(RenderWindow& window) {
+    RectangleShape p;
+    auto rect = [&](Vector2f pos, Vector2f size, Color c) {
+        p.setPosition(pos);
+        p.setSize(size);
+        p.setFillColor(c);
+        window.draw(p);
+    };
+    for (int r = 0; r < raceCount; r++) {
+        const barracksHall& hall = halls[r];
+        if (!hall.built) continue;
+        Vector2f o = snapPx(barracksPos(r));
+        rect(o + Vector2f(1.0f, barracksSize.y), Vector2f(barracksSize.x, 1.0f), buildingShadowColor);
+        rect(o + Vector2f(0.0f, barracksRoofH), Vector2f(barracksSize.x, barracksSize.y - barracksRoofH), barracksWallColor);
+        rect(o + Vector2f(1.0f, 0.0f), Vector2f(barracksSize.x - 2.0f, 1.0f), barracksRoofColor);
+        rect(o + Vector2f(0.0f, 1.0f), Vector2f(barracksSize.x, barracksRoofH - 2.0f), barracksRoofColor);
+        rect(o + Vector2f(0.0f, barracksRoofH - 1.0f), Vector2f(barracksSize.x, 1.0f), barracksEaveColor);
+        rect(o + barracksDoorPos, barracksDoorSize, barracksDoorColor);
+        for (auto& w : barracksWindowPos) rect(o + w, Vector2f(1.0f, 1.0f), barracksWindowColor);
+        Vector2f d = o + dummyOffset;
+        float sway = hall.shakeTicks > 0 ? ((hall.shakeTicks / kDummyShakeStepTicks) % 2 == 0 ? 1.0f : -1.0f) : 0.0f;
+        rect(d + Vector2f(1.0f, 3.0f), Vector2f(1.0f, dummySize.y - 3.0f), dummyPostColor);   // post, planted
+        rect(d + Vector2f(1.0f, 2.0f), Vector2f(1.0f, 1.0f), dummyStrawColor);                // torso, planted
+        rect(d + Vector2f(sway, 1.0f), Vector2f(dummySize.x, 1.0f), dummyStrawColor);         // arms
+        rect(d + Vector2f(1.0f + sway, 0.0f), Vector2f(1.0f, 1.0f), dummyHeadColor);          // sack head
+    }
+}
+
 // R45-F1b: pale stones, one vertex array: body, 1px weathered cap (broken stones: a 4px stub, the corner knocked off),
 // 1px shaded right column, moss at the foot of every other stone. Drawn with the buildings, under barbs and trees.
 void drawRuins(RenderWindow& window) {
@@ -9903,6 +10176,7 @@ int main() {
                 buildfield(barbs, squares, houses, shrines, stores, fields);
                 buildmills(barbs, squares, fields);   // FARM-F2
                 buildkeeps(barbs, squares, stores);   // R31-F1: Town era
+                buildbarracks(barbs, squares, stores, bushshapes);   // R47-F6: once the keep stands; drill slot upkeep
                 wallTick(barbs, trees, tris, stumps, octs, bushshapes, houseshapes, shrines, fields);   // R31-F2: cosmetic curtain walls
                 towerTick(barbs, squares);   // R33-F2: gatehouse towers, after the wall completes
                 causewayTick();   // R33-F3: keep -> crate stone road
@@ -10025,6 +10299,7 @@ int main() {
 	if (forgeEmberFrames > 0 && !paused) forgeEmberFrames--;
 	drawStorehouses(window, stores);
 	drawMineShafts(window, barbs, squares);   // R34-F1: beside the crates, under barbs
+	drawBarracks(window);   // R47-F6: hall + straw dummy, left of the crates, under barbs
 	drawGarrison(window, barbs, houses, houseshapes, stores);   // INBOX-F1: bell marker, sheltering roof tint + pips
 	for (auto& st : stores) if (st.flashFrames > 0 && !paused) st.flashFrames--;
 	for (int r = 0; r < raceCount; r++)
