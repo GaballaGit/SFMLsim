@@ -1263,6 +1263,42 @@ const Color relicGlintColor(236, 224, 178);    // 1px relic beside the carrier o
 const Color relicGlintDimColor(170, 158, 120); // twinkle low phase
 const int relicGlintFrames = 12;               // glint alternates bright/dim every this many frames
 
+// R47-F5 The Hollow: a 6x6 stair mouth inside the ruin site disc (placed by spawnRuins, beside the stones, off the
+// camps and the ridge). A party of a race with a lean-to walks straight to it, descends (members hidden, the one room
+// abstracted as expDelveTicks below), surfaces with one roll of a capped loot table and walks home. No HP, wounds or
+// panel below. A party that breaks up (a member lost) is released at the mouth and its rations go back to the larder.
+const Vector2f hollowSize(6.0f, 6.0f);     // same footprint as a well; smaller than a house (8x7)
+const float hollowRuinDist = 27.0f;        // mouth centre -> site centre: past the stone ring (14 + 10), inside the disc (40)
+const float hollowPickChance = 0.5f;       // when both the ruins and the Hollow are open and nearest, chance of the Hollow
+const int hollowLootCap = 5;               // hauls the one room ever gives; then it is picked clean and never a target again
+struct hollowLootDef { const char* what; int food, stone; float weight; };
+constexpr int hollowLootCount = 4;
+constexpr int hollowLootMaxFood = 5, hollowLootMaxStone = 4;   // per haul: modest, like the sites (food 3-6, stone 2-4)
+constexpr hollowLootDef hollowLoot[hollowLootCount] = {
+    {"a jar of old grain",   5, 0, 0.35f},
+    {"dressed stone blocks", 0, 4, 0.35f},
+    {"a small buried hoard", 2, 2, 0.15f},
+    {"nothing but dust",     0, 0, 0.15f},
+};
+constexpr bool hollowLootCapped() {
+    for (int i = 0; i < hollowLootCount; i++)
+        if (hollowLoot[i].food > hollowLootMaxFood || hollowLoot[i].stone > hollowLootMaxStone || hollowLoot[i].weight <= 0.0f) return false;
+    return true;
+}
+static_assert(hollowLootCapped(), "every Hollow haul must stay within hollowLootMaxFood / hollowLootMaxStone");
+// Look: pale stone lintel and jambs (the ruin palette) round a dark opening with three 1px steps fading into the dark
+const Color hollowLintelColor(192, 186, 166);   // = ruinStoneTopColor
+const Color hollowJambColor(168, 162, 144);     // = ruinStoneColor
+const Color hollowJambShadeColor(128, 122, 108); // = ruinStoneShadeColor, right jamb
+const Color hollowDarkColor(18, 16, 14);
+const Color hollowStepColors[3] = {Color(96, 90, 78), Color(62, 58, 50), Color(38, 35, 30)};   // top step lit, deeper ones darker
+const Color hollowCleanStepColor(44, 41, 36);   // picked clean: all steps one flat dull tone
+const int hollowFlashTicks = 40;           // lintel flash countdown when a party surfaces (~0.7s at 1x)
+const float hollowFlashMix = 0.7f;         // peak blend of the lintel toward the flash colour
+const Color hollowFlashColor(246, 240, 214);    // pale cream-white
+const Color lootGlintColor(214, 218, 224);      // 1px loot beside the carrier on the walk home: pale silver, apart from the relic gold
+const Color lootGlintDimColor(150, 154, 162);
+
 // Lakeside angling (R19-F1): a barb with no tree/rock/bush in reach walks to a free cached shore point and fishes.
 // One angler per shore point; stand spots sit on the bank and are never lakeClear()-checked (they are inside the keep-clear zone).
 const float fishSearchRadius = 60.0f;      // wider than barbWorkSearchRadius: lakes are few and away from the village
@@ -2309,8 +2345,29 @@ struct expeditionParty {
     int poiId = -1;                     // R47-F4: target site (poi.id, re-looked up every tick); -1 = the ruins
     poiKind siteKind = poiHut;          // R47-F4: kept for the ticker after the site is gone
     int rewardFood = 0, rewardStone = 0; // R47-F4: a site's reward, carried home and paid on return
+    bool hollow = false;                // R47-F5: this trip goes down the Hollow (poiId stays -1)
+    int lootIdx = -1;                   // R47-F5: hollowLoot row rolled on surfacing; -1 = not yet
 };
 expeditionParty party;
+// R47-F5: the Hollow. Placed with the ruins (no ruins, no Hollow); lootLeft counts down to 0 = picked clean.
+bool hollowPlaced = false;
+Vector2f hollowPos(-1000.0f, -1000.0f);   // top-left, fixed after spawnRuins()
+int hollowLootLeft = hollowLootCap;
+int hollowFlash = 0;                      // lintel flash ticks left, counted down by expeditionTick()
+bool hollowOpen() { return hollowPlaced && hollowLootLeft > 0; }
+// Below right now: hidden (drawn, hovered and picked like a miner down a shaft)
+bool barbInHollow(const barb& b) { return b.onExpedition && party.active && party.hollow && party.phase == expeditionParty::Delve; }
+RectangleShape hollowShape() {   // the mouth's footprint, for picking and the select ring of a member below
+    RectangleShape s(hollowSize);
+    s.setPosition(hollowPos);
+    return s;
+}
+// R47-F5: the loot carrier on the walk home (memberIds[0]); -1 = nobody or an empty haul
+int lootCarrierId() {
+    if (!party.active || !party.hollow || party.phase != expeditionParty::Back || party.lootIdx < 0) return -1;
+    const hollowLootDef& l = hollowLoot[party.lootIdx];
+    return l.food + l.stone > 0 ? party.memberIds[0] : -1;
+}
 int raceRelics[raceCount] = {0, 0, 0};   // relics each race has brought home, capped at expRelicCap
 int expeditionCooldown = expFirstDelayTicks;
 void expeditionMemberLost(const barb& b) {
@@ -2398,7 +2455,9 @@ int shaftMinerOf(const vector<barb>& barbs, int r) {
     return -1;
 }
 // R40-F1: down the shaft right now. Separate from barbHidden() (garrison only); re-checks the job so a stale flag never hides a barb
-bool barbUnderground(const barb& b) { return b.inMine && !b.garrisoned && atShaftTarget(b) && mineShafts[b.race].built; }
+bool barbUnderground(const barb& b) {
+    return (b.inMine && !b.garrisoned && atShaftTarget(b) && mineShafts[b.race].built) || barbInHollow(b);   // R47-F5: or down the Hollow
+}
 // R40-F1: the one way out of the pit. withLoad = climbing out with stone (starts the lintel flash). Safe if not in the mine.
 void leaveMine(barb& b, bool withLoad = false) {
     if (!b.inMine) return;
@@ -2750,7 +2809,8 @@ const char* barbTaskName(const barb& b) {
     if (b.garrisoned) return b.garrisonInside ? "sheltering" : "running to shelter";   // INBOX-F1
     if (b.onExpedition)   // R45-F2
         return party.phase == expeditionParty::Out ? "expedition: setting out"
-             : party.phase == expeditionParty::Delve ? "expedition: delving" : "expedition: heading home";
+             : party.phase == expeditionParty::Delve ? (party.hollow ? "expedition: below the Hollow" : "expedition: delving")   // R47-F5
+             : "expedition: heading home";
     if (b.deertargeting) return b.hasSpear ? "hunting (spear)" : "hunting";
     if (b.building) return "building";
     if (b.tempering) return "tempering pick";   // R41-F2
@@ -3507,6 +3567,7 @@ void drawBarbs(RenderWindow& window, const vector<barb>& barbs, const vector<Rec
     RectangleShape body(barbBodySize), stripe(Vector2f(barbBodySize.x, barbStripeH)), tool(barbToolSize), hat, tip, dot(Vector2f(1.0f, 1.0f));
     bool showTraits = zoom >= traitDotMinZoom;
     int carrierId = relicCarrierId();   // R45-F2
+    int lootId = lootCarrierId();       // R47-F5
     static VertexArray lookVerts(PrimitiveType::Triangles);   // R35-F1: every race mark this frame, one draw after the loop
     lookVerts.clear();
     auto addLookQuad = [](Vector2f p, Vector2f sz, Color c) {
@@ -3651,6 +3712,10 @@ void drawBarbs(RenderWindow& window, const vector<barb>& barbs, const vector<Rec
         }
         if (b.id == carrierId) {   // R45-F2: 1px relic held low, one column out from the arm/spear column, twinkling
             dot.setFillColor((frame / relicGlintFrames) % 2 == 0 ? relicGlintColor : relicGlintDimColor);
+            dot.setPosition(Vector2f(side + 1.0f, bodyTop + bodyH - 1.0f));
+            window.draw(dot);
+        } else if (b.id == lootId) {   // R47-F5: Hollow loot, same 1px spot, pale silver twinkle
+            dot.setFillColor((frame / relicGlintFrames) % 2 == 0 ? lootGlintColor : lootGlintDimColor);
             dot.setPosition(Vector2f(side + 1.0f, bodyTop + bodyH - 1.0f));
             window.draw(dot);
         }
@@ -4036,6 +4101,17 @@ optional<hoverHit> pickHover(Vector2f p, float radius, const vector<barb>& barbs
         else if (pois[i].found) label += ": found, not yet searched";
         return hoverHit{label, body, nullopt};
     }
+    if (hollowPlaced) {   // R47-F5: the stair mouth
+        RectangleShape mouth(hollowSize + Vector2f(2 * ruinHoverPad, 2 * ruinHoverPad));
+        mouth.setPosition(hollowPos - Vector2f(ruinHoverPad, ruinHoverPad));
+        if (near(mouth)) {
+            string label = "The Hollow: stairs into the dark";
+            if (party.active && party.hollow && party.phase == expeditionParty::Delve)
+                label += "\n" + string(raceDefs[clampRace(party.race)].name) + " party below";
+            label += hollowLootLeft > 0 ? "\nhauls left " + to_string(hollowLootLeft) + "/" + to_string(hollowLootCap) : string("\npicked clean");
+            return hoverHit{label, mouth, nullopt};
+        }
+    }
     for (auto& st : ruinStones) {   // R45-F1b: any stone outlines that stone
         RectangleShape stone(st.size + Vector2f(2 * ruinHoverPad, 2 * ruinHoverPad));
         stone.setPosition(st.position - Vector2f(ruinHoverPad, ruinHoverPad));
@@ -4106,7 +4182,8 @@ int pickBarbAt(Vector2f p, float radius, const vector<barb>& barbs, const vector
     for (int i = 0; i < (int)squares.size() && i < (int)barbs.size(); i++) {
         if (barbHidden(barbs[i])) continue;   // INBOX-F1
         FloatRect box = squares[i].getGlobalBounds();
-        if (barbUnderground(barbs[i])) box = FloatRect(shaftPos(barbs[i].race), shaftSize);   // R40-F1: picked through its shaft
+        if (barbInHollow(barbs[i])) box = FloatRect(hollowPos, hollowSize);   // R47-F5: picked through the stair mouth
+        else if (barbUnderground(barbs[i])) box = FloatRect(shaftPos(barbs[i].race), shaftSize);   // R40-F1: picked through its shaft
         float dSq = rectDistSq(box, p);
         if (dSq <= bestSq) { bestSq = dSq; best = barbs[i].id; }
     }
@@ -7390,7 +7467,7 @@ bool expeditionEligible(const barb& b, int r) {
 Vector2f expeditionGoal(int k) {
     int r = clampRace(party.race);
     Vector2f along(-expMemberGapPx * k, 0.0f);
-    if (party.phase == expeditionParty::Out && party.poiId < 0) return campSpot[r] + campStandOffset + along;
+    if (party.phase == expeditionParty::Out && party.poiId < 0 && !party.hollow) return campSpot[r] + campStandOffset + along;   // R47-F5: the Hollow walks straight to the mouth
     if (party.phase != expeditionParty::Back) return party.delveSpot[k];   // R47-F4: a site trip walks straight to the site
     return storehousePos[r] + storehouseStandOffset + along;
 }
@@ -7410,6 +7487,8 @@ void endExpedition(vector<barb>& barbs, const int (&idx)[expPartySize]) {
     party.lostName = nullptr;
     party.poiId = -1;
     party.rewardFood = party.rewardStone = 0;
+    party.hollow = false;   // R47-F5
+    party.lootIdx = -1;
     expeditionCooldown = expCooldownTicks;
 }
 
@@ -7424,16 +7503,23 @@ void discoverPoi(int i, int r, const char* who) {
 
 // R47-F4: where a party of race r goes. The nearest undiscovered unspent site competes with the ruins (if ruinsOk) by
 // distance from the crate; then the ruins; then the nearest found but unspent site. Spent sites are never picked.
-// Returns a pois index (valid only until the next removal: the caller stores the id), -1 = the ruins, -2 = nowhere.
-int pickExpeditionSite(int r, bool ruinsOk) {
+// Returns a pois index (valid only until the next removal: the caller stores the id), -1 = the ruins, -2 = nowhere,
+// expSiteHollow = the Hollow. R47-F5: the Hollow (hollowOk) sits at the ruins, so it competes at the ruins' distance;
+// when both are open one is picked at hollowPickChance.
+const int expSiteHollow = -3;
+int pickExpeditionSite(int r, bool ruinsOk, bool hollowOk) {
     Vector2f from = storehousePos[clampRace(r)];
     float far = 2.0f * worldSize, uDSq = 0.0f;
     int n = (int)pois.size();
     int u = findNearest(from, far, n, [&](int i) { return poiCentre(i); },
                         [&](int i) { return pois[i].spent || pois[i].found; }, &uDSq);
-    if (ruinsOk) {
+    if (ruinsOk || hollowOk) {
         Vector2f d = ruinCentre - from;
-        if (u < 0 || d.x * d.x + d.y * d.y < uDSq) return -1;
+        if (u < 0 || d.x * d.x + d.y * d.y < uDSq) {
+            if (!ruinsOk) return expSiteHollow;
+            if (!hollowOk) return -1;
+            return uniform_real_distribution<float>(0.0f, 1.0f)(gen) < hollowPickChance ? expSiteHollow : -1;
+        }
     }
     if (u >= 0) return u;
     int f = findNearest(from, far, n, [&](int i) { return poiCentre(i); }, [&](int i) { return pois[i].spent; });
@@ -7452,8 +7538,10 @@ void tryLaunchExpedition(vector<barb>& barbs, vector<RectangleShape>& squares, c
         if (!stores[r].built || raceBell[r] > 0) continue;
         if (stock[r].food < expRationFood + expFoodReserve) continue;
         // R47-F4: the ruins still need the race's lean-to and relics under the cap; sites need neither
-        int site = pickExpeditionSite(r, hasRuins() && campBuilt(r) && raceRelics[r] < expRelicCap);
+        // R47-F5: the Hollow needs the lean-to too (the race's foothold at the ruins), but not the relic cap
+        int site = pickExpeditionSite(r, hasRuins() && campBuilt(r) && raceRelics[r] < expRelicCap, hollowOpen() && campBuilt(r));
         if (site == -2) continue;
+        bool hollowTrip = site == expSiteHollow;
         int pick[expPartySize];
         bool ok = true;
         for (int k = 0; k < expPartySize && ok; k++) {
@@ -7468,7 +7556,7 @@ void tryLaunchExpedition(vector<barb>& barbs, vector<RectangleShape>& squares, c
         if (!ok) continue;
         Vector2f camp = campSpot[r] + campSize / 2.0f;
         int stone[expPartySize] = {};
-        for (int k = 0; k < expPartySize && site < 0; k++) {   // R47-F4: ruin trips only
+        for (int k = 0; k < expPartySize && site == -1; k++) {   // R47-F4: ruin trips only (R47-F5: not the Hollow)
             stone[k] = findNearest(camp, worldSize, (int)ruinStones.size(),
                                    [&](int i) { return ruinStones[i].position + ruinStones[i].size / 2.0f; },
                                    [&](int i) { for (int q = 0; q < k; q++) if (stone[q] == i) return true; return false; });
@@ -7481,6 +7569,7 @@ void tryLaunchExpedition(vector<barb>& barbs, vector<RectangleShape>& squares, c
         spend(stock[r], 0, 0, expRationFood);
         party.rations = expRationFood;
         if (site >= 0) { party.poiId = pois[site].id; party.siteKind = pois[site].kind; }   // R47-F4: the id, never the index
+        party.hollow = hollowTrip;   // R47-F5
         string names;
         for (int k = 0; k < expPartySize; k++) {
             barb& b = barbs[pick[k]];
@@ -7489,8 +7578,8 @@ void tryLaunchExpedition(vector<barb>& barbs, vector<RectangleShape>& squares, c
             b.order = needNone;
             b.orderTicks = 0;
             party.memberIds[k] = b.id;
-            if (site >= 0) {   // R47-F4: members flank the site at its foot, even k on the left, odd on the right
-                Vector2f p = poiShapes[site].getPosition(), s = poiShapes[site].getSize();
+            if (site >= 0 || hollowTrip) {   // R47-F4: members flank the site at its foot, even k on the left, odd on the right (R47-F5: or the mouth)
+                Vector2f p = hollowTrip ? hollowPos : poiShapes[site].getPosition(), s = hollowTrip ? hollowSize : poiShapes[site].getSize();
                 float row = p.y + s.y - squares[pick[k]].getSize().y;
                 float out = (k / 2) * expMemberGapPx;
                 party.delveSpot[k] = snapPx(k % 2 == 0 ? Vector2f(p.x - squares[pick[k]].getSize().x - 1.0f - out, row)
@@ -7501,7 +7590,8 @@ void tryLaunchExpedition(vector<barb>& barbs, vector<RectangleShape>& squares, c
             }
             names += string(k ? " and " : "") + b.name;
         }
-        string dest = site >= 0 ? string(pois[site].found ? "the " : "an unexplored ") + poiNames[party.siteKind] : string("the ruins");
+        string dest = site >= 0 ? string(pois[site].found ? "the " : "an unexplored ") + poiNames[party.siteKind]
+                    : hollowTrip ? string("the Hollow") : string("the ruins");
         printf("---EXPEDITION OUT--- %s: %s to %s, %d rations (food %d left)\n", racePlurals[r], names.c_str(), dest.c_str(), party.rations, stock[r].food);
         logRaceEvent(string(racePlurals[r]) + " send " + names + " to " + dest, r);
         return;
@@ -7512,6 +7602,7 @@ void tryLaunchExpedition(vector<barb>& barbs, vector<RectangleShape>& squares, c
 // a missing, dead or released member dissolves the party. Feeds hungry members from the rations, lets wolves on the road
 // wound (never below expWolfMinHp), walks each leg and advances the phase once every member has arrived.
 void expeditionTick(vector<barb>& barbs, vector<RectangleShape>& squares, const vector<wolf>& wolves, const storehouse (&stores)[raceCount]) {
+    if (hollowFlash > 0) hollowFlash--;   // R47-F5: lintel flash after surfacing
     if (!party.active) {
         if (expeditionCooldown > 0) expeditionCooldown--;
         else tryLaunchExpedition(barbs, squares, stores);
@@ -7528,6 +7619,16 @@ void expeditionTick(vector<barb>& barbs, vector<RectangleShape>& squares, const 
         if (bad) { broken = true; if (idx[k] >= (int)squares.size()) idx[k] = -1; }
     }
     if (broken) {
+        if (party.hollow) {   // R47-F5: released at the mouth (endExpedition clears the flag, so nobody stays hidden), rations refunded, no haul taken
+            bool below = party.phase == expeditionParty::Delve;
+            stock[r].food += party.rations;
+            printf("---EXPEDITION LOST--- %s: %s %s the Hollow, party released (%d rations returned, %d hauls left)\n", racePlurals[r],
+                   lost ? lost : "a member", below ? "below" : "on the way to", party.rations, hollowLootLeft);
+            logRaceEvent(string(racePlurals[r]) + "' Hollow party breaks up: " + (lost ? lost : "a member") + " is lost"
+                         + (below ? ", the rest climb out" : "") + "; rations returned", r);
+            endExpedition(barbs, idx);
+            return;
+        }
         printf("---EXPEDITION LOST--- %s: %s, party dissolved (%d rations lost)\n", racePlurals[r], lost ? lost : "a member", party.rations);
         logRaceEvent(string(racePlurals[r]) + "' expedition breaks up: " + (lost ? lost : "a member") + " is lost", r);
         endExpedition(barbs, idx);
@@ -7593,11 +7694,32 @@ void expeditionTick(vector<barb>& barbs, vector<RectangleShape>& squares, const 
         if (site >= 0) {   // R47-F4: arriving finds the site, through the same path as a passing barb
             discoverPoi(site, r, barbs[idx[0]].name);
             printf("EXPEDITION AT SITE - %s, searching the %s\n", racePlurals[r], poiNames[party.siteKind]);
+        } else if (party.hollow) {   // R47-F5: down the stairs; barbInHollow() hides them from now until they surface
+            printf("EXPEDITION DESCENDS - %s into the Hollow (%d hauls left)\n", racePlurals[r], hollowLootLeft);
+            logRaceEvent(string(barbs[idx[0]].name) + " and " + barbs[idx[expPartySize - 1]].name + " descend into the Hollow", r);
         } else printf("EXPEDITION AT CAMP - %s, to the stones\n", racePlurals[r]);
     } else if (party.phase == expeditionParty::Delve) {
-        if (++party.timer < (site >= 0 ? poiSearchTicks : expDelveTicks)) return;
+        if (++party.timer < (site >= 0 ? poiSearchTicks : expDelveTicks)) return;   // R47-F5: the one room is abstracted as expDelveTicks
         uniform_real_distribution<float> roll01(0.0f, 1.0f);
-        if (site >= 0) {   // R47-F4: one small reward per site, then it is spent
+        if (party.hollow) {   // R47-F5: one weighted roll of the capped table; an empty Hollow (another party took the last) gives nothing
+            party.lootIdx = hollowLootCount - 1;   // "nothing but dust"
+            if (hollowLootLeft > 0) {
+                float total = 0.0f;
+                for (auto& l : hollowLoot) total += l.weight;
+                float roll = roll01(gen) * total;
+                for (int i = 0; i < hollowLootCount; i++) {
+                    if (roll < hollowLoot[i].weight) { party.lootIdx = i; break; }
+                    roll -= hollowLoot[i].weight;
+                }
+                hollowLootLeft--;
+            }
+            const hollowLootDef& l = hollowLoot[party.lootIdx];
+            party.rewardFood = min(l.food, hollowLootMaxFood);
+            party.rewardStone = min(l.stone, hollowLootMaxStone);
+            hollowFlash = hollowFlashTicks;
+            printf("EXPEDITION SURFACES - %s from the Hollow with %s (+%d food, +%d stone), %d hauls left\n",
+                   racePlurals[r], l.what, party.rewardFood, party.rewardStone, hollowLootLeft);
+        } else if (site >= 0) {   // R47-F4: one small reward per site, then it is spent
             const poiRewardDef& w = poiRewards[party.siteKind];
             float roll = roll01(gen);
             if (roll < w.foodChance) party.rewardFood = uniform_int_distribution<int>(poiFoodMin, poiFoodMax)(gen);
@@ -7617,7 +7739,20 @@ void expeditionTick(vector<barb>& barbs, vector<RectangleShape>& squares, const 
         stock[r].food += party.rations;   // leftovers back to the larder
         string outcome;
         string from = party.poiId >= 0 ? string(" from the ") + poiNames[party.siteKind] : string();   // R47-F4
-        if (party.relic && raceRelics[r] < expRelicCap) {
+        if (party.hollow) {   // R47-F5: food and stone may both come up in one haul
+            stock[r].food += party.rewardFood;
+            stock[r].stone += party.rewardStone;
+            const char* what = party.lootIdx >= 0 ? hollowLoot[party.lootIdx].what : hollowLoot[hollowLootCount - 1].what;
+            outcome = "return from the Hollow with " + string(what);
+            if (party.rewardFood > 0 || party.rewardStone > 0) {
+                outcome += " (";
+                if (party.rewardFood > 0) outcome += "+" + to_string(party.rewardFood) + " food";
+                if (party.rewardFood > 0 && party.rewardStone > 0) outcome += ", ";
+                if (party.rewardStone > 0) outcome += "+" + to_string(party.rewardStone) + " stone";
+                outcome += ")";
+            }
+            if (hollowLootLeft == 0) outcome += "; it is picked clean";
+        } else if (party.relic && raceRelics[r] < expRelicCap) {
             raceRelics[r] = min(expRelicCap, raceRelics[r] + 1);
             stock[r].stone += expRelicStone;
             outcome = "return with a relic" + from + " (+" + to_string(expRelicStone) + " stone, " + to_string(raceRelics[r]) + "/" + to_string(expRelicCap) + ")";
@@ -8638,6 +8773,8 @@ void spawnRuins(vector<tree>& trees, vector<CircleShape>& tris, vector<Rectangle
                 vector<CircleShape>& octs, vector<char>& rockGold, vector<bush>& bushes, vector<CircleShape>& bushshapes) {
     ruinStones.clear();
     camps.clear();
+    hollowPlaced = false;   // R47-F5
+    hollowLootLeft = hollowLootCap;
     float lo = ruinSiteRadius + ruinEdgeMargin;
     bool found = false;
     for (float minDist : {ruinMinDist, ruinFallbackDist}) {
@@ -8690,6 +8827,14 @@ void spawnRuins(vector<tree>& trees, vector<CircleShape>& tris, vector<Rectangle
     for (int r = 0; r < raceCount; r++) {
         float a = homeAng + (r - (raceCount - 1) / 2.0f) * campSpreadRad;
         campSpot[r] = snapPx(ruinCentre + Vector2f(cos(a), sin(a)) * campRuinDist - campSize / 2.0f);
+    }
+    // R47-F5: the Hollow, a quarter turn off the village direction: between the camp fan (+-0.6 rad) and the ridge
+    // (from pi - 1.2 rad), past the stone ring, inside the cleared disc so nothing grows on it
+    {
+        float a = homeAng + 1.5707963f;
+        hollowPos = snapPx(ruinCentre + Vector2f(cos(a), sin(a)) * hollowRuinDist - hollowSize / 2.0f);
+        hollowPlaced = true;
+        printf("Hollow: stair mouth at (%.0f, %.0f), %d hauls\n", hollowPos.x, hollowPos.y, hollowLootLeft);
     }
 
     // Ridge: ordinary rocks on an arc away from the village; trees under a ridge rock are removed so it reads
@@ -8837,6 +8982,29 @@ void drawRuins(RenderWindow& window) {
         pushQuad(va, p + Vector2f(s.x - 1.0f, 1.0f), Vector2f(1.0f, s.y - 1.0f), ruinStoneShadeColor);
         if (i % 2 == 0) pushQuad(va, p + Vector2f(0.0f, s.y - 1.0f), Vector2f(1.0f, 1.0f), ruinMossColor);
     }
+    window.draw(va);
+}
+
+// R47-F5: the Hollow's 6x6 stair mouth. Row 0 is a pale lintel (flashing toward cream when a party surfaces), the
+// columns at each side are jambs (lit left, shaded right), and inside is a dark 4x5 opening with three 1px steps on
+// rows 1, 3 and 5, each darker and the last narrower, so the stairs fall away into the dark. Picked clean: flat dull steps.
+void drawHollow(RenderWindow& window) {
+    if (!hollowPlaced) return;
+    static VertexArray va(PrimitiveType::Triangles);
+    va.clear();
+    Vector2f o = snapPx(hollowPos);
+    bool clean = hollowLootLeft <= 0;
+    pushQuad(va, o + Vector2f(1.0f, 1.0f), Vector2f(4.0f, 5.0f), hollowDarkColor);   // the opening
+    for (int s = 0; s < 3; s++) {
+        float inset = s == 2 ? 1.0f : 0.0f;
+        pushQuad(va, o + Vector2f(1.0f + inset, 1.0f + 2.0f * s), Vector2f(4.0f - 2.0f * inset, 1.0f),
+                 clean ? hollowCleanStepColor : hollowStepColors[s]);
+    }
+    pushQuad(va, o + Vector2f(0.0f, 1.0f), Vector2f(1.0f, 5.0f), hollowJambColor);
+    pushQuad(va, o + Vector2f(5.0f, 1.0f), Vector2f(1.0f, 5.0f), hollowJambShadeColor);
+    Color lc = hollowLintelColor;
+    if (hollowFlash > 0) lc = lerpColor(lc, hollowFlashColor, hollowFlashMix * hollowFlash / hollowFlashTicks);
+    pushQuad(va, o, Vector2f(hollowSize.x, 1.0f), lc);
     window.draw(va);
 }
 
@@ -9293,6 +9461,7 @@ int main() {
 	drawShrines(window, shrines);
 	drawSmokehouse(window, smoke, stores);
 	drawRuins(window);   // R45-F1b: with the buildings, under barbs and trees
+	drawHollow(window);  // R47-F5: the stair mouth, beside the stones
 	drawCamps(window);
 	drawPois(window, camRect, frameCount);   // R47-F4: huts and wells, with the buildings
 	drawStall(window, activeTrader);
@@ -9375,7 +9544,8 @@ int main() {
         int selIdx = findBarbById(barbs, selectedBarbId);
         if (selIdx < 0) { selectedBarbId = -1; inspectRect = FloatRect(); }
         if (selIdx >= 0 && selIdx < (int)squares.size() && !barbHidden(barbs[selIdx]))   // R40-F1: a miner below is ringed in its pit
-            drawSelectRing(window, worldView, barbUnderground(barbs[selIdx]) ? shaftPitRect(barbs[selIdx].race) : squares[selIdx], zoom);
+            drawSelectRing(window, worldView, barbInHollow(barbs[selIdx]) ? hollowShape()   // R47-F5: ringed at the mouth
+                           : barbUnderground(barbs[selIdx]) ? shaftPitRect(barbs[selIdx].race) : squares[selIdx], zoom);
         if (selIdx >= 0 && selIdx < (int)squares.size() && !barbHidden(barbs[selIdx]) && !barbUnderground(barbs[selIdx]))   // R44-F1
             if (auto tp = barbTargetPos(barbs[selIdx], squares[selIdx], deers, deershape))
                 drawTargetLine(window, worldView, squares[selIdx].getPosition() + squares[selIdx].getSize() / 2.0f, *tp, zoom, frameCount);
