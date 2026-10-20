@@ -941,6 +941,17 @@ const float targetRingRadius = 3.0f;          // world px at rest, smaller than 
 const float targetRingPulse = 1.0f;           // world px added at the pulse peak
 const float targetRingPulseSpeed = 0.08f;     // radians per frame (~1.3s per pulse at 60fps)
 const uint8_t targetRingAlphaLo = 110, targetRingAlphaHi = 190;   // alpha swing over one pulse
+// R44-F2: idle and ready beacons. Holding H brackets ripe bushes, ripe wheat and idle barbs with four small corner
+// marks, culled to the camera, drawn above the day/night overlay. Arm/pad are world px; line width is screen px.
+const Color beaconColor(240, 240, 232);       // soft white, reads on the dark green and through the night tint
+const uint8_t beaconAlphaLo = 120, beaconAlphaHi = 210;   // gentle pulse range
+const float beaconPulseSpeed = 0.06f;         // radians per frame (~1.7s per pulse at 60fps)
+const float beaconPadPx = 1.5f;               // world px gap between the target's box and the bracket
+const float beaconArmPx = 2.0f;               // world px corner arm length (clamped to half the box side)
+const float beaconLinePx = 1.0f;              // screen px (scaled by zoom), a hairline like the outlines
+const int beaconMaxCount = 120;               // cap per frame: idle barbs first, then wheat, then bushes
+const float beaconFadeZoom = 2.0f;            // below this zoom the beacons dim...
+const float beaconFarAlphaMult = 0.55f;       // ...to this share of their alpha at minZoom (linear in between)
 // Overlay lenses (UIO-F3): L cycles Off -> Hunger -> Race. Soft discs on the ground layer, under barbs and buildings;
 // only barbs, houses and storehouses are looped (never trees), culled to the camera. Legend panel top-left under the HUD.
 enum class Lens { Off, Hunger, Race };
@@ -2176,8 +2187,12 @@ void swapRemove(vector<T>& v, int i) {
     v.pop_back();
 }
 
+// R44-F2: no task stripe -> idle. Shared by barbColor() and the H beacons so both agree on who is jobless
+bool barbIdle(const barb& b) { return !b.deertargeting && !b.building && !b.tempering && !b.chopping; }
+
 // Priority when flags overlap: hunting > building > picking > harvesting > fishing > mining > chopping > idle
 Color barbColor(const barb& b) {
+    if (barbIdle(b)) return barbIdleColor;
     if (b.deertargeting) return barbHuntColor;
     if (b.building) return barbBuildColor;
     if (b.tempering) return barbMineColor;   // R41-F2: pick work at the forge; never overlaps chopping/building
@@ -2185,8 +2200,7 @@ Color barbColor(const barb& b) {
     if (b.chopping && b.target == targetField) return barbHarvestColor;
     if (b.chopping && b.target == targetLake) return barbFishColor;
     if (b.chopping && b.target == targetRock) return barbMineColor;
-    if (b.chopping) return barbChopColor;
-    return barbIdleColor;
+    return barbChopColor;   // only chopping is left once barbIdle() is false
 }
 
 // Same priority as barbColor() so the tooltip always matches the colour on screen
@@ -3655,6 +3669,73 @@ void drawTargetLine(RenderWindow& window, const View& worldView, Vector2f from, 
     ring.setOutlineThickness(selectRingPx / zoom);
     ring.setOutlineColor(rc);
     window.draw(ring);
+}
+
+// R44-F2: four corner brackets around box (world rect) appended to va as triangles. Each corner is an L of two
+// hairline bars drawn inward from the padded box's corner.
+void appendBeacon(VertexArray& va, FloatRect box, float line, Color c) {
+    Vector2f tl = box.position - Vector2f(beaconPadPx, beaconPadPx);
+    Vector2f sz = box.size + Vector2f(2 * beaconPadPx, 2 * beaconPadPx);
+    float armX = min(beaconArmPx, sz.x / 2.0f), armY = min(beaconArmPx, sz.y / 2.0f);
+    auto bar = [&](Vector2f p, Vector2f s) {
+        Vector2f a = p, b = p + Vector2f(s.x, 0), d = p + Vector2f(0, s.y), e = p + s;
+        va.append(Vertex{a, c}); va.append(Vertex{b, c}); va.append(Vertex{d, c});
+        va.append(Vertex{b, c}); va.append(Vertex{e, c}); va.append(Vertex{d, c});
+    };
+    for (int cx = 0; cx < 2; cx++)
+        for (int cy = 0; cy < 2; cy++) {
+            Vector2f corner = tl + Vector2f(cx * sz.x, cy * sz.y);
+            float hx = cx ? corner.x - armX : corner.x;              // horizontal arm grows inward
+            float vy = cy ? corner.y - armY : corner.y;              // vertical arm grows inward
+            float lx = cx ? corner.x - line : corner.x;              // bars sit inside the padded box edge
+            float ly = cy ? corner.y - line : corner.y;
+            bar(Vector2f(hx, ly), Vector2f(armX, line));
+            bar(Vector2f(lx, vy), Vector2f(line, armY));
+        }
+}
+
+// R44-F2: while H is held, bracket idle barbs, ripe wheat plots and ripe bushes inside the view. One VertexArray,
+// one draw, above the overlays. Only barbs, plots and bushes are looped (never trees); capped at beaconMaxCount.
+void drawBeacons(RenderWindow& window, const View& worldView, float zoom, int frame,
+                 const vector<barb>& barbs, const vector<RectangleShape>& squares, const fieldGrid& fields,
+                 const vector<bush>& bushes, const vector<CircleShape>& bushshapes) {
+    window.setView(worldView);
+    float margin = beaconPadPx + beaconArmPx;
+    FloatRect view(worldView.getCenter() - worldView.getSize() / 2.0f - Vector2f(margin, margin),
+                   worldView.getSize() + Vector2f(2 * margin, 2 * margin));
+    float wave = (sin(frame * beaconPulseSpeed) + 1.0f) / 2.0f;   // 0..1
+    float alpha = beaconAlphaLo + (beaconAlphaHi - beaconAlphaLo) * wave;
+    if (zoom < beaconFadeZoom)   // far zoom: dim so a crowd of brackets stays sparse-looking
+        alpha *= beaconFarAlphaMult + (1.0f - beaconFarAlphaMult) * (zoom - minZoom) / (beaconFadeZoom - minZoom);
+    Color c = beaconColor;
+    c.a = (uint8_t)clamp(alpha, 0.0f, 255.0f);
+    float line = beaconLinePx / zoom;
+    VertexArray va(PrimitiveType::Triangles);
+    int count = 0;
+    for (int i = 0; i < (int)barbs.size() && i < (int)squares.size() && count < beaconMaxCount; i++) {
+        const barb& b = barbs[i];
+        if (!barbIdle(b) || b.garrisoned || barbHidden(b) || barbUnderground(b)) continue;
+        FloatRect box(squares[i].getPosition(), squares[i].getSize());
+        if (!view.findIntersection(box)) continue;
+        appendBeacon(va, box, line, c);
+        count++;
+    }
+    for (int r = 0; r < raceCount && count < beaconMaxCount; r++)
+        for (int k = 0; k < fieldsPerRace && count < beaconMaxCount; k++) {
+            const plot& fp = fields[r][k];
+            if (!fieldRipe(fp) || !view.findIntersection(fp.rect)) continue;
+            appendBeacon(va, fp.rect, line, c);
+            count++;
+        }
+    for (int i = 0; i < (int)bushes.size() && i < (int)bushshapes.size() && count < beaconMaxCount; i++) {
+        if (!bushes[i].ripe || bushes[i].picking) continue;
+        float d = 2 * bushshapes[i].getRadius();
+        FloatRect box(snapPx(bushshapes[i].getPosition()), Vector2f(d, d));   // same box bushDrawShape() fills
+        if (!view.findIntersection(box)) continue;
+        appendBeacon(va, box, line, c);
+        count++;
+    }
+    if (va.getVertexCount() > 0) window.draw(va);
 }
 
 // Outline-only copy of the hit shape, drawn above the overlays so it stays readable at night
@@ -7819,6 +7900,8 @@ int main() {
         if (isNightHour(t)) drawHouseLights(window, worldView, houses, houseshapes);
         drawBallots(window, worldView, zoom, barbs, squares); // above the overlays so the pips read true; under hover marks
         if (ballotFramesLeft > 0 && !paused) ballotFramesLeft--;
+        if (window.hasFocus() && Keyboard::isKeyPressed(Keyboard::Key::H))   // R44-F2: held, not toggled; under select/hover marks
+            drawBeacons(window, worldView, zoom, frameCount, barbs, squares, fields, bushes, bushshapes);
         for (int k = 0; k < techCount; k++)
             if (know.pulseFrames[k] > 0 && !paused) know.pulseFrames[k]--;   // know-how pip flash (R20-F1)
 
