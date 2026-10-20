@@ -26,6 +26,14 @@ constexpr int numrocks = (int)(100 * worldAreaScale);    // 225
 constexpr int treeSpawnOneIn = (int)(100000 / worldAreaScale); // 1-in-N per tick for a new tree: same rate per area as before
 constexpr float deerEntryDepthPx = 80.0f;   // arriving animals walk this far in past mapEdgeInset from their side edge
 constexpr float deerOffMapPx = 20.0f;       // arriving animals start this far outside the side edge
+// Gold Veins (R46-F1a): a few rocks are gold-flecked; mining one also adds goldPerRock to the global gold count.
+// The flag lives in rockGold, parallel to rocks/octs. Draw: warmer diamond plus one pale-gold fleck pixel.
+const float goldRockChance = 0.08f;         // per spawned rock
+const int goldPerRock = 1;                  // nuggets per gold rock, on top of its normal stone
+const Color goldRockColor(136, 128, 108);   // rock diamond (128,126,118) nudged warm, still clearly a rock
+const Color goldFleckColor(212, 188, 118);  // muted pale gold, under the gentry sash (224,194,96) in saturation
+const Vector2f goldFleckOffset(5.0f, 4.0f); // 1px fleck on the upper-left (lit) face of the 12px diamond
+const Color hudGoldColor(212, 188, 118);    // HUD "gold n" text, same pale gold as the fleck
 
 const char* const hudFontPath = "assets/DejaVuSans.ttf";
 const unsigned int hudFontSize = 14;
@@ -1546,6 +1554,9 @@ int stallBonusLots = 0;     // extra lots the stall added to the current visit; 
 struct forge {bool built = false; bool claimed = false;}; // the one dwarf forge; claimed = a builder is on it
 // POL-F5a: the single forge gate (shared with forge phase 2): race r works at the forge only if it is dwarves and it is built
 bool forgeActive(const forge& fg, int r) { return r == raceDwarf && fg.built; }
+int gold = 0;              // R46-F1a: global nuggets, from gold rocks only
+bool goldFound = false;    // R46-F1a: set by the first nugget; the HUD gold cell stays shown from then on
+char rollGoldRock() { return bernoulli_distribution(goldRockChance)(gen) ? 1 : 0; }   // one roll per spawned rock
 int forgeEmberFrames = 0;  // >0 = ember glows hot; set when a dwarf mines a rock, counted down per drawn frame
 // POL-F5b: fixed spark pool; a slot is free once age >= forgeSparkFrames
 struct forgeSpark {Vector2f pos, vel; int age = forgeSparkFrames;};
@@ -3929,6 +3940,8 @@ struct hudValues {
     const char* era;         // settlement rank: Camp / Hamlet / Town
     bool learned[techCount]; // know-how pips (R20-F1)
     int pulse[techCount];    // frames of white pulse left per pip
+    int gold;                // R46-F1a: global nuggets
+    bool goldFound;          // R46-F1a: gold cell hidden until the first nugget
 };
 
 // Draws one table icon at pos (top-left, screen px), one quad per filled cell
@@ -3990,6 +4003,7 @@ FloatRect drawHud(RenderWindow& window, const Font& font, const hudValues& v) {
         {v.night ? iconMoon : iconSun, hour, pal.hudText},
         {v.paused ? iconPause : iconSpeed, v.paused ? string("Paused") : string(speed), v.paused ? pal.hudAlert : pal.hudText},
     };
+    if (v.goldFound) cells.push_back({iconCount, "gold " + to_string(v.gold), hudGoldColor}); // R46-F1a: text only (iconCount = no icon)
     if (v.raining) cells.push_back({iconRain, "Rain", pal.hudText}); // last, so it never shifts the other cells
 
     // Centre on a fixed reference string so every number sits on the same baseline
@@ -4000,8 +4014,10 @@ FloatRect drawHud(RenderWindow& window, const Font& font, const hudValues& v) {
     float iconY = round((inner - hudIconSize) / 2);
     float x = hudPadX;
     for (auto& c : cells) {
-        drawIcon(window, c.icon, {x, iconY});
-        x += hudIconSize + hudIconGap;
+        if (c.icon != iconCount) {
+            drawIcon(window, c.icon, {x, iconY});
+            x += hudIconSize + hudIconGap;
+        }
         Text t(font, c.text, hudFontSize);
         FloatRect tb = t.getLocalBounds();
         t.setFillColor(c.color);
@@ -7156,7 +7172,7 @@ void haulTick(barb& b, RectangleShape& sq, storehouse (&stores)[raceCount], cons
     if (temper) startTemper(b);
 }
 
-void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<CircleShape>& tris, vector<RectangleShape>& stumps, vector<tree>& trees, vector<CircleShape>& octs, vector<rock>& rocks,
+void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<CircleShape>& tris, vector<RectangleShape>& stumps, vector<tree>& trees, vector<CircleShape>& octs, vector<rock>& rocks, vector<char>& rockGold,
                    vector<bush>& bushes, vector<CircleShape>& bushshapes, vector<birthRing>& catchRings, fieldGrid& fields, storehouse (&stores)[raceCount],
                    const forge& fg) {
     vector<int> treeClaim, rockClaim;   // parallel to trees/tris and rocks/octs for this tick
@@ -7567,8 +7583,14 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
 				}
 				if (b.race == raceDwarf) forgeEmberFrames = forgeEmberBoostFrames; // forge ember flares (drawn only once built)
 				memRecord(b, memRock, Vector2f((int)rix, (int)riy));   // INBOX-F2
+				if (i < (int)rockGold.size() && rockGold[i]) {   // R46-F1a: nuggets go straight to the global count; stone still hauls
+					gold += goldPerRock;
+					goldFound = true;
+					printf("GOLD ROCK MINED - barb %d, +%d gold (total %d)\n", b.id, goldPerRock, gold);
+				}
 				swapRemove(rocks, i);
 				swapRemove(octs, i);
+				swapRemove(rockGold, i);
 				swapRemove(rockClaim, i);
 				startHaul(b, carryStone, stores);  // R29-F1: stone counts once it reaches the depot
 				printf("ROCK DESTROYED - hauling stone (stock %d)\n", stockOf(b).stone);
@@ -7628,7 +7650,7 @@ void treespawn(vector<tree>& trees, vector<CircleShape>& tris, vector<RectangleS
 // lakeCountMin-Max ponds (2-3 per 800x800 of map) away from the village, apart from each other. Startup trees (trees/tris/stumps) and rocks (rocks/octs)
 // in or touching a lake are removed together. Fixed village spots (stall, forge) are inside the
 // lakeVillageMinDist ring, and the race smokehouses sit inside the dry quarters, so they never need a lake check. Shore points are cached here for angling.
-void spawnLakes(vector<tree>& trees, vector<CircleShape>& tris, vector<RectangleShape>& stumps, vector<rock>& rocks, vector<CircleShape>& octs) {
+void spawnLakes(vector<tree>& trees, vector<CircleShape>& tris, vector<RectangleShape>& stumps, vector<rock>& rocks, vector<CircleShape>& octs, vector<char>& rockGold) {
     uniform_int_distribution<int> count(lakeCountMin, lakeCountMax);
     uniform_int_distribution<int> pickSize(0, lakeSizeCount - 1);
     bernoulli_distribution trimCorner(lakeCornerTrimChance);
@@ -7703,7 +7725,7 @@ void spawnLakes(vector<tree>& trees, vector<CircleShape>& tris, vector<Rectangle
     }
     for (int i = (int)octs.size() - 1; i >= 0; i--) {
         if (lakeClear(octs[i].getGlobalBounds())) continue;
-        swapRemove(rocks, i); swapRemove(octs, i);
+        swapRemove(rocks, i); swapRemove(octs, i); swapRemove(rockGold, i);
     }
     printf("Spawned %zu lakes (%zu shore points)\n", lakes.size(), shorePoints.size());
 }
@@ -7762,7 +7784,7 @@ void spawnBushes(vector<bush>& bushes, vector<CircleShape>& bushshapes, vector<t
 // trees and quarterMinRocks rocks between its clearing and quarterResourceRadius. A short quarter is topped up from a
 // fixed-seed generator (deterministic re-seed), keeping every parallel vector in step.
 void checkQuarters(vector<tree>& trees, vector<CircleShape>& tris, vector<RectangleShape>& stumps,
-                   vector<rock>& rocks, vector<CircleShape>& octs, const vector<CircleShape>& bushshapes) {
+                   vector<rock>& rocks, vector<CircleShape>& octs, vector<char>& rockGold, const vector<CircleShape>& bushshapes) {
     const Vector2f treeSz(treeFootprint, treeFootprint), rockSz(12.0f, 12.0f);   // rock: 6px-radius pentagon
     auto nearby = [](Vector2f topLeft, Vector2f size, int q) {
         Vector2f d = topLeft + size / 2.0f - quarterCentre(q);
@@ -7813,6 +7835,7 @@ void checkQuarters(vector<tree>& trees, vector<CircleShape>& tris, vector<Rectan
                 oct.setRadius(6);
                 oct.setFillColor(Color(125, 125, 125));
                 octs.push_back(oct);
+                rockGold.push_back(rollGoldRock());   // R46-F1a: same index as rocks/octs
                 addR++;
             }
         }
@@ -7828,7 +7851,7 @@ void checkQuarters(vector<tree>& trees, vector<CircleShape>& tris, vector<Rectan
 // rocks (rocks/octs) and bushes (bushes/bushshapes) touching the site disc are removed together; then the ridge's rocks
 // are added on the far side, and each race's lean-to spot is fixed on the village-facing side.
 void spawnRuins(vector<tree>& trees, vector<CircleShape>& tris, vector<RectangleShape>& stumps, vector<rock>& rocks,
-                vector<CircleShape>& octs, vector<bush>& bushes, vector<CircleShape>& bushshapes) {
+                vector<CircleShape>& octs, vector<char>& rockGold, vector<bush>& bushes, vector<CircleShape>& bushshapes) {
     ruinStones.clear();
     camps.clear();
     float lo = ruinSiteRadius + ruinEdgeMargin;
@@ -7871,7 +7894,7 @@ void spawnRuins(vector<tree>& trees, vector<CircleShape>& tris, vector<Rectangle
     }
     for (int i = (int)octs.size() - 1; i >= 0; i--) {
         if (ruinsClear(octs[i].getGlobalBounds())) continue;
-        swapRemove(rocks, i); swapRemove(octs, i);
+        swapRemove(rocks, i); swapRemove(octs, i); swapRemove(rockGold, i);
         clearedR++;
     }
     for (int i = (int)bushshapes.size() - 1; i >= 0; i--) {
@@ -7900,6 +7923,7 @@ void spawnRuins(vector<tree>& trees, vector<CircleShape>& tris, vector<Rectangle
         if (p.x < 0.0f || p.y < hudBarHeight || p.x + rockSz.x > worldSize || p.y + rockSz.y > worldSize) continue;
         if (inClearing(p) || !lakeClear(rr) || !ruinsClear(rr)) continue;
         rocks.push_back(rock{(int)p.x, (int)p.y, false});
+        rockGold.push_back(rollGoldRock());   // R46-F1a: same index as rocks/octs
         CircleShape oct;
         oct.setPointCount(5);
         oct.setPosition(p);
@@ -8090,14 +8114,17 @@ int main() {
         oct.setFillColor(Color(125, 125, 125));
         octs.push_back(oct);
     }
+    vector<char> rockGold;   // R46-F1a: 1 = gold-flecked, parallel to rocks/octs (every swapRemove touches all three)
+    rockGold.reserve(numrocks);
+    for (size_t i = 0; i < rocks.size(); i++) rockGold.push_back(rollGoldRock());
 
-    spawnLakes(trees, tris, stumps, rocks, octs); // before the bushes so clumps can avoid the water
+    spawnLakes(trees, tris, stumps, rocks, octs, rockGold); // before the bushes so clumps can avoid the water
 
     vector<bush> bushes;
     vector<CircleShape> bushshapes;
     spawnBushes(bushes, bushshapes, trees, tris, stumps);
-    checkQuarters(trees, tris, stumps, rocks, octs, bushshapes);   // R30-F1: no quarter short of wood/stone
-    spawnRuins(trees, tris, stumps, rocks, octs, bushes, bushshapes);   // R45-F1b: last, so it clears whatever landed on the site
+    checkQuarters(trees, tris, stumps, rocks, octs, rockGold, bushshapes);   // R30-F1: no quarter short of wood/stone
+    spawnRuins(trees, tris, stumps, rocks, octs, rockGold, bushes, bushshapes);   // R45-F1b: last, so it clears whatever landed on the site
     for (auto& s : stock) {   // RACE-F1: every race starts with at least startStock
         s.wood = max(s.wood, startStock.wood);
         s.stone = max(s.stone, startStock.stone);
@@ -8221,7 +8248,7 @@ int main() {
                 towerTick(barbs, squares);   // R33-F2: gatehouse towers, after the wall completes
                 causewayTick();   // R33-F3: keep -> crate stone road
                 craftspear(barbs, squares, dwarfForge);
-                minematerials(squares, barbs, tris, stumps, trees, octs, rocks, bushes, bushshapes, catchRings, fields, stores, dwarfForge);
+                minematerials(squares, barbs, tris, stumps, trees, octs, rocks, rockGold, bushes, bushshapes, catchRings, fields, stores, dwarfForge);
                 barbmove(squares, barbs);
                 shaftTick(barbs);   // R40-F1: dust puffs and lintel flash
                 shinobiTick(barbs, squares, houseshapes, octs, shinobiPuffs);
@@ -8280,7 +8307,7 @@ int main() {
                         printf("Rock cleared near the village - miner %d dropped its target\n", b.id);
                     }
                 }
-                swapRemove(octs, i); swapRemove(rocks, i);
+                swapRemove(octs, i); swapRemove(rocks, i); swapRemove(rockGold, i);
             }
         }
 
@@ -8293,8 +8320,17 @@ int main() {
         drawLakes(window);
         drawLens(window, lensVerts, worldView, lens, barbs, squares, houses, houseshapes, stores);   // UIO-F3: under rocks, buildings and barbs
 
-	for (auto& oct : octs)
-		window.draw(rockDrawShape(oct));
+	{
+		RectangleShape fleck({1.0f, 1.0f});   // R46-F1a: one pale-gold pixel on each gold rock
+		fleck.setFillColor(goldFleckColor);
+		for (int i = 0; i < (int)octs.size(); i++) {
+			CircleShape d = rockDrawShape(octs[i]);
+			bool isGold = i < (int)rockGold.size() && rockGold[i];
+			if (isGold) d.setFillColor(goldRockColor);
+			window.draw(d);
+			if (isGold) { fleck.setPosition(d.getPosition() + goldFleckOffset); window.draw(fleck); }
+		}
+	}
 
 	for (auto& bs : bushshapes)
 		window.draw(bushDrawShape(bs));
@@ -8442,6 +8478,8 @@ int main() {
                 : activeTrader->phase == trader::Trading ? "Trading" : "Leaving";
             hv.tradeLine = tradeMsgTimer > 0 ? tradeMsg : "";
             hv.era = eraNames[currentEra];
+            hv.gold = gold;              // R46-F1a
+            hv.goldFound = goldFound;
             for (int k = 0; k < techCount; k++) { hv.learned[k] = know.learned[k]; hv.pulse[k] = know.pulseFrames[k]; }
             hudRect = drawHud(window, hudFont, hv);
             tickerRect = drawEvents(window, hudFont);
