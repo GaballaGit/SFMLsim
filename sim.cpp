@@ -17,13 +17,40 @@ using namespace std;
 // R45-F1a Far Reaches: the map grew from 800 to 1200 px a side. Every count tuned on the old map scales with area so
 // density (and so walk distance between jobs) holds; the window stays 800 px and shows the world 1:1 at zoom 1.
 constexpr float baseWorldSize = 800.0f;     // map side the density tunables were tuned on
-constexpr float worldSize = 1200.0f;        // map side in world px (was 800)
-constexpr float worldAreaScale = (worldSize / baseWorldSize) * (worldSize / baseWorldSize); // 2.25
+constexpr float worldSize = 2400.0f;        // map side in world px (R47-F1: was 1200)
+constexpr float worldAreaScale = (worldSize / baseWorldSize) * (worldSize / baseWorldSize); // 9
 constexpr float windowSize = 800.0f;        // window side in px; at zoom 1 the camera spans this many world px
-constexpr float mapEdgeInset = 20.0f;       // edge arrivals (wolves, trader, deer) keep this far from the corners
-constexpr int numtrees = (int)(2000 * worldAreaScale);   // 4500
-constexpr int numrocks = (int)(100 * worldAreaScale);    // 225
+constexpr float mapEdgeInset = 20.0f;       // edge arrivals (trader, deer) keep this far from the corners
 constexpr int treeSpawnOneIn = (int)(100000 / worldAreaScale); // 1-in-N per tick for a new tree: same rate per area as before
+// R47-F1 The Wilds: three bands, looked up by zoneAt(pos). The safe core is a disc round villageCenter (it wins where it
+// overlaps the rim), the sparse rocky edge is a rim zoneEdgeBandPx wide along the map border, and the wild ring is the
+// rest. Startup trees/rocks are bucketed per band (densities per 800x800 of map, so they read like the old tunables);
+// new trees pick a band by its share of the startup trees, and the core stops taking new trees at zoneCoreTreeCap.
+enum zoneId { zoneCore, zoneWild, zoneEdge, zoneCount };
+const char* const zoneNames[zoneCount] = {"core", "wild", "edge"};
+const float zoneCoreRadius = 420.0f;        // safe core: px from villageCenter (quarters reach ~313, so they sit inside)
+const float zoneEdgeBandPx = 320.0f;        // rocky edge: px in from each map border
+const float zoneTreeDensity[zoneCount] = {1500.0f, 2200.0f, 400.0f};   // trees per 800x800 (old map: 2000 everywhere)
+const float zoneRockDensity[zoneCount] = {100.0f, 60.0f, 200.0f};      // rocks per 800x800 (old map: 100 everywhere)
+const int zoneCoreTreeCap = 1400;           // core never holds more than this (startup is clamped to it too)
+const float zoneAreaSamplePx = 8.0f;        // band areas are measured once at startup on this grid
+const int zoneRollTries = 40;               // position rolls per tree/rock before giving up on that one
+// Ground tint: one translucent quad grid, vertex colours blended across each boundary so there are no hard lines, plus a
+// +-1 alpha hash jitter per vertex (dither) so the ~6% wash has no visible banding
+const float zoneTintTilePx = 16.0f;         // tint grid step (world px); only the rows/columns in view are drawn
+const float zoneTintFeatherPx = 72.0f;      // blend half-width either side of a band boundary
+const Color zoneTintColors[zoneCount] = {
+    Color(196, 180, 120, 14),               // core: warm straw, a touch of settled ground
+    Color(40, 92, 44, 16),                  // wild: deeper moss green, lusher than the base grass
+    Color(150, 146, 136, 16),               // edge: pale stone grey for the rocky rim
+};
+const int zoneTintJitter = 1;               // +- alpha per vertex
+// Tree spatial grid: work-spot buckets so the per-tick tree searches only look at nearby cells
+const float treeGridCellPx = 64.0f;
+const int treeGridN = (int)(worldSize / treeGridCellPx) + 1;   // +1: work spots sit up to 15px past a tree near the far edge
+// Wolves walk in from (and leave by) the wild band's outer edge, at least this far from the core
+const float wolfCoreMarginPx = 80.0f;
+const int wolfSpawnTries = 12;
 constexpr float deerEntryDepthPx = 80.0f;   // arriving animals walk this far in past mapEdgeInset from their side edge
 constexpr float deerOffMapPx = 20.0f;       // arriving animals start this far outside the side edge
 // Gold Veins (R46-F1a): a few rocks are gold-flecked; mining one also adds goldPerRock to the global gold count.
@@ -58,7 +85,7 @@ const float zoomStep = 1.1f;
 const int ticksPerMinute = 3600;            // one real minute at 1x (60 ticks/s)
 const int realMinutesPerGameHour = 10;      // the one day-length knob: real minutes (at 1x) per in-game hour (4 real hours per day)
 const int ticksPerGameHour = realMinutesPerGameHour * ticksPerMinute; // clockk() advances game_time by one hour after this many ticks
-const float clearRadiusSq = 50.0f * 50.0f;  // trees/rocks within 50px of the village centre (400,400) are cleared
+const float clearRadiusSq = 50.0f * 50.0f;  // trees/rocks within 50px of the village centre (villageCenter) are cleared
 const Color stumpColor(115, 30, 2);         // every tree stump, startup and respawned
 
 const Color barbIdleColor(255, 255, 255);
@@ -328,7 +355,9 @@ const float ledgerOutlinePx = 1.0f;       // screen px (scaled by zoom), hovered
 const Color ledgerPipColor(226, 220, 204); // neutral pale stone for the shared campfire: belongs to no race
 
 const float trailCellSize = 8.0f;          // world px per trail grid cell
-const int trailGridN = (int)(worldSize / trailCellSize); // cells per side (1200 / 8 = 150)
+const int trailGridN = (int)(worldSize / trailCellSize); // cells per side (2400 / 8 = 300)
+const int trailGridMaxN = 320;             // R47-F1: bound on cells per side; raise trailCellSize before a bigger map passes it
+static_assert(trailGridN <= trailGridMaxN, "trail grid too large: raise trailCellSize for this worldSize");
 const int trailDecayIntervalTicks = 120;   // every 2s each cell loses 1 wear, so stray steps fade out
 const int rainErodeMult = 2;               // trails decay this many times faster while raining (4 needed a barb per cell every 4s to hold a road through a shower)
 const int trailMaxWear = 240;             // cap so abandoned roads fade within ~8 min
@@ -343,7 +372,7 @@ const int pathWearClamp = trailRoadThreshold; // wear beyond road tier adds no e
 constexpr float routeWearDiscount = 0.4f;     // a full road costs 0.6 of bare ground
 const float routeDetourCap = 1.3f;         // max route length / straight distance; keeps routes from collapsing onto a few highways
 const int routeExpandCap = 400;            // A* node expansions per plan; past it the barb walks straight
-const int routeMaxCells = 280;             // waypoint buffer per barb (1.3 x the 212-cell diagonal of the 1200 map fits)
+const int routeMaxCells = 560;             // waypoint buffer per barb (1.3 x the 424-cell diagonal of the 2400 map fits)
 const int routeLookahead = 3;              // a barb that cuts a corner into a later waypoint cell skips ahead
 const float routeStrayPx = 24.0f;          // farther than this from the next waypoint (pushed/teleported): replan
 static_assert(routeWearDiscount < 1.0f, "a cell must never cost zero or less");
@@ -395,7 +424,7 @@ const Vector2f birdWingsOut(3.0f, 2.0f);
 const Vector2f birdWingsIn(2.0f, 2.0f);
 const Color birdColor(205, 215, 230);      // pale blue-white: readable on dark green, distinct from white idle barbs
 
-const int maxWolves = 2;
+const int maxWolves = 3;                   // R47-F1: was 2; the wild ring is bigger and wolfier
 const int wolfMinDeer = 4;                 // wolves only hunt while more deer than this remain, else they leave
 const int wolfSpawnChance = 5000;          // 1-in-N per tick while below the cap and deer are plentiful (~83s)
 const int wolfStepInterval = 2;            // ticks per 1px step (deer step every 3, so wolves gain slowly)
@@ -1532,9 +1561,13 @@ treeKind treeKindAt(Vector2f pos) {
 }
 
 // Stepped blocky trees, batched into one vertex array; kind (size + colour) comes from a position hash
-void drawTrees(RenderWindow& window, const vector<CircleShape>& tris, VertexArray& va) {
+void drawTrees(RenderWindow& window, const vector<CircleShape>& tris, VertexArray& va, const FloatRect& view) {
     va.clear();
+    // R47-F1: ~12k trees on the 2400 map, so only those near the view are batched (margin covers the tallest canopy)
+    const float m = 2 * treeFootprint;
+    FloatRect nearView(view.position - Vector2f(m, m), view.size + Vector2f(2 * m, 2 * m));
     for (auto& tri : tris) {
+        if (!nearView.contains(tri.getPosition())) continue;
         Vector2f p = snapPx(tri.getPosition());
         const treeKindDef& kd = treeKinds[treeKindAt(tri.getPosition())];
         const int last = treeTiers - 1;
@@ -2368,6 +2401,168 @@ void swapRemove(vector<T>& v, int i) {
     v.pop_back();
 }
 
+// R47-F1: which band a world position is in. The core disc wins over the rim where they overlap.
+int zoneAt(Vector2f p) {
+    float dx = p.x - villageCenter.x, dy = p.y - villageCenter.y;
+    if (dx * dx + dy * dy < zoneCoreRadius * zoneCoreRadius) return zoneCore;
+    float rim = min(min(p.x, p.y), min(worldSize - p.x, worldSize - p.y));
+    return rim < zoneEdgeBandPx ? zoneEdge : zoneWild;
+}
+
+// R47-F1: band areas (world px^2), measured once; the startup tree/rock targets per band follow from them
+float zoneArea[zoneCount] = {};
+int zoneTreeTarget[zoneCount] = {};
+int zoneRockTarget[zoneCount] = {};
+void computeZoneTargets() {
+    int n = (int)(worldSize / zoneAreaSamplePx);
+    for (int z = 0; z < zoneCount; z++) zoneArea[z] = 0.0f;
+    for (int y = 0; y < n; y++)
+        for (int x = 0; x < n; x++)
+            zoneArea[zoneAt(Vector2f((x + 0.5f) * zoneAreaSamplePx, (y + 0.5f) * zoneAreaSamplePx))] += zoneAreaSamplePx * zoneAreaSamplePx;
+    for (int z = 0; z < zoneCount; z++) {
+        float units = zoneArea[z] / (baseWorldSize * baseWorldSize);
+        zoneTreeTarget[z] = (int)(zoneTreeDensity[z] * units);
+        zoneRockTarget[z] = (int)(zoneRockDensity[z] * units);
+    }
+    zoneTreeTarget[zoneCore] = min(zoneTreeTarget[zoneCore], zoneCoreTreeCap);
+    printf("Bands: core %.0fk px2 (%d trees, %d rocks), wild %.0fk (%d, %d), edge %.0fk (%d, %d)\n",
+           zoneArea[zoneCore] / 1000, zoneTreeTarget[zoneCore], zoneRockTarget[zoneCore],
+           zoneArea[zoneWild] / 1000, zoneTreeTarget[zoneWild], zoneRockTarget[zoneWild],
+           zoneArea[zoneEdge] / 1000, zoneTreeTarget[zoneEdge], zoneRockTarget[zoneEdge]);
+}
+
+// R47-F1: a top-left spot (for a size x size footprint) whose centre is in band z; rolled inside the band's bounding box
+// (the core's is a square round villageCenter) so a small band doesn't waste rolls. False after zoneRollTries misses.
+bool rollInZone(int z, float size, Vector2i& out) {
+    float lo = 0.0f, hiX = worldSize - 1.0f, loY = 0.0f, hiY = worldSize - 1.0f;
+    if (z == zoneCore) {
+        lo = max(0.0f, villageCenter.x - zoneCoreRadius); hiX = min(worldSize - 1.0f, villageCenter.x + zoneCoreRadius);
+        loY = max(0.0f, villageCenter.y - zoneCoreRadius); hiY = min(worldSize - 1.0f, villageCenter.y + zoneCoreRadius);
+    }
+    uniform_int_distribution<int> rx((int)lo, (int)hiX), ry((int)loY, (int)hiY);
+    for (int k = 0; k < zoneRollTries; k++) {
+        Vector2i p(rx(gen), ry(gen));
+        if (zoneAt(Vector2f(p.x + size / 2, p.y + size / 2)) == z) { out = p; return true; }
+    }
+    return false;
+}
+
+// R47-F1: 8-way compass word for a direction from the village (screen y grows downward, so north is -y)
+const char* compassName(Vector2f d) {
+    static const char* const names[8] = {"east", "north-east", "north", "north-west", "west", "south-west", "south", "south-east"};
+    float ang = atan2(-d.y, d.x);   // radians, 0 = east, counter-clockwise
+    int k = (int)lround(ang / 0.78539816f);
+    return names[((k % 8) + 8) % 8];
+}
+
+// R47-F1: tree spatial grid. cells[c] holds indices into tris/trees, bucketed by work spot (tris pos + treeWorkOffset).
+// Rebuilt from tris once at the start of minematerials() each tick (so every add/remove elsewhere is picked up), and
+// again lazily after a chop there swapRemoves a tree (stale). zoneTrees counts trees per band at the last rebuild.
+struct treeGridT {
+    vector<vector<int>> cells = vector<vector<int>>(treeGridN * treeGridN);
+    bool stale = true;
+    int zoneTrees[zoneCount] = {};
+};
+treeGridT treeGrid;
+
+int treeGridCoord(float v) { return clamp((int)floor(v / treeGridCellPx), 0, treeGridN - 1); }
+
+void treeGridRebuild(const vector<CircleShape>& tris) {
+    for (auto& c : treeGrid.cells) c.clear();   // keeps capacity: no allocation after the first few ticks
+    for (int z = 0; z < zoneCount; z++) treeGrid.zoneTrees[z] = 0;
+    for (int i = 0; i < (int)tris.size(); i++) {
+        Vector2f tp = tris[i].getPosition();
+        Vector2f p = tp + treeWorkOffset;
+        treeGrid.cells[treeGridCoord(p.y) * treeGridN + treeGridCoord(p.x)].push_back(i);   // ascending i per cell
+        treeGrid.zoneTrees[zoneAt(tp + Vector2f(treeFootprint / 2, treeFootprint / 2))]++;
+    }
+    treeGrid.stale = false;
+}
+
+// findNearest over trees by work spot, through the grid; same contract (strictly inside radius, ties keep the lowest
+// index, outDSq = radius^2 when nothing is found). radius must be finite.
+template<typename SkipFn>
+int findNearestTree(const vector<CircleShape>& tris, Vector2f pos, float radius, SkipFn skip, float* outDSq = nullptr) {
+    if (treeGrid.stale) treeGridRebuild(tris);
+    int best = -1;
+    float bestDSq = radius * radius;
+    int x0 = treeGridCoord(pos.x - radius), x1 = treeGridCoord(pos.x + radius);
+    int y0 = treeGridCoord(pos.y - radius), y1 = treeGridCoord(pos.y + radius);
+    for (int cy = y0; cy <= y1; cy++)
+        for (int cx = x0; cx <= x1; cx++)
+            for (int i : treeGrid.cells[cy * treeGridN + cx]) {
+                if (skip(i)) continue;
+                Vector2f d = tris[i].getPosition() + treeWorkOffset - pos;
+                float dSq = d.x * d.x + d.y * d.y;
+                if (dSq < bestDSq || (dSq == bestDSq && best != -1 && i < best)) {bestDSq = dSq; best = i;}
+            }
+    if (outDSq) *outDSq = bestDSq;
+    return best;
+}
+
+// R47-F1 band ground tint: a static grid of translucent quads, built once. Each vertex blends the band tints with
+// smoothstep weights across each boundary (core wins over the rim, as in zoneAt), plus a +-zoneTintJitter alpha hash
+// dither, so the wash fades between bands with no hard line. Rows are contiguous, so only the visible span is drawn.
+vector<Vertex> zoneTintVerts;
+int zoneTintN = 0;   // tiles per side
+
+float smooth01(float e0, float e1, float x) {
+    float t = clamp((x - e0) / (e1 - e0), 0.0f, 1.0f);
+    return t * t * (3.0f - 2.0f * t);
+}
+
+Color zoneTintAt(Vector2f p) {
+    float dc = hypot(p.x - villageCenter.x, p.y - villageCenter.y);
+    float rim = min(min(p.x, p.y), min(worldSize - p.x, worldSize - p.y));
+    float c = 1.0f - smooth01(zoneCoreRadius - zoneTintFeatherPx, zoneCoreRadius + zoneTintFeatherPx, dc);
+    float e = 1.0f - smooth01(zoneEdgeBandPx - zoneTintFeatherPx, zoneEdgeBandPx + zoneTintFeatherPx, rim);
+    float w[zoneCount] = {c, (1.0f - c) * (1.0f - e), (1.0f - c) * e};
+    float r = 0, g = 0, b = 0, a = 0;
+    for (int z = 0; z < zoneCount; z++) {
+        r += w[z] * zoneTintColors[z].r; g += w[z] * zoneTintColors[z].g;
+        b += w[z] * zoneTintColors[z].b; a += w[z] * zoneTintColors[z].a;
+    }
+    uint32_t h = (uint32_t)(int)p.x * 73856093u ^ (uint32_t)(int)p.y * 19349663u;
+    h ^= h >> 13; h *= 0x5bd1e995u; h ^= h >> 15;
+    int jitter = (int)(h % (uint32_t)(2 * zoneTintJitter + 1)) - zoneTintJitter;
+    return Color((uint8_t)lround(r), (uint8_t)lround(g), (uint8_t)lround(b), (uint8_t)clamp((int)lround(a) + jitter, 0, 255));
+}
+
+void buildZoneTint() {
+    zoneTintN = (int)ceil(worldSize / zoneTintTilePx);
+    zoneTintVerts.clear();
+    zoneTintVerts.reserve((size_t)zoneTintN * zoneTintN * 6);
+    for (int ty = 0; ty < zoneTintN; ty++)
+        for (int tx = 0; tx < zoneTintN; tx++) {
+            float x0 = tx * zoneTintTilePx, y0 = ty * zoneTintTilePx;
+            float x1 = min(worldSize, x0 + zoneTintTilePx), y1 = min(worldSize, y0 + zoneTintTilePx);
+            Vertex a{{x0, y0}, zoneTintAt({x0, y0})}, b{{x1, y0}, zoneTintAt({x1, y0})};
+            Vertex d{{x0, y1}, zoneTintAt({x0, y1})}, e{{x1, y1}, zoneTintAt({x1, y1})};
+            for (const Vertex& v : {a, b, e, a, e, d}) zoneTintVerts.push_back(v);
+        }
+}
+
+// World layer, straight after the clear: under trails, lakes and everything else
+void drawZoneTint(RenderWindow& window, const FloatRect& view) {
+    if (zoneTintN == 0) return;
+    int tx0 = clamp((int)floor(view.position.x / zoneTintTilePx), 0, zoneTintN - 1);
+    int tx1 = clamp((int)floor((view.position.x + view.size.x) / zoneTintTilePx), 0, zoneTintN - 1);
+    int ty0 = clamp((int)floor(view.position.y / zoneTintTilePx), 0, zoneTintN - 1);
+    int ty1 = clamp((int)floor((view.position.y + view.size.y) / zoneTintTilePx), 0, zoneTintN - 1);
+    for (int ty = ty0; ty <= ty1; ty++)
+        window.draw(&zoneTintVerts[((size_t)ty * zoneTintN + tx0) * 6], (size_t)(tx1 - tx0 + 1) * 6, PrimitiveType::Triangles);
+}
+
+// The tree whose (int) work spot is exactly (x, y), lowest index first; -1 if none
+int treeAtWorkSpot(const vector<CircleShape>& tris, int x, int y) {
+    if (treeGrid.stale) treeGridRebuild(tris);
+    for (int i : treeGrid.cells[treeGridCoord((float)y) * treeGridN + treeGridCoord((float)x)]) {
+        Vector2f p = tris[i].getPosition() + treeWorkOffset;
+        if ((int)p.x == x && (int)p.y == y) return i;
+    }
+    return -1;
+}
+
 // R44-F2: no task stripe -> idle. Shared by barbColor() and the H beacons so both agree on who is jobless
 bool barbIdle(const barb& b) { return !b.deertargeting && !b.building && !b.tempering && !b.chopping; }
 
@@ -2498,19 +2693,31 @@ void wolfTick(vector<wolf>& wolves, vector<deer>& deers, vector<RectangleShape>&
 	int deerCount = countSpecies(deers, speciesDeer);   // only deer count: rabbits are never wolf prey
 	if ((int)wolves.size() < maxWolves && deerCount > wolfMinDeer
 	    && uniform_int_distribution<int>(0, wolfSpawnChance - 1)(gen) == 0) {
+		// R47-F1: in from a random side of the wild band's outer edge (where it meets the rocky rim), well clear of the
+		// core; it leaves the same way. No clear spot in wolfSpawnTries = no wolf this time.
 		wolf w;
-		float along = clamp((float)distrib(gen), mapEdgeInset, worldSize - mapEdgeInset);
-		switch (uniform_int_distribution<int>(0, 3)(gen)) {
-			case 0:  w.exit = Vector2f(-10.0f, along); break;
-			case 1:  w.exit = Vector2f(worldSize + 10.0f, along); break;
-			case 2:  w.exit = Vector2f(along, -10.0f); break;
-			default: w.exit = Vector2f(along, worldSize + 10.0f); break;
+		uniform_real_distribution<float> along(zoneEdgeBandPx, worldSize - zoneEdgeBandPx);
+		bool found = false;
+		for (int k = 0; k < wolfSpawnTries && !found; k++) {
+			float a = along(gen);
+			switch (uniform_int_distribution<int>(0, 3)(gen)) {
+				case 0:  w.exit = Vector2f(zoneEdgeBandPx, a); break;
+				case 1:  w.exit = Vector2f(worldSize - zoneEdgeBandPx, a); break;
+				case 2:  w.exit = Vector2f(a, zoneEdgeBandPx); break;
+				default: w.exit = Vector2f(a, worldSize - zoneEdgeBandPx); break;
+			}
+			Vector2f d = w.exit - villageCenter;
+			found = hypot(d.x, d.y) >= zoneCoreRadius + wolfCoreMarginPx;
 		}
-		w.shape.setSize(wolfSize);
-		w.shape.setFillColor(wolfColor);
-		w.shape.setPosition(w.exit);
-		wolves.push_back(w);
-		printf("Wolf arriving\n");
+		if (found) {
+			w.shape.setSize(wolfSize);
+			w.shape.setFillColor(wolfColor);
+			w.shape.setPosition(w.exit);
+			wolves.push_back(w);
+			const char* dir = compassName(w.exit - villageCenter);
+			printf("Wolf arriving from the %s (%.0f, %.0f)\n", dir, w.exit.x, w.exit.y);
+			logEvent(string("A wolf comes out of the wilds to the ") + dir);
+		}
 	}
 	for (int i = 0; i < (int)wolves.size(); ) {
 		wolf& w = wolves[i];
@@ -7451,6 +7658,7 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
                    const forge& fg) {
     vector<int> treeClaim, rockClaim;   // parallel to trees/tris and rocks/octs for this tick
     buildWorkClaims(barbs, tris, octs, treeClaim, rockClaim);
+    treeGridRebuild(tris);   // R47-F1: picks up every tree add/remove since last tick; chops below mark it stale
     vector<int> shoreClaim(shorePoints.size(), -1);   // rebuilt every tick like the tree/rock claims, so no stale anglers
     for (int j = 0; j < (int)barbs.size(); j++) {
         int k = barbs[j].targetShore;
@@ -7491,8 +7699,7 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
         bool bestIsRock = false;
         if (b.timer == 0 && !b.chopping) {
             float treeDSq, rockDSq, bushDSq;
-            int bestTree = findNearest(bpos, barbWorkSearchRadius, (int)trees.size(),
-                                       [&](int i) { return tris[i].getPosition() + treeWorkOffset; },
+            int bestTree = findNearestTree(tris, bpos, barbWorkSearchRadius,   // R47-F1: grid, nearby cells only
                                        [&](int i) { return trees[i].dying || (treeClaim[i] != -1 && treeClaim[i] != j); }, &treeDSq);
             int bestRock = findNearest(bpos, barbWorkSearchRadius, (int)rocks.size(),
                                        [&](int k) { return octs[k].getPosition() + rockWorkOffset; },
@@ -7574,8 +7781,7 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
                     const workMem m = b.mem[k];
                     int hit = -1;
                     if (m.kind == memTree)
-                        hit = findNearest(m.pos, memSpotRadius, (int)trees.size(),
-                                          [&](int i) { return tris[i].getPosition() + treeWorkOffset; },
+                        hit = findNearestTree(tris, m.pos, memSpotRadius,
                                           [&](int i) { return trees[i].dying || (treeClaim[i] != -1 && treeClaim[i] != j); });
                     else if (m.kind == memRock)
                         hit = findNearest(m.pos, memSpotRadius, (int)rocks.size(),
@@ -7669,8 +7875,7 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
             // the bigger map head for the nearest tree, rock or ripe bush instead of wandering empty ground
             if (best == -1 && !bestIsBush && !b.moving && !b.deertargeting) {
                 float wTreeDSq, wRockDSq, wBushDSq;
-                int wTree = findNearest(bpos, barbWorkFallbackRadius, (int)trees.size(),
-                                        [&](int i) { return tris[i].getPosition() + treeWorkOffset; },
+                int wTree = findNearestTree(tris, bpos, barbWorkFallbackRadius,
                                         [&](int i) { return trees[i].dying || (treeClaim[i] != -1 && treeClaim[i] != j); }, &wTreeDSq);
                 int wRock = findNearest(bpos, barbWorkFallbackRadius, (int)rocks.size(),
                                         [&](int k) { return octs[k].getPosition() + rockWorkOffset; },
@@ -7806,33 +8011,31 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
             continue;
 	}
 	if (b.target != targetRock) {
-        for (int i = 0; i < (int)trees.size(); i++) {
+        int i = treeAtWorkSpot(tris, b.targetx, b.targety);   // R47-F1: grid lookup instead of a scan of every tree
+        if (i >= 0) {
             Vector2f tp = tris[i].getPosition();
             float tix = tp.x + 8, tiy = tp.y + 15;
-            if (b.targetx != (int)tix || b.targety != (int)tiy) continue;
+            float dx = tix - bpos.x, dy = tiy - bpos.y;
             if (trees[i].dying && !b.chopping) {
                 b.moving  = false; clearRoute(b);
                 b.targetx = b.targety = -1;
-                break;
+            } else if (dx * dx + dy * dy < 4.0f) {
+                b.chopping = true;
+                trees[i].dying = true;
+                if (workTick(b)) b.timer++;
+                if (b.timer >= chopTicks()) {
+                    practice(techHandAxe);
+                    memRecord(b, memTree, Vector2f((int)tix, (int)tiy));   // INBOX-F2: by position; the tree index dies with the swapRemove
+                    swapRemove(trees,  i);
+                    swapRemove(tris,   i);
+                    swapRemove(stumps, i);
+                    swapRemove(treeClaim, i);
+                    treeGrid.stale = true;   // R47-F1: indices moved; the next lookup rebuilds
+                    startHaul(b, carryWood, stores);   // R29-F1: wood counts once it reaches the depot
+                    printf("TREE DESTROYED - hauling wood (stock %d)\n", stockOf(b).wood);
+                }
             }
-	   
-            float dx = tix - bpos.x, dy = tiy - bpos.y;
-            if (dx * dx + dy * dy >= 4.0f) break;
-            b.chopping = true;
-            trees[i].dying = true;
-            if (workTick(b)) b.timer++;
-            if (b.timer >= chopTicks()) {
-                practice(techHandAxe);
-                memRecord(b, memTree, Vector2f((int)tix, (int)tiy));   // INBOX-F2: by position; the tree index dies with the swapRemove
-                swapRemove(trees,  i);
-                swapRemove(tris,   i);
-                swapRemove(stumps, i);
-                swapRemove(treeClaim, i);
-                startHaul(b, carryWood, stores);   // R29-F1: wood counts once it reaches the depot
-                printf("TREE DESTROYED - hauling wood (stock %d)\n", stockOf(b).wood);
-           		}
-            break;
-        	}
+        }
 	    }
 	else
 		for(int i = 0; i < (int)rocks.size(); i++) {
@@ -7889,14 +8092,23 @@ CircleShape makeTreeTri(int x, int y) {
 void treespawn(vector<tree>& trees, vector<CircleShape>& tris, vector<RectangleShape>& stumps, const fieldGrid& fields,
                const vector<house>& houses, const vector<barb>& barbs) {
     if (treespawnChance(gen) != 0) return;
-    tree t{distrib(gen), distrib(gen), false};
-    // R44-F3: reroll toward the frontier; the last roll stands after groveMaxRetries
+    // R47-F1: bucket by band, weighted by each band's startup tree share; a core at zoneCoreTreeCap takes no more
+    // (counts from the tree grid, rebuilt in minematerials() earlier this tick)
+    double w[zoneCount];
+    for (int z = 0; z < zoneCount; z++) w[z] = zoneTreeTarget[z];
+    if (treeGrid.zoneTrees[zoneCore] >= zoneCoreTreeCap) w[zoneCore] = 0.0;
+    if (w[zoneCore] + w[zoneWild] + w[zoneEdge] <= 0.0) return;
+    int z = discrete_distribution<int>(w, w + zoneCount)(gen);
+    Vector2i p;
+    if (!rollInZone(z, treeFootprint, p)) return;
+    tree t{p.x, p.y, false};
+    // R44-F3: reroll toward the frontier (inside the core only, the band the clearing is in); the last roll stands
     uniform_real_distribution<float> groveRoll(0.0f, 1.0f);
-    for (int i = 0; i < groveMaxRetries; i++) {
+    for (int i = 0; z == zoneCore && i < groveMaxRetries; i++) {
         float d = hypot(t.x - villageCenter.x, t.y - villageCenter.y);
         float accept = clamp((d - groveRampStart) / groveRamp, groveMinAccept, 1.0f);
         if (groveRoll(gen) < accept) break;
-        t = tree{distrib(gen), distrib(gen), false};
+        if (rollInZone(zoneCore, treeFootprint, p)) t = tree{p.x, p.y, false};
     }
     if (!lakeClear(FloatRect(Vector2f(t.x, t.y), Vector2f(treeFootprint, treeFootprint)))) return; // no trees in the water
     if (!fieldsClear(fields, FloatRect(Vector2f(t.x, t.y), Vector2f(treeFootprint, treeFootprint)))) return; // nor on a wheat plot
@@ -8347,11 +8559,18 @@ int main() {
         logEvent(founders);
     }
 
-    vector<tree> trees(numtrees);
-    for (auto& t : trees) {t.x = distrib(gen); t.y = distrib(gen);}
-
-    vector<rock> rocks(numrocks);
-    for (auto& r : rocks) {r.x = distrib(gen); r.y = distrib(gen);}
+    // R47-F1: startup trees and rocks bucketed per band (zoneTreeTarget/zoneRockTarget), uniform inside each band
+    computeZoneTargets();
+    buildZoneTint();
+    vector<tree> trees;
+    vector<rock> rocks;
+    for (int z = 0; z < zoneCount; z++) {
+        Vector2i p;
+        for (int k = 0; k < zoneTreeTarget[z]; k++)
+            if (rollInZone(z, treeFootprint, p)) trees.push_back(tree{p.x, p.y, false});
+        for (int k = 0; k < zoneRockTarget[z]; k++)
+            if (rollInZone(z, 12.0f, p)) rocks.push_back(rock{p.x, p.y, false});   // 6px-radius pentagon
+    }
 
     vector<house> houses;
     vector<RectangleShape> houseshapes;
@@ -8367,8 +8586,8 @@ int main() {
 
     vector<CircleShape> tris;
     vector<RectangleShape> stumps;
-    tris.reserve(numtrees);
-    stumps.reserve(numtrees);
+    tris.reserve(trees.size());
+    stumps.reserve(trees.size());
     for (auto& t : trees) {
         tris.push_back(makeTreeTri(t.x, t.y));
 
@@ -8379,7 +8598,7 @@ int main() {
     }
 
     vector<CircleShape> octs;
-    octs.reserve(numrocks);
+    octs.reserve(rocks.size());
     for (auto& r : rocks) {
         CircleShape oct;
         oct.setPointCount(5);
@@ -8389,7 +8608,7 @@ int main() {
         octs.push_back(oct);
     }
     vector<char> rockGold;   // R46-F1a: 1 = gold-flecked, parallel to rocks/octs (every swapRemove touches all three)
-    rockGold.reserve(numrocks);
+    rockGold.reserve(rocks.size());
     for (size_t i = 0; i < rocks.size(); i++) rockGold.push_back(rollGoldRock());
 
     spawnLakes(trees, tris, stumps, rocks, octs, rockGold); // before the bushes so clumps can avoid the water
@@ -8588,6 +8807,8 @@ int main() {
 
         window.clear(Color(4, 20, 14)); //bg color
         window.setView(worldView);
+        FloatRect camRect(worldView.getCenter() - worldView.getSize() / 2.0f, worldView.getSize());   // R47-F1: view culling
+        drawZoneTint(window, camRect);   // R47-F1: faint band wash, first on the ground
         drawTrails(window, trailVerts);
         drawWalls(window, wallVerts);    // R31-F2: under paving, quarter marks, buildings and barbs
         drawPaving(window, paveVerts);   // over the trail tint, under everything else
@@ -8647,7 +8868,7 @@ int main() {
 		drawSnapped(window, w.shape);
 
         {
-            // R45-F1a: 4500 stumps on the 1200 map, so only the ones in (or touching) the view are drawn
+            // R45-F1a: thousands of stumps (R47-F1: ~12k on the 2400 map), so only the ones in (or touching) the view are drawn
             FloatRect viewRect(worldView.getCenter() - worldView.getSize() / 2.0f, worldView.getSize());
             for (int i = 0; i < (int)tris.size(); i++)
                 if (viewRect.findIntersection(stumps[i].getGlobalBounds())) drawSnapped(window, stumps[i]);
@@ -8655,7 +8876,7 @@ int main() {
 
         drawBarbs(window, barbs, squares, frameCount, zoom);
 	if (activeTrader) drawSnapped(window, activeTrader->shape);
-	drawTrees(window, tris, treeVerts);
+	drawTrees(window, tris, treeVerts, camRect);
 	drawSmoke(window, smoke, paused);   // INBOX2-F1: per-race puffs, only after own smoked kills
 	drawMillPuffs(window);   // FARM-F2: above the trees, under the overlay
 	drawForgeSparks(window, paused);   // POL-F5b: above barbs and trees so the sparks read, under the overlay
