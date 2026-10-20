@@ -34,6 +34,10 @@ const Color goldRockColor(136, 128, 108);   // rock diamond (128,126,118) nudged
 const Color goldFleckColor(212, 188, 118);  // muted pale gold, under the gentry sash (224,194,96) in saturation
 const Vector2f goldFleckOffset(5.0f, 4.0f); // 1px fleck on the upper-left (lit) face of the 12px diamond
 const Color hudGoldColor(212, 188, 118);    // HUD "gold n" text, same pale gold as the fleck
+// Gilded Keep (R46-F1b): once a race's keep stands and the global gold reaches keepGildCost, it is spent once to gild
+// that keep's gate: a 1px gilt frame (jambs, shoulders, keystone) round the dark arched door. One ticker line per gilding.
+const int keepGildCost = 6;                 // nuggets per keep (~6 gold rocks)
+const Color keepGildColor(228, 196, 104);   // a touch brighter than the fleck so the frame reads on the slate wall
 
 const char* const hudFontPath = "assets/DejaVuSans.ttf";
 const unsigned int hudFontSize = 14;
@@ -1622,7 +1626,7 @@ bool smokehouseClear(const FloatRect& r) {
 // R31-F1: one per race (index = barbRace). x,y = keep top-left, fixed at startup by placeQuarters(); id is stable, from
 // nextKeepId, given when the keep stands. keepQueued[r] (a builder holds jobKeep for it) and keepReservedStone[r] are
 // always set together on claim and cleared together on completion or cancelKeep(). Never torn down (outlives any leader).
-struct keep {int id = -1; int race = -1; int x = 0, y = 0; bool built = false;};
+struct keep {int id = -1; int race = -1; int x = 0, y = 0; bool built = false; bool gilded = false;};   // R46-F1b: gilded
 keep keeps[raceCount];
 int nextKeepId = 0;
 bool keepQueued[raceCount] = {false, false, false};
@@ -6045,6 +6049,12 @@ void cancelKeep(int r) {
 void buildkeeps(vector<barb>& barbs, vector<RectangleShape>& squares, const storehouse (&stores)[raceCount]) {
     for (int r = 0; r < raceCount; r++) {
         keep& kp = keeps[r];
+        if (kp.built && !kp.gilded && gold >= keepGildCost) {   // R46-F1b: checked before deducting; gilds once
+            gold -= keepGildCost;
+            kp.gilded = true;
+            printf("---KEEP GILDED--- %s, id %d (%d gold, %d left)\n", raceDefs[r].name, kp.id, keepGildCost, gold);
+            logRaceEvent(string(racePlurals[r]) + " gild their keep's gate", r);
+        }
         if (kp.built) continue;
         if (keepQueued[r]) {   // builder lost without releaseBarbWork() (should not happen): refund and free the guard
             int i = findBarbById(barbs, keepBuilderId[r]);
@@ -6090,6 +6100,13 @@ void drawKeeps(RenderWindow& window, const vector<barb>& barbs) {
         drawParts(va, keepShadowParts, o, Color::White);
         drawParts(va, keepStoneParts, o, keepStoneColor);
         drawParts(va, keepTrimParts, o, Color::White);
+        if (kp.gilded) {   // R46-F1b: 1px gilt frame hugging the door: keystone over the arch, shoulders, full-height jambs
+            pushQuad(va, o + keepGatePos + Vector2f(1.0f, -1.0f), Vector2f(keepGateSize.x - 2.0f, 1.0f), keepGildColor);
+            pushQuad(va, o + keepGatePos, Vector2f(1.0f, 1.0f), keepGildColor);
+            pushQuad(va, o + keepGatePos + Vector2f(keepGateSize.x - 1.0f, 0.0f), Vector2f(1.0f, 1.0f), keepGildColor);
+            pushQuad(va, o + keepGatePos + Vector2f(-1.0f, 1.0f), Vector2f(1.0f, keepGateSize.y - 1.0f), keepGildColor);
+            pushQuad(va, o + keepGatePos + Vector2f(keepGateSize.x, 1.0f), Vector2f(1.0f, keepGateSize.y - 1.0f), keepGildColor);
+        }
         pushQuad(va, o + keepPolePos, Vector2f(1.0f, keepPoleH), keepPoleColor);
         if (inside > 0)     // R31-F3: full height, flying right from the pole top
             pushQuad(va, o + keepPolePos + Vector2f(1.0f, 0.0f), keepFlagSize, keepBannerColors[k]);
