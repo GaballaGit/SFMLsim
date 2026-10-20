@@ -320,6 +320,25 @@ const float healthBarW = 4.0f;                    // 1px tall bar, centred under
 const float healthBarGap = 1.0f;                  // px of grass between the feet and the bar
 const Color healthBarFillColor(196, 72, 58);      // muted brick red, same family as the hunt stripe but dimmer
 const Color healthBarBackColor(70, 60, 56, 200);  // dull grey-brown for the missing part, readable on dark green
+// R47-F9 Ancestor Stones: every death (removeBarb) leaves a 3x4 headstone where the barb stood. The graves vector is
+// its own list (no barb index or id kept), capped at graveMax with the oldest evicted first.
+const int graveMax = 12;                          // stones on the map at once; a new one evicts the oldest
+const Vector2f graveSize(3.0f, 4.0f);             // 1px cap on a 3x3 slab (barbs are 2-3px wide, trees ~16px)
+const Color graveStoneColor(128, 126, 118);       // weathered grey, mixed with the race tint
+const float graveRaceTint = 0.3f;                 // share of raceEventColors in the stone: muted, still readable by race
+const float graveBaseShade = 0.7f;                // bottom row darker, so the stone reads as set in the ground
+const int graveFadeStartTicks = 5 * ticksPerMinute;   // fresh stones hold full alpha this long...
+const int graveFadeTicks = 20 * ticksPerMinute;       // ...then fade over this long down to graveOldAlpha
+const uint8_t graveOldAlpha = 102;                // 40% of 255: old graves stay faintly visible
+const float graveNoticePx = 8.0f;                 // a same-race barb within this many px of the stone centre brightens it
+const int graveGlowTicks = 90;                    // brighten fades out over this many ticks once the barb has moved on
+const Color graveGlowColor(232, 228, 212);        // pale stone the colour lifts toward while lit
+const float graveGlowMix = 0.45f;                 // at full glow
+const float graveSpreadPx = 4.0f;                 // a stone landing on another is nudged right by this much (a few tries)
+// Morale: one term per race per tick, graveMoralePerStone per own stone up to graveMoraleMax. The race's hunger grows
+// that much slower (a rest tick every 1/term ticks), so 4 stones = 4% longer between meals at most.
+const float graveMoralePerStone = 0.01f;
+const float graveMoraleMax = 0.04f;
 
 const int eventMaxLines = 5;              // ticker shows (and stores) at most this many events
 const int eventFadeTicks = 300;           // frames an event stays on screen (~5s at 60fps)
@@ -3469,6 +3488,62 @@ void drawRain(RenderWindow& window, VertexArray& va, int frame) {
     if (va.getVertexCount() > 0) window.draw(va);
 }
 
+// R47-F9 Ancestor Stones. Independent of the barb vectors: a stone keeps only its race and spot, never an index or id.
+struct grave {
+    Vector2f pos;        // top-left of the 3x4 stone, whole px
+    int race = 0;
+    int age = 0;         // sim ticks since it was raised
+    int glow = 0;        // ticks of brightening left (refreshed while a same-race barb is near)
+};
+vector<grave> graves;                       // oldest first, at most graveMax
+float graveMorale[raceCount] = {};          // the one morale term per race, recomputed by graveTick() every tick
+float graveRestAcc[raceCount] = {};         // carries the fractional rest ticks between ticks
+bool graveHungerRest[raceCount] = {};       // this tick, race r's hunger does not grow (read in hungerTick)
+
+// Called from removeBarb() only. The stone stands where the barb's feet were, nudged off any stone already there.
+void addGrave(const barb& b, const RectangleShape& sq) {
+    Vector2f p(floor(sq.getPosition().x + sq.getSize().x / 2.0f - 1.0f), floor(sq.getPosition().y + sq.getSize().y) - graveSize.y);
+    for (int tries = 0; tries < 4; tries++) {
+        bool hit = false;
+        for (auto& g : graves)
+            if (fabs(g.pos.x - p.x) < graveSize.x + 1.0f && fabs(g.pos.y - p.y) < graveSize.y) { hit = true; break; }
+        if (!hit) break;
+        p.x += graveSpreadPx;
+    }
+    p.x = clamp(p.x, 0.0f, worldSize - graveSize.x);
+    p.y = clamp(p.y, 0.0f, worldSize - graveSize.y);
+    if ((int)graves.size() >= graveMax) graves.erase(graves.begin());   // oldest-first eviction
+    grave g;
+    g.pos = p;
+    g.race = clampRace(b.race);
+    graves.push_back(g);
+    printf("GRAVE - stone raised for %s (%s) at %d,%d - %d stones\n", b.name, raceOf(b).name, (int)p.x, (int)p.y, (int)graves.size());
+}
+
+// Ages the stones, lights the ones a same-race barb is beside, and computes each race's morale term once.
+// Runs before hungerTick(), which reads graveHungerRest.
+void graveTick(const vector<barb>& barbs, const vector<RectangleShape>& squares) {
+    int own[raceCount] = {};
+    for (auto& g : graves) {
+        g.age++;
+        if (g.glow > 0) g.glow--;
+        own[clampRace(g.race)]++;
+        Vector2f c = g.pos + graveSize / 2.0f;
+        for (int i = 0; i < (int)barbs.size() && i < (int)squares.size(); i++) {
+            const barb& b = barbs[i];
+            if (b.race != g.race || barbHidden(b) || barbUnderground(b)) continue;
+            Vector2f d = squares[i].getPosition() + squares[i].getSize() / 2.0f - c;
+            if (d.x * d.x + d.y * d.y <= graveNoticePx * graveNoticePx) { g.glow = graveGlowTicks; break; }
+        }
+    }
+    for (int r = 0; r < raceCount; r++) {
+        graveMorale[r] = min(graveMoraleMax, own[r] * graveMoralePerStone);
+        graveRestAcc[r] += graveMorale[r];
+        graveHungerRest[r] = graveRestAcc[r] >= 1.0f;
+        if (graveHungerRest[r]) graveRestAcc[r] -= 1.0f;
+    }
+}
+
 // Returns true on ticks where the barb makes work progress; hungry barbs skip some ticks
 bool workTick(barb& b) {
     if (!isHungry(b)) return true;
@@ -3483,7 +3558,7 @@ void hungerTick(vector<barb>& barbs) {
     int hungryCommoners[raceCount] = {};   // RACE-F1: each race eats from its own larder, so the reserve is per race
     for (auto& b : barbs) {
         if (!isHungry(b)) {
-            b.hunger++;
+            if (!graveHungerRest[clampRace(b.race)]) b.hunger++;   // R47-F9: ancestor stones' morale rest tick
             if (isHungry(b) && stockOf(b).food <= 0 && hungryLogCooldown == 0) {
                 logRaceEvent(string(b.name) + " is hungry - no food (" + racePlurals[clampRace(b.race)] + ")", b.race);
                 hungryLogCooldown = eventHungryCooldownTicks;
@@ -7021,6 +7096,28 @@ void causewayTick() {
     }
 }
 
+// R47-F9: ground layer, after bushes and before the buildings (a house built later covers its stone). One batched draw.
+// Muted race-tinted stone; fades to 40% alpha with age; lifts toward pale stone (and full alpha) while a kinsman is near.
+void drawGraves(RenderWindow& window, const FloatRect& camRect) {
+    if (graves.empty()) return;
+    static VertexArray va(PrimitiveType::Triangles);
+    va.clear();
+    for (auto& g : graves) {
+        if (!camRect.findIntersection(FloatRect(g.pos, graveSize))) continue;
+        float old = clamp((float)(g.age - graveFadeStartTicks) / graveFadeTicks, 0.0f, 1.0f);
+        float lit = (float)g.glow / graveGlowTicks;
+        float a = 255.0f + (graveOldAlpha - 255.0f) * old;
+        a += (255.0f - a) * lit;
+        Color c = lerpColor(lerpColor(graveStoneColor, raceEventColors[clampRace(g.race)], graveRaceTint), graveGlowColor, graveGlowMix * lit);
+        c.a = (uint8_t)a;
+        Color base = shade(c, graveBaseShade);
+        pushQuad(va, g.pos + Vector2f(1.0f, 0.0f), Vector2f(1.0f, 1.0f), c);          // rounded cap
+        pushQuad(va, g.pos + Vector2f(0.0f, 1.0f), Vector2f(graveSize.x, 2.0f), c);   // slab
+        pushQuad(va, g.pos + Vector2f(0.0f, 3.0f), Vector2f(graveSize.x, 1.0f), base);  // set in the ground
+    }
+    if (va.getVertexCount() > 0) window.draw(va);
+}
+
 // INBOX-F1: the release half of removeBarb(), shared with bellTick() so a barb taking shelter frees exactly what a dead one does
 void releaseBarbWork(barb& b, smokehouseSet& sh, forge& fg, storehouse (&stores)[raceCount], fieldGrid& fields) {
     if (b.deertargeting) clearHunt(b);
@@ -7082,6 +7179,7 @@ void removeBarb(vector<barb>& barbs, vector<RectangleShape>& squares, int i,
     if (isLeader(b)) loseLeader(b.race);
     printf("BARB DIED - %s the %s (%s, %s), id %d - %d left\n", b.name, traitOf(b).name, raceOf(b).name,
            isGentry(b) ? "Gentry" : "Commoner", b.id, (int)barbs.size() - 1);
+    addGrave(b, squares[i]);   // R47-F9: copied out by value; nothing in graves points back at barbs
     b.homeHouse = -1;
     clearRoute(b);   // R39-F1: the route lives in the struct; the swapped-in barb keeps its own route
     swapRemove(barbs, i);
@@ -9373,6 +9471,7 @@ int main() {
                 clockk();
                 weatherTick();
                 traderTick(activeTrader, barbs, stores);
+                graveTick(barbs, squares);   // R47-F9: morale term per race, before hungerTick() reads it
                 hungerTick(barbs);
                 trailTick();
                 birdTick(birds, birdHeading, squares, barbs);
@@ -9444,6 +9543,7 @@ int main() {
 
 	for (auto& bs : bushshapes)
 		window.draw(bushDrawShape(bs));
+	drawGraves(window, camRect);   // R47-F9: ancestor stones, on the ground under the buildings
 
 	{
 		RectangleShape slab(houseSlabSize); // foundations under houses, drawn first so every house sits on top
