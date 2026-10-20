@@ -928,6 +928,19 @@ const Color inspectHealthFill(118, 172, 96);      // muted leaf green, distinct 
 const float selectRingRadius = 4.5f;          // world px around the barb's centre: clears the 2x4 body and 2px hats
 const float selectRingPx = 1.0f;              // screen px (scaled by zoom), thin like the hover outline
 const Color selectRingColor(240, 210, 90, 230);   // tooltip-outline yellow
+// R44-F1: job target line. Hovered or selected barb -> faint dotted 1px line from its centre to its work target, plus a
+// small pulsing ring on the target. Dash/gap/line length are screen px (scaled by zoom like the outlines).
+const Color targetLineColor(236, 226, 170);   // pale cream-yellow; alpha comes from targetLineAlpha
+const uint8_t targetLineAlpha = 90;           // faint: the world shows through, reads on the dark green and at night
+const float targetDashPx = 3.0f;              // dash length, screen px
+const float targetGapPx = 3.0f;               // gap between dashes, screen px
+const int targetMaxDashes = 160;              // long lines at far zoom stretch the dashes instead of adding more
+const float targetLineMinDist = 8.0f;         // world px: closer than this (working at the spot) draws no line, ring only
+const Color targetRingColor(222, 210, 140);   // muted pale yellow, a step softer than the select ring
+const float targetRingRadius = 3.0f;          // world px at rest, smaller than the 4.5px select ring
+const float targetRingPulse = 1.0f;           // world px added at the pulse peak
+const float targetRingPulseSpeed = 0.08f;     // radians per frame (~1.3s per pulse at 60fps)
+const uint8_t targetRingAlphaLo = 110, targetRingAlphaHi = 190;   // alpha swing over one pulse
 // Overlay lenses (UIO-F3): L cycles Off -> Hunger -> Race. Soft discs on the ground layer, under barbs and buildings;
 // only barbs, houses and storehouses are looped (never trees), culled to the camera. Legend panel top-left under the HUD.
 enum class Lens { Off, Hunger, Race };
@@ -3304,7 +3317,22 @@ struct hoverHit {string label; optional<RectangleShape> rect; optional<CircleSha
                  int homeOfBarb = -1;     // hovered barb's home house id -> outline that house
                  int hoveredHouse = -1;   // hovered house id -> pip over each resident
                  int hoveredBarb = -1;    // INBOX-F2b: hovered barb id -> its order pip shows at any zoom
-                 optional<Color> tint;}; // POL-F1: ledger outline + text colour (default tooltip colours when unset)
+                 optional<Color> tint;   // POL-F1: ledger outline + text colour (default tooltip colours when unset)
+                 optional<Vector2f> targetPos;}; // R44-F1: hovered barb's work target centre (world px), unset if none
+
+// R44-F1: centre of a barb's current work target, or nullopt (no target, wandering, or a hunted deer that is gone).
+// A hunt reads the deer's live shape by id, index-checked against both parallel vectors; never a stored index.
+optional<Vector2f> barbTargetPos(const barb& b, const RectangleShape& sq, const vector<deer>& deers, const vector<RectangleShape>& deershape) {
+    if (b.deertargeting) {
+        int k = findDeerById(deers, b.targetDeerId);
+        if (k < 0 || k >= (int)deershape.size()) return nullopt;
+        FloatRect db = deershape[k].getGlobalBounds();
+        return db.position + db.size / 2.0f;
+    }
+    if (b.targetx < 0 || b.targety < 0) return nullopt;
+    if (b.targetx == b.wanderX && b.targety == b.wanderY) return nullopt;   // a wander walk is not a job
+    return Vector2f((float)b.targetx, (float)b.targety) + sq.getSize() / 2.0f;   // targetx/y is where the body's top-left goes
+}
 
 int spearsOfRace(const vector<barb>& barbs, int r);   // POL-F3, defined with craftspear
 
@@ -3366,6 +3394,7 @@ optional<hoverHit> pickHover(Vector2f p, float radius, const vector<barb>& barbs
             hoverHit h{label, squares[i], nullopt};
             h.homeOfBarb = b.homeHouse;
             h.hoveredBarb = b.id;   // INBOX-F2b: order pip
+            h.targetPos = barbTargetPos(b, squares[i], deers, deershape);   // R44-F1
             return h;
         }
     for (int r = 0; r < raceCount; r++) {   // R40-F1: a miner below ground is hovered through its shaft frame
@@ -3594,6 +3623,38 @@ void drawHousehold(RenderWindow& window, const View& worldView, const hoverHit& 
             break;
         }
     }
+}
+
+// R44-F1: faint dotted line from a barb's centre to its work target plus a pulsing pale-yellow ring on the target.
+// Drawn above the overlays (like the hover outline) and under the HUD; the line is skipped when the target is very close.
+void drawTargetLine(RenderWindow& window, const View& worldView, Vector2f from, Vector2f to, float zoom, int frame) {
+    window.setView(worldView);
+    Vector2f d = to - from;
+    float len = sqrt(d.x * d.x + d.y * d.y);
+    if (len >= targetLineMinDist) {
+        float dash = targetDashPx / zoom, step = (targetDashPx + targetGapPx) / zoom;
+        if (len / step > targetMaxDashes) { step = len / targetMaxDashes; dash = step / 2.0f; }
+        Vector2f u = d / len;
+        Color lc = targetLineColor;
+        lc.a = targetLineAlpha;
+        VertexArray va(PrimitiveType::Lines);
+        for (float s = 0.0f; s < len; s += step) {
+            va.append(Vertex{from + u * s, lc});
+            va.append(Vertex{from + u * min(s + dash, len), lc});
+        }
+        window.draw(va);
+    }
+    float wave = (sin(frame * targetRingPulseSpeed) + 1.0f) / 2.0f;   // 0..1
+    float rad = targetRingRadius + targetRingPulse * wave;
+    Color rc = targetRingColor;
+    rc.a = (uint8_t)(targetRingAlphaLo + (targetRingAlphaHi - targetRingAlphaLo) * wave);
+    CircleShape ring(rad, 20);
+    ring.setOrigin({rad, rad});
+    ring.setPosition(to);
+    ring.setFillColor(Color::Transparent);
+    ring.setOutlineThickness(selectRingPx / zoom);
+    ring.setOutlineColor(rc);
+    window.draw(ring);
 }
 
 // Outline-only copy of the hit shape, drawn above the overlays so it stays readable at night
@@ -7766,6 +7827,9 @@ int main() {
         if (selIdx < 0) { selectedBarbId = -1; inspectRect = FloatRect(); }
         if (selIdx >= 0 && selIdx < (int)squares.size() && !barbHidden(barbs[selIdx]))   // R40-F1: a miner below is ringed in its pit
             drawSelectRing(window, worldView, barbUnderground(barbs[selIdx]) ? shaftPitRect(barbs[selIdx].race) : squares[selIdx], zoom);
+        if (selIdx >= 0 && selIdx < (int)squares.size() && !barbHidden(barbs[selIdx]) && !barbUnderground(barbs[selIdx]))   // R44-F1
+            if (auto tp = barbTargetPos(barbs[selIdx], squares[selIdx], deers, deershape))
+                drawTargetLine(window, worldView, squares[selIdx].getPosition() + squares[selIdx].getSize() / 2.0f, *tp, zoom, frameCount);
 
         optional<hoverHit> hover;
         bool overHud = false;
@@ -7781,6 +7845,8 @@ int main() {
             if (window.hasFocus() && !panning && !overUi && mpx.x >= 0 && mpx.y >= 0 && mpx.x < (int)wsz.x && mpx.y < (int)wsz.y) {
                 Vector2f mworld = window.mapPixelToCoords(mpx, worldView);
                 hover = pickHover(mworld, tooltipPickRadius / zoom, barbs, squares, activeTrader, wolves, deers, deershape, rocks, octs, bushes, bushshapes, houses, houseshapes, fields, stores);
+                if (hover && hover->targetPos && hover->rect && hover->hoveredBarb != selectedBarbId)   // R44-F1: selected one drawn above
+                    drawTargetLine(window, worldView, hover->rect->getPosition() + hover->rect->getSize() / 2.0f, *hover->targetPos, zoom, frameCount);
                 if (hover) drawHoverOutline(window, worldView, *hover, zoom);
                 if (hover) drawHousehold(window, worldView, *hover, zoom, barbs, squares, houses, houseshapes);
             }
