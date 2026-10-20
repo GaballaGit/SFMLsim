@@ -305,14 +305,19 @@ const int rainErodeMult = 2;               // trails decay this many times faste
 const int trailMaxWear = 240;             // cap so abandoned roads fade within ~8 min
 const int trailPathThreshold = 48;         // wear for the faint "path" tint (~6 recent crossings)
 const int trailRoadThreshold = 144;        // wear for "road": darker tint and the speed bonus
-const int roadStepBonus = 1;               // ticks shaved off the step limit on road cells (~10% faster)
-// R29-F2 path following: each step scores straight and +/-45 deg candidates as alignment (cos, 1.0 straight)
-// + pathBias * min(wear, pathWearClamp) / pathWearClamp. pathBias stays below the alignment weight (1.0), so the
-// heading term always dominates: trails can bend a step by at most 45 deg, never away from or around the target.
-constexpr float pathBias = 0.4f;              // a full road beside bare ground wins a 45 deg detour (0.707 + 0.4 > 1.0)
+const int trailSpeedBonus[3] = {0, 1, 2};  // R39-F1: ticks shaved off the step limit by tier (none/path/road), ~10%/20% faster at 1x
+const int trailWearPerCell = 8;            // R39-F1: wear added once per cell entered (about what a per-pixel crossing of 8px used to add)
+// R39-F1 trail routes: a non-wander walk plans a bounded A* over the trail grid once per goal and follows its cells.
+// Each cell costs (1 - routeWearDiscount * min(wear, pathWearClamp) / pathWearClamp) per cell of length, so worn
+// cells are cheaper, but no route may be longer than routeDetourCap x the straight (octile) distance.
 const int pathWearClamp = trailRoadThreshold; // wear beyond road tier adds no extra pull
-const float pathSkipDistSq = 4.0f;         // within 2px of the target barbs step straight in
-static_assert(pathBias < 1.0f, "pathBias must stay below the alignment weight");
+constexpr float routeWearDiscount = 0.4f;     // a full road costs 0.6 of bare ground
+const float routeDetourCap = 1.3f;         // max route length / straight distance; keeps routes from collapsing onto a few highways
+const int routeExpandCap = 400;            // A* node expansions per plan; past it the barb walks straight
+const int routeMaxCells = 200;             // waypoint buffer per barb (1.3 x the 141-cell diagonal fits)
+const int routeLookahead = 3;              // a barb that cuts a corner into a later waypoint cell skips ahead
+const float routeStrayPx = 24.0f;          // farther than this from the next waypoint (pushed/teleported): replan
+static_assert(routeWearDiscount < 1.0f, "a cell must never cost zero or less");
 const Color trailPathColor(150, 125, 85, 26);
 const Color trailRoadColor(150, 125, 85, 52);   // kept as-is for the underlay of paved cells
 // R38-F1: muted tan-brown trails whose alpha follows wear (in 8-wear buckets); road a shade darker than path
@@ -1759,6 +1764,17 @@ enum carryLoad {carryNone, carryWood, carryStone, carryWheat};   // R29-F1: what
 // carryKind field, so every carryLoad reset (dropCarry, deposit, removeBarb) clears it too.
 const char* carryName(carryLoad c) { return c == carryWood ? "wood" : c == carryStone ? "stone" : c == carryWheat ? "wheat" : "none"; }
 
+// R39-F1: a barb's planned walk. cells[idx..len) are trail cells still to pass (start and goal cells excluded);
+// planned with len == 0 means walk straight (A* failed, too short or off the grid). goalX/Y is the target it was
+// planned for: a different targetx/y replans. lastCell is the wear tracker and survives clearRoute().
+struct barbRoute {
+    int cells[routeMaxCells];
+    int len = 0, idx = 0;
+    int goalX = -1, goalY = -1;
+    bool planned = false;
+    int lastCell = -1;           // cell the barb last added wear to (wear once per cell entered)
+};
+
 struct barb {
     int id = -1;                // stable, unique; assigned only by makeBarb()
     int x, y;
@@ -1802,7 +1818,14 @@ struct barb {
     bool memShared = false;      // INBOX-F2: already shared a fresh spot this trip
     leaderNeed order = needNone; // INBOX-F2b: leader's individual order; needNone = no order. Never touches garrison state
     int orderTicks = 0;          // INBOX-F2b: ticks until the order expires; reset in makeBarb()
+    barbRoute route;             // R39-F1: moves with the struct on swapRemove; reset only through clearRoute()
 };
+// R39-F1: the one route reset, called wherever moving/movingbspot is cleared and before a barb is swapRemoved
+void clearRoute(barb& b) {
+    b.route.len = b.route.idx = 0;
+    b.route.goalX = b.route.goalY = -1;
+    b.route.planned = false;
+}
 bool barbHidden(const barb& b) { return b.garrisoned && b.garrisonInside; }   // INBOX-F1
 
 const raceDef& raceOf(const barb& b) { return raceDefs[b.race]; }
@@ -2051,7 +2074,7 @@ int findDeerById(const vector<deer>& deers, int id) {
 void clearHunt(barb& b) {
 	b.deertargeting = false;
 	b.targetDeerId = -1;
-	b.moving = false;
+	b.moving = false; clearRoute(b);
 	b.timer = 0;
 	b.targetx = b.targety = -1;
 	dropCarry(b);   // R29-F1
@@ -2398,10 +2421,13 @@ uint8_t trailAlpha(int c) {
     return (uint8_t)(aMin + f * (aMax - aMin) + 0.5f);
 }
 
-void trailStep(Vector2f p) {
+// R39-F1: wear is added once per cell entered (trailWearPerCell), never per pixel
+void trailStep(barb& b, Vector2f p) {
     int c = trailCell(p);
+    if (c == b.route.lastCell) return;
+    b.route.lastCell = c;
     if (c < 0 || trailWear[c] >= trailMaxWear) return;
-    trailWear[c]++;
+    trailWear[c] = min(trailMaxWear, trailWear[c] + trailWearPerCell);
     trailSetTier(c);
 }
 
@@ -2417,36 +2443,118 @@ void trailTick() {
     }
 }
 
-bool onRoad(Vector2f p) {
-    int c = trailCell(p);
-    return c >= 0 && trailTier[c] == 2;
+// R39-F1: path tier and road tier (paved cells included) shave trailSpeedBonus[tier] ticks off the step limit
+int stepLimit(const barb& b, Vector2f pos) {
+    int c = trailCell(pos);
+    return max(1, stepLimit(b) - (c >= 0 ? trailSpeedBonus[trailTier[c]] : 0));
 }
 
-int stepLimit(const barb& b, Vector2f pos) { return max(1, stepLimit(b) - (onRoad(pos) ? roadStepBonus : 0)); }
+// R39-F1 A* scratch, sized once and reused by every plan (stamps instead of clearing; the heap keeps its capacity)
+vector<float> routeG(trailGridN * trailGridN, 0.0f);     // cost so far
+vector<float> routeLenG(trailGridN * trailGridN, 0.0f);  // geometric length so far (cells), for the detour cap
+vector<int> routeFrom(trailGridN * trailGridN, -1);
+vector<int> routeSeen(trailGridN * trailGridN, 0);       // == routeStamp: G/LenG/From valid this plan
+vector<int> routeDone(trailGridN * trailGridN, 0);       // == routeStamp: expanded this plan
+vector<pair<float, int>> routeOpen;                      // min-heap on f via greater<>
+int routeStamp = 0;
 
-// R29-F2: one 1px step from pos toward pos + diff, bent up to 45 deg onto worn trail cells. Grid lookups only.
-// Every diagonal candidate must strictly shorten the distance to the target and stay on the map, so the
-// straight step (always valid) is the fallback and barbs can't orbit. Within 2px it is always straight.
-Vector2f pathStep(Vector2f pos, Vector2f diff) {
-    float dSq = diff.x * diff.x + diff.y * diff.y;
-    Vector2f u = diff / sqrt(dSq);
-    if (dSq < pathSkipDistSq) return u;
-    const float c45 = 0.70710678f;
-    Vector2f cands[3] = { u, Vector2f(u.x * c45 - u.y * c45, u.x * c45 + u.y * c45),
-                             Vector2f(u.x * c45 + u.y * c45, -u.x * c45 + u.y * c45) };
-    const float align[3] = { 1.0f, c45, c45 };
-    Vector2f best = u;
-    float bestScore = -1.0f;
-    for (int k = 0; k < 3; k++) {
-        Vector2f s = cands[k];
-        if (k > 0 && 2.0f * (s.x * diff.x + s.y * diff.y) <= 1.0f) continue;   // |diff - s| must be < |diff|
-        int c = trailCell(pos + s);                                              // -1 = off the grid
-        if (k > 0 && c < 0) continue;
-        float wear = c >= 0 ? (float)min(trailWear[c], pathWearClamp) / (float)pathWearClamp : 0.0f;
-        float score = align[k] + pathBias * wear;
-        if (score > bestScore) { bestScore = score; best = s; }
+// Lake water blocks a route cell (centre inside a lake rect); the bank zone stays walkable so shore spots are reachable
+bool routeCellBlocked(int c) {
+    Vector2f centre(((c % trailGridN) + 0.5f) * trailCellSize, ((c / trailGridN) + 0.5f) * trailCellSize);
+    for (auto& l : lakes) if (l.contains(centre)) return true;
+    return false;
+}
+
+float routeOctile(int a, int b) {
+    int dx = abs(a % trailGridN - b % trailGridN), dy = abs(a / trailGridN - b / trailGridN);
+    return (float)max(dx, dy) + 0.41421356f * (float)min(dx, dy);
+}
+
+// Plans r from `from` to `to` (top-left positions) and tags it with the goal. Returns false (r stays planned with
+// len 0 = straight walk) when start/goal is off the grid, they share a cell, or A* hits routeExpandCap or the detour cap.
+// h is the plain octile distance (cells cost <= 1), so the search leans greedy and stays inside the expansion cap.
+bool planRoute(barbRoute& r, Vector2f from, Vector2f to, int goalX, int goalY) {
+    r.planned = true; r.goalX = goalX; r.goalY = goalY; r.len = r.idx = 0;
+    int s = trailCell(from), g = trailCell(to);
+    if (s < 0 || g < 0 || s == g) return false;
+    if (++routeStamp == INT32_MAX) { fill(routeSeen.begin(), routeSeen.end(), 0); fill(routeDone.begin(), routeDone.end(), 0); routeStamp = 1; }
+    float maxLen = routeDetourCap * routeOctile(s, g) + 0.001f;
+    routeOpen.clear();
+    routeG[s] = routeLenG[s] = 0.0f; routeFrom[s] = -1; routeSeen[s] = routeStamp;
+    routeOpen.push_back({routeOctile(s, g), s});
+    int expanded = 0;
+    bool found = false;
+    while (!routeOpen.empty() && expanded < routeExpandCap) {
+        pop_heap(routeOpen.begin(), routeOpen.end(), greater<>());
+        int n = routeOpen.back().second;
+        routeOpen.pop_back();
+        if (routeDone[n] == routeStamp) continue;
+        routeDone[n] = routeStamp;
+        expanded++;
+        if (n == g) { found = true; break; }
+        int nx = n % trailGridN, ny = n / trailGridN;
+        for (int dy = -1; dy <= 1; dy++) for (int dx = -1; dx <= 1; dx++) {
+            if (dx == 0 && dy == 0) continue;
+            int x = nx + dx, y = ny + dy;
+            if (x < 0 || y < 0 || x >= trailGridN || y >= trailGridN) continue;
+            int m = y * trailGridN + x;
+            if (routeDone[m] == routeStamp || (m != g && routeCellBlocked(m))) continue;
+            if (dx != 0 && dy != 0 && (routeCellBlocked(ny * trailGridN + x) || routeCellBlocked(y * trailGridN + nx))) continue;   // no corner-cutting into water
+            float step = (dx != 0 && dy != 0) ? 1.41421356f : 1.0f;
+            float len = routeLenG[n] + step;
+            if (len + routeOctile(m, g) > maxLen) continue;   // detour cap
+            float cost = routeG[n] + step * (1.0f - routeWearDiscount * (float)min(trailWear[m], pathWearClamp) / (float)pathWearClamp);
+            if (routeSeen[m] == routeStamp && cost >= routeG[m]) continue;
+            routeSeen[m] = routeStamp; routeG[m] = cost; routeLenG[m] = len; routeFrom[m] = n;
+            routeOpen.push_back({cost + routeOctile(m, g), m});
+            push_heap(routeOpen.begin(), routeOpen.end(), greater<>());
+        }
     }
-    return best;
+    if (!found) return false;
+    int count = 0;
+    for (int c = routeFrom[g]; c != s && c >= 0; c = routeFrom[c]) count++;   // cells strictly between start and goal
+    if (count > routeMaxCells) return false;
+    r.len = count;
+    int k = count;
+    for (int c = routeFrom[g]; c != s && c >= 0; c = routeFrom[c]) r.cells[--k] = c;
+    return true;
+}
+
+// Where the barb at pos should head this step: the next waypoint cell's centre, or the goal once the route is spent
+// (or when it is a straight walk). Replans on a new goal, a waypoint cell gone blocked, or a barb that strayed.
+Vector2f routeAim(barb& b, Vector2f pos) {
+    barbRoute& r = b.route;
+    Vector2f goal((float)b.targetx, (float)b.targety);
+    if (!r.planned || r.goalX != b.targetx || r.goalY != b.targety) planRoute(r, pos, goal, b.targetx, b.targety);
+    int cur = trailCell(pos);
+    for (int k = r.idx; k < r.len && k < r.idx + routeLookahead; k++)
+        if (r.cells[k] == cur) { r.idx = k + 1; break; }
+    if (r.idx >= r.len) return goal;
+    int c = r.cells[r.idx];
+    Vector2f centre(((c % trailGridN) + 0.5f) * trailCellSize, ((c / trailGridN) + 0.5f) * trailCellSize);
+    Vector2f d = centre - pos;
+    if (routeCellBlocked(c) || d.x * d.x + d.y * d.y > routeStrayPx * routeStrayPx) {
+        if (!planRoute(r, pos, goal, b.targetx, b.targety) || r.len == 0) return goal;   // straight fallback
+        c = r.cells[0];
+        centre = Vector2f(((c % trailGridN) + 0.5f) * trailCellSize, ((c / trailGridN) + 0.5f) * trailCellSize);
+    }
+    return centre;
+}
+
+// R39-F1: the one walk step for every non-wander walk (and wander with straight = true). Counts the step timer,
+// moves 1px toward the route's next waypoint (or straight at targetx/y) and wears the trail once per cell entered.
+// Callers keep their own arrival checks and only call this while the barb is >= 1px from targetx/targety.
+void walkStep(barb& b, RectangleShape& sq, bool straight = false) {
+    Vector2f pos = sq.getPosition();
+    if (++b.stepTimer < stepLimit(b, pos)) return;
+    b.stepTimer = 0;
+    Vector2f aim = straight ? Vector2f((float)b.targetx, (float)b.targety) : routeAim(b, pos);
+    Vector2f d = aim - pos;
+    float dSq = d.x * d.x + d.y * d.y;
+    if (dSq < 0.0001f) { d = Vector2f((float)b.targetx, (float)b.targety) - pos; dSq = d.x * d.x + d.y * d.y; }
+    if (dSq < 0.0001f) return;
+    sq.move(d / sqrt(dSq));
+    trailStep(b, sq.getPosition());
 }
 
 // Rebuilds the tinted cell quads only when some cell changed tier or wear bucket (va reused, capacity kept)
@@ -3961,7 +4069,7 @@ void buildhouse(vector<barb>& barbs,vector<RectangleShape>& squares, vector<hous
                     stockOf(b).stone += b.reservedstone;
                     b.reservedwood = false;
                     b.reservedstone = 0;
-                    b.moving = b.movingbspot = b.building = false;
+                    b.moving = b.movingbspot = b.building = false; clearRoute(b);
                     b.timer = 0;
                     continue;
                 }
@@ -3979,17 +4087,13 @@ void buildhouse(vector<barb>& barbs,vector<RectangleShape>& squares, vector<hous
                     hs.setOutlineThickness(1);
                     houseshapes.push_back(hs);
                     rebuildQuarterRoad(h.race, houses);   // R30-F1: only here, never per tick
-                    b.building = b.moving = b.movingbspot = false;
+                    b.building = b.moving = b.movingbspot = false; clearRoute(b);
                     b.timer = 0;
 		            printf("---HOUSE BUILT---\n");
                     logEvent("House built");
                 }
             } else {
-                if (++b.stepTimer >= stepLimit(b, pos)) {
-                    b.stepTimer = 0;
-                    sq.move(diff / sqrt(dSq));
-                    trailStep(sq.getPosition());
-                }
+                walkStep(b, sq);   // R39-F1
             }
         }
     }
@@ -4065,7 +4169,7 @@ void buildshrine(vector<barb>& barbs, vector<RectangleShape>& squares, const vec
                     stockOf(b).stone += b.reservedstone;
                     b.reservedstone = 0;
                     b.jobKind = jobNone;
-                    b.moving = b.movingbspot = b.building = false;
+                    b.moving = b.movingbspot = b.building = false; clearRoute(b);
                     b.timer = 0;
                     continue;
                 }
@@ -4077,17 +4181,13 @@ void buildshrine(vector<barb>& barbs, vector<RectangleShape>& squares, const vec
                     shrines.push_back(s);
                     b.reservedstone = 0;
                     b.jobKind = jobNone;
-                    b.building = b.moving = b.movingbspot = false;
+                    b.building = b.moving = b.movingbspot = false; clearRoute(b);
                     b.timer = 0;
                     printf("---SHRINE BUILT--- id %d (%d/%d)\n", s.id, (int)shrines.size(), maxShrines);
                     logEvent("Shrine stone raised");
                 }
             } else {
-                if (++b.stepTimer >= stepLimit(b, pos)) {
-                    b.stepTimer = 0;
-                    sq.move(diff / sqrt(dSq));
-                    trailStep(sq.getPosition());
-                }
+                walkStep(b, sq);   // R39-F1
             }
         }
     }
@@ -4144,15 +4244,11 @@ bool buildOneOff(vector<barb>& barbs, vector<RectangleShape>& squares, bool& cla
             if (workTick(b)) b.timer++;
             if (b.timer >= buildJobTicks[kind]) {
                 b.jobKind = jobNone;
-                b.building = b.moving = b.movingbspot = false;
+                b.building = b.moving = b.movingbspot = false; clearRoute(b);
                 b.timer = 0;
                 return true;
             }
-        } else if (++b.stepTimer >= stepLimit(b, pos)) {
-            b.stepTimer = 0;
-            sq.move(pathStep(pos, diff));   // R29-F2
-            trailStep(sq.getPosition());
-        }
+        } else walkStep(b, sq);   // R39-F1
         return false;
     }
     return false;
@@ -4794,7 +4890,7 @@ int spearsOfRace(const vector<barb>& barbs, int r) {
 void clearSpearCraft(barb& b) {
     refundSpear(b);
     b.jobKind = jobNone;
-    b.moving = b.movingbspot = b.building = false;
+    b.moving = b.movingbspot = b.building = false; clearRoute(b);
     b.spearTimer = 0;
     b.spearAtForge = false;   // POL-F5a
     b.stepTimer = 0;
@@ -4864,14 +4960,10 @@ void craftspear(vector<barb>& barbs, vector<RectangleShape>& squares, const forg
     Vector2f diff = Vector2f(b.targetx, b.targety) - pos;
     float dSq = diff.x * diff.x + diff.y * diff.y;
     if (dSq >= 1.0f) {
-        if (++b.stepTimer >= stepLimit(b, pos)) {
-            b.stepTimer = 0;
-            sq.move(diff / sqrt(dSq));
-            trailStep(sq.getPosition());
-        }
+        walkStep(b, sq);   // R39-F1
         return;
     }
-    b.moving = false;   // standing at the fire: no walking bob while knapping
+    b.moving = false; clearRoute(b);   // standing at the fire: no walking bob while knapping
     if (workTick(b)) b.spearTimer++;
     if (b.spearTimer < (b.spearAtForge ? spearForgeTicks : spearCraftTicks)) return;
     b.spearPaid = false;   // POL-F3: cost was taken at claim; finishing consumes it, so clearSpearCraft refunds nothing
@@ -5180,7 +5272,7 @@ void eraTick(const vector<barb>& barbs, const vector<house>& houses) {
 // R20-F2: every exit from a paving job (finished, unaffordable, interrupted) clears the same barb fields and the claim
 void clearPave(barb& b) {
     b.jobKind = jobNone;
-    b.moving = b.movingbspot = b.building = false;
+    b.moving = b.movingbspot = b.building = false; clearRoute(b);
     b.timer = 0;
     b.stepTimer = 0;
     b.targetx = b.targety = -1;
@@ -5205,14 +5297,10 @@ void paveTick(vector<barb>& barbs, vector<RectangleShape>& squares) {
         Vector2f diff = Vector2f(b.targetx, b.targety) - pos;
         float dSq = diff.x * diff.x + diff.y * diff.y;
         if (dSq >= 1.0f) {
-            if (++b.stepTimer >= stepLimit(b, pos)) {
-                b.stepTimer = 0;
-                sq.move(diff / sqrt(dSq));
-                trailStep(sq.getPosition());
-            }
+            walkStep(b, sq);   // R39-F1
             return;
         }
-        b.moving = false;     // on the cell: no walking bob, just the generic build tool swing
+        b.moving = false; clearRoute(b);   // on the cell: no walking bob, just the generic build tool swing
         b.building = true;
         if (workTick(b)) b.timer++;
         if (b.timer < paveTicks) return;
@@ -5225,7 +5313,7 @@ void paveTick(vector<barb>& barbs, vector<RectangleShape>& squares) {
         int c = paveClaim;
         spend(rs, 0, paveStoneCost);
         trailPaved[c] = 1;
-        trailWear[c] = max(trailWear[c], trailRoadThreshold);   // locked at road tier (keeps roadStepBonus)
+        trailWear[c] = max(trailWear[c], trailRoadThreshold);   // locked at road tier (keeps the road speed bonus)
         trailSetTier(c);
         trailDirty = true;   // R38-F1: paved cells switch to the fixed road underlay
         pavedCount++;
@@ -5492,7 +5580,7 @@ void placeTowers(int r, vector<barb>& barbs, vector<tree>& trees, vector<CircleS
             int tix = (int)(p.x + 8), tiy = (int)(p.y + 15);   // same stand spot the clearing pass in main drops
             for (auto& b : barbs) {
                 if (!b.garrisoned && b.target != targetBush && b.targetx == tix && b.targety == tiy) {
-                    b.moving = b.chopping = false;
+                    b.moving = b.chopping = false; clearRoute(b);
                     b.timer  = 0;
                     b.targetx = b.targety = -1;
                 }
@@ -5564,7 +5652,7 @@ void wallTick(vector<barb>& barbs, vector<tree>& trees, vector<CircleShape>& tri
                 int tix = (int)(p.x + 8), tiy = (int)(p.y + 15);   // same stand spot the clearing pass in main drops
                 for (auto& b : barbs) {
                     if (!b.garrisoned && b.target != targetBush && b.targetx == tix && b.targety == tiy) {
-                        b.moving = b.chopping = false;
+                        b.moving = b.chopping = false; clearRoute(b);
                         b.timer  = 0;
                         b.targetx = b.targety = -1;
                     }
@@ -5756,7 +5844,7 @@ void causewayTick() {
         if (!canAfford(stock[r], 0, causewayStoneCost + keepStoneReserve)) continue;
         spend(stock[r], 0, causewayStoneCost);
         trailPaved[next] = causewayPaved;
-        trailWear[next] = max(trailWear[next], trailRoadThreshold);   // locked at road tier: roadStepBonus speed-up
+        trailWear[next] = max(trailWear[next], trailRoadThreshold);   // locked at road tier: road speed bonus
         trailSetTier(next);
         trailDirty = true;   // R38-F1: paved cells switch to the fixed road underlay
         paveDirty = true;
@@ -5807,7 +5895,7 @@ void releaseBarbWork(barb& b, smokehouseSet& sh, forge& fg, storehouse (&stores)
         default: break;
     }
     b.jobKind = jobNone;
-    b.moving = b.movingbspot = b.building = b.chopping = false;
+    b.moving = b.movingbspot = b.building = b.chopping = false; clearRoute(b);
     b.timer = 0;
 }
 
@@ -5825,6 +5913,7 @@ void removeBarb(vector<barb>& barbs, vector<RectangleShape>& squares, int i,
     printf("BARB DIED - %s the %s (%s, %s), id %d - %d left\n", b.name, traitOf(b).name, raceOf(b).name,
            isGentry(b) ? "Gentry" : "Commoner", b.id, (int)barbs.size() - 1);
     b.homeHouse = -1;
+    clearRoute(b);   // R39-F1: the route lives in the struct; the swapped-in barb keeps its own route
     swapRemove(barbs, i);
     swapRemove(squares, i);
 }
@@ -5868,7 +5957,7 @@ void ungarrison(barb& b) {
     for (auto& slots : keepSlots) slots.erase(std::remove(slots.begin(), slots.end(), b.id), slots.end());
     b.garrisoned = b.garrisonInside = false;
     b.garrisonHouseId = -1;
-    b.moving = false;
+    b.moving = false; clearRoute(b);
     b.stepTimer = 0;
     b.targetx = b.targety = -1;
     b.target = targetNone;
@@ -5956,13 +6045,9 @@ void bellTick(vector<barb>& barbs, vector<RectangleShape>& squares, const vector
             if (dSq < 1.0f) {
                 sq.setPosition(spot);
                 b.garrisonInside = true;
-                b.moving = false;
+                b.moving = false; clearRoute(b);
                 b.stepTimer = 0;
-            } else if (++b.stepTimer >= stepLimit(b, pos)) {
-                b.stepTimer = 0;
-                sq.move(pathStep(pos, diff));
-                trailStep(sq.getPosition());
-            }
+            } else walkStep(b, sq);   // R39-F1
             continue;
         }
         if (raceBell[b.race] == 0 || b.carryKind != carryNone) continue;   // haulers deposit first, then shelter
@@ -6235,14 +6320,10 @@ void barbmove(vector<RectangleShape>& squares, vector<barb>& barbs) {
             float dSq = diff.x * diff.x + diff.y * diff.y;
             bool wandering = b.targetx == b.wanderX && b.targety == b.wanderY;
             if (dSq < 1.0f) {
-                b.moving    = false;
+                b.moving    = false; clearRoute(b);
                 b.stepTimer = 0;
                 b.wanderX = b.wanderY = -1;
-            } else if (++b.stepTimer >= stepLimit(b, pos)) {
-                b.stepTimer = 0;
-                sq.move(wandering ? diff / sqrt(dSq) : pathStep(pos, diff));   // R29-F2: wander walks stay straight
-                trailStep(sq.getPosition());
-            }
+            } else walkStep(b, sq, wandering);   // R39-F1: wander walks stay straight, others follow a route
         }
     }
 }
@@ -6321,7 +6402,7 @@ void memShare(vector<barb>& barbs, const vector<RectangleShape>& squares, int j,
 
 // Every way out of a crop harvest (berry bush or wheat field) clears the same barb fields
 void clearHarvest(barb& b) {
-    b.moving = b.chopping = false;
+    b.moving = b.chopping = false; clearRoute(b);
     b.timer = 0;
     b.targetx = b.targety = -1;
     b.target = targetNone;
@@ -6380,11 +6461,7 @@ void haulTick(barb& b, RectangleShape& sq, storehouse (&stores)[raceCount], cons
     Vector2f diff = Vector2f(b.targetx, b.targety) - pos;
     float dSq = diff.x * diff.x + diff.y * diff.y;
     if (dSq >= 1.0f) {
-        if (++b.stepTimer >= stepLimit(b, pos)) {
-            b.stepTimer = 0;
-            sq.move(pathStep(pos, diff));
-            trailStep(sq.getPosition());
-        }
+        walkStep(b, sq);   // R39-F1
         return;
     }
     if (b.carryKind == carryWheat) {   // FARM-F2: mill revalidated on arrival; gone/unbuilt -> the sheaf goes to the storehouse
@@ -6426,7 +6503,7 @@ void haulTick(barb& b, RectangleShape& sq, storehouse (&stores)[raceCount], cons
     b.carryKind = carryNone;
     b.carryAmount = 1;   // R34-F1
     b.target = targetNone;
-    b.moving = false;
+    b.moving = false; clearRoute(b);
     b.stepTimer = 0;
     b.targetx = b.targety = -1;
     memEndTrip(b);   // INBOX-F2
@@ -6645,7 +6722,7 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
 	if (b.target == targetLake) {
             int k = b.targetShore;
             auto quit = [&]() {   // every way out of fishing clears the same fields
-                b.moving = b.chopping = false;
+                b.moving = b.chopping = false; clearRoute(b);
                 b.timer = 0;
                 b.targetx = b.targety = -1;
                 b.target = targetNone;
@@ -6710,7 +6787,7 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
             mineShaft& ms = mineShafts[b.race];
             if (!ms.built || ms.seam <= 0 || shaftMiner[b.race] != j) {   // dry, gone or taken: drop it and search again next tick
                 if (b.chopping || b.timer > 0) printf("SHAFT LEFT - barb %d, %s seam %d\n", b.id, racePlurals[b.race], ms.seam);
-                b.moving = b.chopping = false;
+                b.moving = b.chopping = false; clearRoute(b);
                 b.timer = 0;
                 b.targetx = b.targety = -1;
                 b.target = targetNone;
@@ -6741,7 +6818,7 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
             float tix = tp.x + 8, tiy = tp.y + 15;
             if (b.targetx != (int)tix || b.targety != (int)tiy) continue;
             if (trees[i].dying && !b.chopping) {
-                b.moving  = false;
+                b.moving  = false; clearRoute(b);
                 b.targetx = b.targety = -1;
                 break;
             }
@@ -6770,7 +6847,7 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
 			float rix = rp.x + 6, riy = rp.y + 10;
 			if (b.targetx != (int)rix || b.targety != (int)riy) continue;
 			if (rocks[i].dying && !b.chopping) {
-				b.moving = false;
+				b.moving = false; clearRoute(b);
 				b.targetx = b.targety = -1;
 				break;
 			}
@@ -7274,7 +7351,7 @@ int main() {
                 int tix = (int)(p.x + 8), tiy = (int)(p.y + 15);
                 for (auto& b : barbs) {
                     if (!b.garrisoned && b.target != targetBush && b.targetx == tix && b.targety == tiy) {   // INBOX-F1: doorstep walks untouched
-                        b.moving = b.chopping = false;
+                        b.moving = b.chopping = false; clearRoute(b);
                         b.timer  = 0;
                         b.targetx = b.targety = -1;
                     }
@@ -7288,7 +7365,7 @@ int main() {
                 int rix = (int)(p.x + 6), riy = (int)(p.y + 10);   // same stand spot minematerials targets
                 for (auto& b : barbs) {
                     if (!b.garrisoned && b.target == targetRock && b.targetx == rix && b.targety == riy) {
-                        b.moving = b.chopping = false;
+                        b.moving = b.chopping = false; clearRoute(b);
                         b.timer  = 0;
                         b.targetx = b.targety = -1;
                         printf("Rock cleared near the village - miner %d dropped its target\n", b.id);
