@@ -808,6 +808,18 @@ const Color shaftDeadLintelColor(76, 68, 60);    // ...dimmed lintel...
 const Color shaftDeadPitColor(6, 6, 6);          // ...and a flat black pit
 const Color shaftSeamColor(150, 150, 146);       // thin grey seam bar
 const Color shaftSeamTrackColor(36, 38, 36);     // its empty track
+// R40-F1 (phase 2): the working miner drops into the pit (barb.inMine, cleared only by leaveMine()) and is hidden while
+// below; faint dust puffs rise off the lintel, and a short lintel flash marks the climb-out with a load.
+const int kShaftPuffEveryTicks = 20;             // one puff per this many ticks while a miner is underground
+const int kShaftPuffLifeTicks = 36;              // a puff fades out over this long
+const int kShaftPuffCap = 3;                     // live puffs per shaft (ring buffer: the oldest is overwritten)
+const float kShaftPuffSize = 2.0f;               // 2x2 px
+const float kShaftPuffRisePx = 5.0f;             // total rise above the lintel over its life
+const uint8_t kShaftPuffAlpha = 60;              // starting alpha, fading to 0: low so stacked puffs don't haze
+const Color kShaftPuffColor(140, 124, 104);      // grey-brown dust
+const int kShaftFlashTicks = 12;                 // lintel flash countdown when the miner climbs out with stone
+const float kShaftFlashMix = 0.55f;              // peak blend of the lintel toward the flash colour
+const Color kShaftFlashColor(222, 198, 150);     // pale sandy highlight
 
 // UI red (UIO-F1/F2/F3): one muted brick red for every "starving" mark in the UI (minimap dots, inspect panel, hunger lens)
 const Color uiStarvingRed = healthBarFillColor;
@@ -1363,9 +1375,18 @@ forgeSpark forgeSparks[forgeSparkPoolMax];
 struct storehouse {bool built = false; bool claimed = false; int stored = 0; int flashFrames = 0;}; // flashFrames: deposit flash, per drawn frame
 // R34-F1: one per race (index = barbRace), at storehousePos + shaftCrateOffset. built is the validity flag; claimed and
 // builderId follow the mill's claim path; seam counts down to 0 (never below). Reset with the quarters in placeQuarters().
-struct mineShaft {bool built = false; bool claimed = false; int builderId = -1; int seam = kShaftCapacity;};
+// R40-F1: puffs/flash are cosmetic, advanced by shaftTick(); a puff with age < 0 is free
+struct shaftPuff {Vector2f pos; int age = -1;};
+struct mineShaft {bool built = false; bool claimed = false; int builderId = -1; int seam = kShaftCapacity;
+                  shaftPuff puffs[kShaftPuffCap]; int puffNext = 0; int puffTimer = 0; int flashTicks = 0;};
 mineShaft mineShafts[raceCount];
 Vector2f shaftPos(int r) { return storehousePos[r] + shaftCrateOffset; }
+// R40-F1: the dark pit inside the frame (under the lintel, between the posts, above the 1px sill)
+RectangleShape shaftPitRect(int r) {
+    RectangleShape pit(Vector2f(shaftSize.x - 2 * shaftPostW, shaftSize.y - shaftLintelH - 1.0f));
+    pit.setPosition(shaftPos(r) + Vector2f(shaftPostW, shaftLintelH));
+    return pit;
+}
 Vector2f shaftWorkSpot(int r) { return shaftPos(r) + shaftStandOffset; }
 bool shaftOpen(int r) { return r >= 0 && r < raceCount && mineShafts[r].built && mineShafts[r].seam > 0; }
 // Seam bar above, the frame, and the miner's stand spot below
@@ -1819,6 +1840,7 @@ struct barb {
     leaderNeed order = needNone; // INBOX-F2b: leader's individual order; needNone = no order. Never touches garrison state
     int orderTicks = 0;          // INBOX-F2b: ticks until the order expires; reset in makeBarb()
     barbRoute route;             // R39-F1: moves with the struct on swapRemove; reset only through clearRoute()
+    bool inMine = false;         // R40-F1: down its race's shaft (not drawn); set at the stand spot, cleared only by leaveMine()
 };
 // R39-F1: the one route reset, called wherever moving/movingbspot is cleared and before a barb is swapRemoved
 void clearRoute(barb& b) {
@@ -1878,6 +1900,22 @@ bool atShaftTarget(const barb& b) {
 }
 // R34-F1: work ticks for the barb's current mining job: doubled at the shaft
 int mineTicksFor(const barb& b) { return atShaftTarget(b) ? kShaftTickMult * mineTicks(b) : mineTicks(b); }
+// R40-F1: the one miner a shaft serves: the first ungarrisoned own-race barb targeting its stand spot (-1 = none).
+// minematerials() derives its per-tick shaftMiner[] from this, so the tooltip and the work bar agree with the work loop.
+int shaftMinerOf(const vector<barb>& barbs, int r) {
+    for (int j = 0; j < (int)barbs.size(); j++)
+        if (barbs[j].race == r && !barbs[j].garrisoned && atShaftTarget(barbs[j])) return j;
+    return -1;
+}
+// R40-F1: down the shaft right now. Separate from barbHidden() (garrison only); re-checks the job so a stale flag never hides a barb
+bool barbUnderground(const barb& b) { return b.inMine && !b.garrisoned && atShaftTarget(b) && mineShafts[b.race].built; }
+// R40-F1: the one way out of the pit. withLoad = climbing out with stone (starts the lintel flash). Safe if not in the mine.
+void leaveMine(barb& b, bool withLoad = false) {
+    if (!b.inMine) return;
+    b.inMine = false;
+    if (withLoad && b.race >= 0 && b.race < raceCount) mineShafts[b.race].flashTicks = kShaftFlashTicks;
+    printf("SHAFT CLIMB OUT - barb %d%s\n", b.id, withLoad ? " with stone" : "");
+}
 
 struct deer {            // any game animal; species picks its row in speciesDefs
 animalSpecies species = speciesDeer;
@@ -2803,7 +2841,7 @@ void drawBarbs(RenderWindow& window, const vector<barb>& barbs, const vector<Rec
     };
     for (int i = 0; i < (int)squares.size() && i < (int)barbs.size(); i++) {
         const barb& b = barbs[i];
-        if (barbHidden(b)) continue;   // INBOX-F1: indoors
+        if (barbHidden(b) || barbUnderground(b)) continue;   // INBOX-F1: indoors; R40-F1: down the shaft
         const raceDef& rd = raceOf(b);
         Vector2f bodySize = rd.bodySize;
         bool hungry = isHungry(b);
@@ -3213,7 +3251,7 @@ optional<hoverHit> pickHover(Vector2f p, float radius, const vector<barb>& barbs
     float rSq = radius * radius;
     auto near = [&](const Shape& s) { return rectDistSq(s.getGlobalBounds(), p) <= rSq; };
     for (int i = 0; i < (int)squares.size() && i < (int)barbs.size(); i++)
-        if (!barbHidden(barbs[i]) && near(squares[i])) {   // INBOX-F1: sheltering barbs can't be hovered
+        if (!barbHidden(barbs[i]) && !barbUnderground(barbs[i]) && near(squares[i])) {   // INBOX-F1: sheltering barbs can't be hovered; R40-F1: miners below via their shaft
             const barb& b = barbs[i];
             string label = string(b.name) + ", " + traitOf(b).name + ", " + raceOf(b).name + ": " + barbTaskName(b) + (isStarving(b) ? " (starving)" : isHungry(b) ? " (hungry)" : "");
             if (b.homeHouse >= 0) {   // kin counted here, on hover only
@@ -3230,6 +3268,18 @@ optional<hoverHit> pickHover(Vector2f p, float radius, const vector<barb>& barbs
             h.hoveredBarb = b.id;   // INBOX-F2b: order pip
             return h;
         }
+    for (int r = 0; r < raceCount; r++) {   // R40-F1: a miner below ground is hovered through its shaft frame
+        int m = shaftMinerOf(barbs, r);
+        if (m < 0 || m >= (int)squares.size() || !barbUnderground(barbs[m])) continue;
+        RectangleShape frame(shaftSize);
+        frame.setPosition(shaftPos(r));
+        if (!near(frame)) continue;
+        hoverHit h{string(raceDefs[r].name) + " miner at work, seam " + to_string(mineShafts[r].seam) + "/" + to_string(kShaftCapacity),
+                   frame, nullopt};
+        h.homeOfBarb = barbs[m].homeHouse;
+        h.hoveredBarb = barbs[m].id;
+        return h;
+    }
     if (tr && near(tr->shape)) {
         const char* ph = tr->phase == trader::Arriving ? "arriving" : tr->phase == trader::Trading ? "trading" : "leaving";
         string label = string("Trader: ") + ph;   // POL-F4: who it serves and what it buys
@@ -3314,7 +3364,9 @@ int pickBarbAt(Vector2f p, float radius, const vector<barb>& barbs, const vector
     int best = -1;
     for (int i = 0; i < (int)squares.size() && i < (int)barbs.size(); i++) {
         if (barbHidden(barbs[i])) continue;   // INBOX-F1
-        float dSq = rectDistSq(squares[i].getGlobalBounds(), p);
+        FloatRect box = squares[i].getGlobalBounds();
+        if (barbUnderground(barbs[i])) box = FloatRect(shaftPos(barbs[i].race), shaftSize);   // R40-F1: picked through its shaft
+        float dSq = rectDistSq(box, p);
         if (dSq <= bestSq) { bestSq = dSq; best = barbs[i].id; }
     }
     return best;
@@ -3395,7 +3447,7 @@ void drawOrderPips(RenderWindow& window, const View& worldView, float zoom, int 
     RectangleShape pip(orderPipSize);
     for (int i = 0; i < (int)squares.size() && i < (int)barbs.size(); i++) {
         const barb& b = barbs[i];
-        if (b.order == needNone || b.garrisoned) continue;
+        if (b.order == needNone || b.garrisoned || barbUnderground(b)) continue;   // R40-F1: no pip over an empty stand spot
         if (!all && b.id != hoveredBarb) continue;
         Vector2f base = snapPx(squares[i].getPosition());
         float feet = base.y + squares[i].getSize().y;
@@ -3416,7 +3468,7 @@ void drawHousehold(RenderWindow& window, const View& worldView, const hoverHit& 
         RectangleShape pip(householdPipSize);
         pip.setFillColor(householdColor);
         for (int i = 0; i < (int)squares.size() && i < (int)barbs.size(); i++) {
-            if (barbs[i].homeHouse != h.hoveredHouse || barbHidden(barbs[i])) continue;   // INBOX-F1: no pip over an indoor barb
+            if (barbs[i].homeHouse != h.hoveredHouse || barbHidden(barbs[i]) || barbUnderground(barbs[i])) continue;   // INBOX-F1: no pip over an indoor barb; R40-F1: or one down the shaft
             Vector2f top = snapPx(squares[i].getPosition());
             float cx = top.x + round((squares[i].getSize().x - householdPipSize.x) / 2.0f);
             pip.setPosition(Vector2f(cx, top.y - householdPipGap - householdPipSize.y));
@@ -4522,7 +4574,9 @@ void drawMineShafts(RenderWindow& window, const vector<barb>& barbs, const vecto
         pit.setFillColor(dead ? shaftDeadPitColor : worked ? lerpColor(shaftPitColor, shaftAmberColor, shaftTintMix) : shaftPitColor);
         window.draw(pit);
         lintel.setPosition(p);
-        lintel.setFillColor(dead ? shaftDeadLintelColor : shaftLintelColor);
+        Color lc = dead ? shaftDeadLintelColor : shaftLintelColor;
+        if (ms.flashTicks > 0) lc = lerpColor(lc, kShaftFlashColor, kShaftFlashMix * ms.flashTicks / kShaftFlashTicks);   // R40-F1: climb-out
+        lintel.setFillColor(lc);
         window.draw(lintel);
         Vector2f sp = p - Vector2f(0.0f, shaftSeamGap + shaftSeamH);
         seam.setSize(Vector2f(shaftSize.x, shaftSeamH));
@@ -4535,6 +4589,36 @@ void drawMineShafts(RenderWindow& window, const vector<barb>& barbs, const vecto
             seam.setFillColor(shaftSeamColor);
             window.draw(seam);
         }
+        RectangleShape puff(Vector2f(kShaftPuffSize, kShaftPuffSize));   // R40-F1: faint dust off the lintel, fading as it rises
+        for (const shaftPuff& pf : ms.puffs) {
+            if (pf.age < 0) continue;
+            float t = (float)pf.age / kShaftPuffLifeTicks;
+            Color c = kShaftPuffColor;
+            c.a = (uint8_t)(kShaftPuffAlpha * (1.0f - t));
+            puff.setFillColor(c);
+            puff.setPosition(snapPx(pf.pos - Vector2f(0.0f, kShaftPuffRisePx * t)));
+            window.draw(puff);
+        }
+    }
+}
+
+// R40-F1: per sim tick. Counts down each lintel flash, ages puffs, and while a shaft's miner is underground drops a
+// new puff every kShaftPuffEveryTicks into a fixed kShaftPuffCap ring (the oldest is overwritten; nothing is erased).
+void shaftTick(const vector<barb>& barbs) {
+    uniform_int_distribution<int> puffX((int)shaftPostW, (int)(shaftSize.x - shaftPostW - kShaftPuffSize));
+    for (int r = 0; r < raceCount; r++) {
+        mineShaft& ms = mineShafts[r];
+        if (ms.flashTicks > 0) ms.flashTicks--;
+        for (shaftPuff& pf : ms.puffs)
+            if (pf.age >= 0 && ++pf.age >= kShaftPuffLifeTicks) pf.age = -1;
+        int m = ms.built ? shaftMinerOf(barbs, r) : -1;
+        if (m < 0 || !barbUnderground(barbs[m])) { ms.puffTimer = 0; continue; }
+        if (++ms.puffTimer < kShaftPuffEveryTicks) continue;
+        ms.puffTimer = 0;
+        shaftPuff& pf = ms.puffs[ms.puffNext];
+        pf.pos = shaftPos(r) + Vector2f((float)puffX(gen), -kShaftPuffSize);   // resting on the lintel's top edge
+        pf.age = 0;
+        ms.puffNext = (ms.puffNext + 1) % kShaftPuffCap;
     }
 }
 
@@ -5392,7 +5476,7 @@ void drawBallots(RenderWindow& window, const View& worldView, float zoom,
     float a = min(1.0f, (float)ballotFramesLeft / ballotFadeFrames);
     RectangleShape pip(ballotPipSize);
     for (int i = 0; i < (int)squares.size() && i < (int)barbs.size(); i++) {
-        if (barbs[i].lastVote == decreeNone || barbHidden(barbs[i])) continue;   // born after the vote; INBOX-F1: indoors
+        if (barbs[i].lastVote == decreeNone || barbHidden(barbs[i]) || barbUnderground(barbs[i])) continue;   // born after the vote; INBOX-F1: indoors; R40-F1: below
         Color c = ballotPipColors[barbs[i].lastVote];
         c.a = (uint8_t)(255 * a);
         pip.setFillColor(c);
@@ -5897,6 +5981,7 @@ void releaseBarbWork(barb& b, smokehouseSet& sh, forge& fg, storehouse (&stores)
     b.jobKind = jobNone;
     b.moving = b.movingbspot = b.building = b.chopping = false; clearRoute(b);
     b.timer = 0;
+    leaveMine(b);   // R40-F1: death and sheltering both pass through here
 }
 
 void ungarrison(barb& b);   // R31-F3: defined with bellTick(); also frees the barb's keep slot
@@ -6526,8 +6611,9 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
         if (k >= 0) fieldTaken[o.race][k] = true;
     }
     int shaftMiner[raceCount] = {-1, -1, -1};   // R34-F1: one miner per shaft, derived from targets every tick (no stored claim)
-    for (int j = 0; j < (int)barbs.size(); j++)
-        if (!barbs[j].garrisoned && atShaftTarget(barbs[j]) && shaftMiner[barbs[j].race] == -1) shaftMiner[barbs[j].race] = j;
+    for (int r = 0; r < raceCount; r++) shaftMiner[r] = shaftMinerOf(barbs, r);   // R40-F1: same rule as the tooltip and bar
+    for (int j = 0; j < (int)barbs.size(); j++)   // R40-F1: redirected, garrisoned or shaft gone/reset: out of the pit
+        if (barbs[j].inMine && (!barbUnderground(barbs[j]) || shaftMiner[barbs[j].race] != j)) leaveMine(barbs[j]);
     leaderNeed liveNeed[raceCount];   // R30-F2: a race's need counts only while its leader is alive (checked once per tick)
     for (int r = 0; r < raceCount; r++) liveNeed[r] = findBarbById(barbs, raceLeaderId[r]) >= 0 ? raceNeed[r] : needNone;
     for (int j = 0; j < (int)squares.size(); j++) {
@@ -6787,6 +6873,7 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
             mineShaft& ms = mineShafts[b.race];
             if (!ms.built || ms.seam <= 0 || shaftMiner[b.race] != j) {   // dry, gone or taken: drop it and search again next tick
                 if (b.chopping || b.timer > 0) printf("SHAFT LEFT - barb %d, %s seam %d\n", b.id, racePlurals[b.race], ms.seam);
+                leaveMine(b);   // R40-F1
                 b.moving = b.chopping = false; clearRoute(b);
                 b.timer = 0;
                 b.targetx = b.targety = -1;
@@ -6797,10 +6884,15 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
             float dx = sp.x - bpos.x, dy = sp.y - bpos.y;
             if (dx * dx + dy * dy >= 4.0f) continue;   // still walking (barbmove)
             b.chopping = true;
+            if (!b.inMine) {   // R40-F1: at the mouth: down into the pit
+                b.inMine = true;
+                printf("SHAFT DESCENT - barb %d, %s seam %d\n", b.id, racePlurals[b.race], ms.seam);
+            }
             if (workTick(b)) b.timer++;
             if (b.timer >= mineTicksFor(b)) {
                 int yield = min(kShaftYield, ms.seam);
                 ms.seam = max(0, ms.seam - yield);
+                leaveMine(b, true);   // R40-F1: climbs out with the stone; lintel flash
                 practice(techPickwork);
                 if (b.race == raceDwarf) forgeEmberFrames = forgeEmberBoostFrames;   // same flare as a mined rock
                 startHaul(b, carryStone, stores, yield);
@@ -7315,6 +7407,7 @@ int main() {
                 craftspear(barbs, squares, dwarfForge);
                 minematerials(squares, barbs, tris, stumps, trees, octs, rocks, bushes, bushshapes, catchRings, fields, stores, dwarfForge);
                 barbmove(squares, barbs);
+                shaftTick(barbs);   // R40-F1: dust puffs and lintel flash
                 shinobiTick(barbs, squares, houseshapes, octs, shinobiPuffs);
                 treespawn(trees, tris, stumps, fields);
                 barbspawner(squares, barbs, houses, houseshapes, birthRings);
@@ -7447,10 +7540,11 @@ int main() {
                         (float)b.timer / fieldHarvestTicks, fieldBarColor);
             if (b.building &&  b.timer > 0)
                 drawBar(window, Vector2f(b.targetx - 9, b.targety - 10), b.timer / (float)buildJobTicks[b.jobKind], pal.barBuild);
-	    if (b.chopping && b.timer > 0 && atShaftTarget(b))   // R34-F1: centred over the shaft, clear of its seam bar
+	    if (b.chopping && b.timer > 0 && atShaftTarget(b)) {   // R34-F1: centred over the shaft, clear of its seam bar
+                if (shaftMinerOf(barbs, b.race) == q)   // R40-F1: only the shaft's own miner, as the tooltip resolves it
                 drawBar(window, shaftPos(b.race) + Vector2f(shaftSize.x / 2 - barSize.x / 2,
                         -shaftSeamGap - shaftSeamH - 2.0f - barFramePx - barSize.y), (float)b.timer / mineTicksFor(b), pal.barMine);
-	    else if (b.chopping && b.timer > 0 && b.target == targetRock)
+	    } else if (b.chopping && b.timer > 0 && b.target == targetRock)
                 drawBar(window, Vector2f(b.targetx - 10, b.targety - 16), (float)b.timer / mineTicks(b), pal.barMine);
 	}
 	drawBirthRings(window, birthRings);
@@ -7476,7 +7570,8 @@ int main() {
         // UIO-F2: resolve the selection once per frame; a vanished barb (died/removed) clears it
         int selIdx = findBarbById(barbs, selectedBarbId);
         if (selIdx < 0) { selectedBarbId = -1; inspectRect = FloatRect(); }
-        if (selIdx >= 0 && selIdx < (int)squares.size() && !barbHidden(barbs[selIdx])) drawSelectRing(window, worldView, squares[selIdx], zoom);
+        if (selIdx >= 0 && selIdx < (int)squares.size() && !barbHidden(barbs[selIdx]))   // R40-F1: a miner below is ringed in its pit
+            drawSelectRing(window, worldView, barbUnderground(barbs[selIdx]) ? shaftPitRect(barbs[selIdx].race) : squares[selIdx], zoom);
 
         optional<hoverHit> hover;
         bool overHud = false;
