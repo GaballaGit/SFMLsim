@@ -288,7 +288,9 @@ const int tradeMaxLots = 5;               // max lots per visit (caps at 5 wood/
 const int tradeMsgTicks = 600;            // ticks the last-trade line stays on the HUD
 const Vector2f traderSize(3.0f, 3.0f);
 const Color traderColor(190, 140, 230);
-const Vector2f villageCenter(400.0f, 400.0f);
+// R47-F2 Heartland Founding: the campfire sits at the middle of the map, so the safe core is ringed by the wilds
+const Vector2f villageCenter(worldSize / 2.0f, worldSize / 2.0f);
+const char* const foundingTickerLine = "Founded at the heart of the land";   // logged once, right after the founders
 // POL-F4: the trader serves the eligible race with the least wood, at its storehouse (campfire while it has none)
 const int traderRaceCooldownVisits = 1;   // a served race sits out this many following visits (1 = no back-to-back)
 const int tradeFoodCost = 3;              // food paid per lot when no race can pay in stone
@@ -1058,16 +1060,17 @@ const Color stockEmptyRaceColor(120, 118, 108); // a race with no living members
 // Race quarters (R30-F1): each race's crate sits in its own quarter around the village, at least raceMinSeparation from
 // the others; that race's houses go within quarterHouseRadius of it. Trees/rocks are kept off each quarter like the
 // village clearing, lakes and bush clumps avoid it, and each quarter is topped up at startup if it is short of wood/stone.
-// INBOX-F3 wider quarters, R44-F4b pushed further out (R45-F1a: the village stays at 400,400, so the left/top edges
-// still bind on the 1200 map): with 3 races the 120 deg split gives crates
-// >= 210*sqrt(3) ~ 364 apart (> raceMinSeparation), and at any rotation the quarter clearing (63) reaches at most
-// 250+63 = 313 from the campfire, which fits both the side edges (400) and the HUD (400-24 = 376), and stays >= 210-63
-// = 147 clear of the village clearing (50). So quarterLayoutOk() always passes and the fallback should never fire.
+// INBOX-F3 wider quarters, R44-F4b pushed further out (R47-F2: the village is at the map centre, worldSize/2): with 3
+// races the 120 deg split gives crates >= 210*sqrt(3) ~ 364 apart (> raceMinSeparation), and at any rotation the quarter
+// clearing (63) reaches at most 250+63 = 313 from the campfire, well inside the edges and HUD (1200 / 1176 away), and
+// stays >= 210-63 = 147 clear of the village clearing (50). quarterLayoutSweepOk() re-checks this at startup over a full
+// turn of rotations at both radii, so quarterLayoutOk() always passes and the fallback should never fire.
 // Lakes are placed after the quarters and keep quarterClearRadius + lakeMinGap off each one.
 const float raceMinSeparation = 185.0f;      // min distance between two races' crates (startup check)
 const float quarterMinRadius = 210.0f;       // crate centre distance from the campfire (R44-F4b: was 165)
 const float quarterMaxRadius = 250.0f;       // (R44-F4b: was 200)
 const int quarterPlaceTries = 50;            // random layouts tried before the fixed fallback layout
+const int quarterSweepSteps = 360;           // R47-F2: startup check of quarterLayoutOk's rules at every 1 deg rotation
 const float quarterHouseRadius = 56.0f;      // house spot within this of the crate centre (+25% over R30-F1's 45)
 const float quarterClearMargin = 7.0f;       // clearing reaches past the house disc: 5px slab half + 2
 const float quarterClearRadius = quarterHouseRadius + quarterClearMargin; // trees/rocks cleared within this
@@ -1128,6 +1131,7 @@ const float ruinFallbackDist = 170.0f;     // second pass if no spot passes at r
 const float ruinSiteRadius = 40.0f;        // trees, rocks and bushes cleared within this of the site centre; camps sit inside
 const float ruinEdgeMargin = 12.0f;        // site disc keeps this far from the map edges and the HUD strip
 const float ruinQuarterGap = quarterResourceRadius + ruinSiteRadius; // site centre -> any crate: outside the startup top-up ring
+const float ruinCoreMinDist = zoneCoreRadius + ruinSiteRadius;     // R47-F2: whole site disc outside the safe core (460)
 const int ruinPlaceTries = 200;            // per pass
 const int ruinStoneCount = 6;              // standing stones in a rough ring, plus one fallen stone in the middle
 const float ruinRingRadius = 14.0f;        // ring point -> site centre (stone base centre sits on it)
@@ -1819,6 +1823,19 @@ void placeQuarters() {
         }
         wallsegs.clear();
     };
+    // R47-F2: with the village at the map centre, check quarterLayoutOk() at every rotation and at both radius limits
+    // (only the crate positions are set; the real layout below overwrites them)
+    int sweepFails = 0;
+    for (float r : {quarterMinRadius, quarterMaxRadius})
+        for (int s = 0; s < quarterSweepSteps; s++) {
+            float a0 = 6.2831853f * s / quarterSweepSteps;
+            for (int k = 0; k < raceCount; k++) {
+                float a = a0 + 6.2831853f * k / raceCount;
+                storehousePos[k] = snapPx(Vector2f(villageCenter.x + cos(a) * r, villageCenter.y + sin(a) * r) - storehouseSize / 2.0f);
+            }
+            if (!quarterLayoutOk()) sweepFails++;
+        }
+    printf("Race quarters: rotation sweep %s (%d of %d layouts fail)\n", sweepFails ? "FAILS" : "ok", sweepFails, 2 * quarterSweepSteps);
     bool ok = false;
     for (int t = 0; t < quarterPlaceTries && !ok; t++) {
         layout(ang(gen), rad(gen));
@@ -8332,7 +8349,8 @@ void checkQuarters(vector<tree>& trees, vector<CircleShape>& tris, vector<Rectan
 }
 
 // R45-F1b: one ruin site, after the quarters, lakes, bushes and the quarter top-up. The site centre is at least ruinMinDist
-// from the campfire (second pass: ruinFallbackDist), outside every quarter's startup resource ring, inside the map below
+// from the campfire (second pass: ruinFallbackDist; R47-F2: never under ruinCoreMinDist, so the site stays outside the
+// safe core), outside every quarter's startup resource ring, inside the map below
 // the HUD, and dry over its whole square. No spot = no ruins (and so no ridge or camps). Startup trees (trees/tris/stumps),
 // rocks (rocks/octs) and bushes (bushes/bushshapes) touching the site disc are removed together; then the ridge's rocks
 // are added on the far side, and each race's lean-to spot is fixed on the village-facing side.
@@ -8344,6 +8362,7 @@ void spawnRuins(vector<tree>& trees, vector<CircleShape>& tris, vector<Rectangle
     uniform_real_distribution<float> sx(lo, worldSize - lo), sy(hudBarHeight + lo, worldSize - lo);
     bool found = false;
     for (float minDist : {ruinMinDist, ruinFallbackDist}) {
+        minDist = max(minDist, ruinCoreMinDist);   // R47-F2: both passes keep the site disc outside the safe core
         for (int k = 0; k < ruinPlaceTries && !found; k++) {
             Vector2f c(round(sx(gen)), round(sy(gen)));
             if (hypot(c.x - villageCenter.x, c.y - villageCenter.y) < minDist) continue;
@@ -8557,6 +8576,8 @@ int main() {
             founders += string(r ? ", " : " ") + to_string(founded[r]) + " " + raceDefs[r].name;
         printf("%s\n", founders.c_str());
         logEvent(founders);
+        printf("%s (%.0f, %.0f)\n", foundingTickerLine, villageCenter.x, villageCenter.y);
+        logEvent(foundingTickerLine);   // R47-F2: once per game, at startup
     }
 
     // R47-F1: startup trees and rocks bucketed per band (zoneTreeTarget/zoneRockTarget), uniform inside each band
@@ -8638,7 +8659,9 @@ int main() {
     bool paused = false;
     int simSpeed = 1;
     float zoom = minZoom;
-    Vector2f camCenter = villageCenter;   // R45-F1a: open on the village; the view spans windowSize / zoom world px
+    // R45-F1a: open on the village; the view spans windowSize / zoom world px. R47-F2: nudged up by half the HUD strip so
+    // the campfire sits centred in the visible area below the HUD
+    Vector2f camCenter = villageCenter - Vector2f(0.0f, hudBarHeight / 2.0f / zoom);
     bool panning = false;
     Vector2i lastMouse;
     View worldView(FloatRect({0.0f, 0.0f}, {windowSize, windowSize}));
