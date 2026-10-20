@@ -1078,6 +1078,55 @@ const Color lakeDeepColorB(56, 90, 134);   // checker partner, kept very close t
 const Color lakeShallowsColor(82, 112, 146); // deep blue pulled toward the bank
 const Color lakeBankColor(118, 138, 150);  // muted grey-blue bank
 
+// Far Reaches (R45-F1b): one ruin site far out from the village (placed once at startup by spawnRuins, after the
+// quarters, lakes and bushes), a ridge of ordinary mineable rocks arcing behind it, and one lean-to camp per race beside
+// it, built through buildOneOff (jobCamp). Built camps are entries in `camps`; a claim is "a barb of that race holds
+// jobCamp" (no stored flag). Everything is placed relative to worldSize, so it moves out with a bigger map.
+const float ruinMinDist = 260.0f;          // site centre at least this far from the campfire (relaxed to ruinFallbackDist)
+const float ruinFallbackDist = 170.0f;     // second pass if no spot passes at ruinMinDist
+const float ruinSiteRadius = 40.0f;        // trees, rocks and bushes cleared within this of the site centre; camps sit inside
+const float ruinEdgeMargin = 12.0f;        // site disc keeps this far from the map edges and the HUD strip
+const float ruinQuarterGap = quarterResourceRadius + ruinSiteRadius; // site centre -> any crate: outside the startup top-up ring
+const int ruinPlaceTries = 200;            // per pass
+const int ruinStoneCount = 6;              // standing stones in a rough ring, plus one fallen stone in the middle
+const float ruinRingRadius = 14.0f;        // ring point -> site centre (stone base centre sits on it)
+const float ruinRingJitter = 0.25f;        // radians of random twist per stone
+const Vector2f ruinStoneSize(6.0f, 10.0f); // a whole standing stone (broken ones are shorter)
+const float ruinBrokenH[2] = {6.0f, 4.0f}; // heights of the two broken stones
+const Vector2f ruinFallenSize(10.0f, 6.0f); // the fallen stone, lying on its side in the middle
+const Color ruinStoneColor(168, 162, 144); // pale muted sandstone: lighter and warmer than rocks (128) and shrines (138)
+const Color ruinStoneTopColor(192, 186, 166);   // 1px weathered cap row
+const Color ruinStoneShadeColor(128, 122, 108); // 1px shaded right column
+const Color ruinMossColor(88, 108, 72);    // 1px moss at the foot of every other stone
+const float ruinHoverPad = 1.0f;           // hover rect grows this much round each stone
+// Faint glow over the ruins in the evening tint hours (eveningStartHour..nightStartHour-1), additive like the campfire
+const int ruinGlowLayers = 3;
+const float ruinGlowRadius = 30.0f;        // outer layer radius (world px)
+const Color ruinGlowColor(150, 140, 200);  // pale violet: clear of the orange campfire and warm lamp light
+const uint8_t ruinGlowLayerAlpha = 9;      // per layer; ~27 at the centre, a hint rather than a light
+const float ruinGlowRainMult = 0.35f;      // rain dims the glow to this fraction
+const int ruinGlowBreathFrames = 240;      // slow 4s breathing
+const float ruinGlowBreathDepth = 0.25f;   // alpha swings +-25%
+// Rock ridge: an arc of ordinary rocks behind the ruins (the side away from the village)
+const float ridgeRadius = 50.0f;           // arc radius from the site centre (rock centres), just outside the cleared disc
+const float ridgeHalfSpan = 1.2f;          // radians either side of straight away from the village
+const float ridgeStepPx = 11.0f;           // arc length between rock centres: 12px rocks just touch
+const float ridgeJitterPx = 3.0f;          // radial jitter per rock, so the ridge reads uneven
+// Lean-to camps: one per race at the ruins, on the village-facing side, fanned by race
+const int campWoodCost = 10;               // paid at claim from the race's stock (houseWoodCost kept back first)
+const int campMinHouses = 3;               // the race's own houses before it sends a builder that far out
+const int campBuildTicks = 400;            // lighter work than a house (600)
+const float campRuinDist = 32.0f;          // camp centre -> site centre: clear of the tallest stones (ring 14 + 10)
+const float campSpreadRad = 0.6f;          // angle between neighbouring races' camps (~19px apart at campRuinDist)
+const Vector2f campSize(5.0f, 4.0f);       // 5x4 lean-to: smaller than a house (8x7) and a smokehouse (6x5)
+const Vector2f campStandOffset(-3.0f, 1.0f); // builder's spot relative to the lean-to top-left: at its left side
+const Color campPoleColor(104, 78, 50);    // rough timber poles
+const Color campInsideColor(26, 22, 18);   // dark open front under the roof
+// MM markers: ruins as a pale square, camps as a small dot in the lifted crate colour
+const float MM_RUIN_PX = 3.0f;
+const Color MM_RUIN_COLOR(206, 198, 176);
+const float MM_CAMP_PX = 2.0f;
+
 // Lakeside angling (R19-F1): a barb with no tree/rock/bush in reach walks to a free cached shore point and fishes.
 // One angler per shore point; stand spots sit on the bank and are never lakeClear()-checked (they are inside the keep-clear zone).
 const float fishSearchRadius = 60.0f;      // wider than barbWorkSearchRadius: lakes are few and away from the village
@@ -1222,8 +1271,8 @@ const int spearKnapFrames = 8;                // crafter's knapping hand ticks u
 // Build jobs: which structure a barb's movingbspot/building belongs to. jobNone = no job, or a house (buildhouse()).
 // jobSpear is a craft, not a structure: it uses movingbspot (so no other system grabs the barb) but never building/timer.
 // jobPave (R20-F2) is run by paveTick(): movingbspot while walking, building/timer while laying the cobbles.
-enum buildJob {jobNone, jobShrine, jobSmoke, jobStall, jobForge, jobField, jobSpear, jobPave, jobStore, jobMill, jobKeep, jobShaft, buildJobCount};
-const int buildJobTicks[buildJobCount] = {houseBuildTicks, shrineBuildTicks, smokehouseBuildTicks, stallBuildTicks, forgeBuildTicks, fieldBuildTicks, spearCraftTicks, paveTicks, storehouseBuildTicks, millBuildTicks, keepBuildTicks, shaftBuildTicks};
+enum buildJob {jobNone, jobShrine, jobSmoke, jobStall, jobForge, jobField, jobSpear, jobPave, jobStore, jobMill, jobKeep, jobShaft, jobCamp, buildJobCount};
+const int buildJobTicks[buildJobCount] = {houseBuildTicks, shrineBuildTicks, smokehouseBuildTicks, stallBuildTicks, forgeBuildTicks, fieldBuildTicks, spearCraftTicks, paveTicks, storehouseBuildTicks, millBuildTicks, keepBuildTicks, shaftBuildTicks, campBuildTicks};
 // Game animals share the deer code (deers/deershape vectors); per-species numbers live in speciesDefs below.
 // Sprite offsets are relative to the logic shape (body = hitbox), written for an animal facing right.
 enum animalSpecies {speciesDeer, speciesRabbit, speciesCount};
@@ -1909,6 +1958,26 @@ bool lakeClear(const FloatRect& r, const Vector2f* pathFrom = nullptr) {
         if (segmentHitsRect(*pathFrom, r.position, sweep)) return false;
     }
     return true;
+}
+
+// R45-F1b: Far Reaches. ruinStones empty = no site was found at startup (then no ridge or camps either).
+vector<FloatRect> ruinStones;              // standing + fallen stone rects, fixed after spawnRuins()
+Vector2f ruinCentre(-1000.0f, -1000.0f);   // site centre, set by spawnRuins()
+Vector2f campSpot[raceCount];              // each race's lean-to top-left, fixed after spawnRuins()
+struct leanTo {int race = -1; Vector2f pos;};
+vector<leanTo> camps;                      // standing lean-tos, at most one per race; a built camp is just its entry here
+bool hasRuins() { return !ruinStones.empty(); }
+bool campBuilt(int r) {
+    for (auto& c : camps) if (c.race == r) return true;
+    return false;
+}
+// False if r touches the cleared ruin site disc (nearest point of the rect to the centre)
+bool ruinsClear(const FloatRect& r) {
+    if (!hasRuins()) return true;
+    float nx = clamp(ruinCentre.x, r.position.x, r.position.x + r.size.x);
+    float ny = clamp(ruinCentre.y, r.position.y, r.position.y + r.size.y);
+    float dx = nx - ruinCentre.x, dy = ny - ruinCentre.y;
+    return dx * dx + dy * dy > ruinSiteRadius * ruinSiteRadius;
 }
 
 // Work target of a barb. targetNone with a set targetx is a tree (or a hunt/wander/build spot, which own their flags).
@@ -3492,6 +3561,16 @@ optional<hoverHit> pickHover(Vector2f p, float radius, const vector<barb>& barbs
             h.hoveredHouse = houses[i].id;
             return h;
         }
+    for (auto& c : camps) {   // R45-F1b
+        RectangleShape body(campSize);
+        body.setPosition(snapPx(c.pos));
+        if (near(body)) return hoverHit{string(raceDefs[clampRace(c.race)].name) + " lean-to camp", body, nullopt};
+    }
+    for (auto& st : ruinStones) {   // R45-F1b: any stone outlines that stone
+        RectangleShape stone(st.size + Vector2f(2 * ruinHoverPad, 2 * ruinHoverPad));
+        stone.setPosition(st.position - Vector2f(ruinHoverPad, ruinHoverPad));
+        if (near(stone)) return hoverHit{"Ruins: old standing stones", stone, nullopt};
+    }
     for (int r = 0; r < raceCount; r++) {   // POL-F1: a standing crate shows its race's ledger line
         if (!stores[r].built) continue;
         RectangleShape crate(storehouseSize);
@@ -4020,6 +4099,8 @@ void drawMinimap(RenderWindow& window, VertexArray& va, const View& worldView,
         minimapDot(va, inner, houseshapes[i].getPosition() + houseshapes[i].getSize() / 2.0f, MM_HOUSE_PX, storehouseColors[houses[i].race]);
     for (int k = 0; k < raceCount; k++)
         if (stores[k].built) minimapDot(va, inner, quarterCentre(k), MM_STORE_PX, MM_STORE_COLORS[k]);
+    if (hasRuins()) minimapDot(va, inner, ruinCentre, MM_RUIN_PX, MM_RUIN_COLOR);   // R45-F1b: site, then camps over it
+    for (auto& c : camps) minimapDot(va, inner, c.pos + campSize / 2.0f, MM_CAMP_PX, MM_STORE_COLORS[clampRace(c.race)]);
     for (int i = 0; i < (int)barbs.size(); i++)
         if (!barbHidden(barbs[i]))   // INBOX-F1
         minimapDot(va, inner, squares[i].getPosition() + squares[i].getSize() / 2.0f, MM_BARB_PX,
@@ -7533,6 +7614,7 @@ void treespawn(vector<tree>& trees, vector<CircleShape>& tris, vector<RectangleS
             if (o.movingbspot && o.jobKind == jobNone
                 && tr.findIntersection(FloatRect(Vector2f(o.targetx - 3.0f, o.targety - 3.0f), houseSlabSize))) return;
     }
+    if (!ruinsClear(FloatRect(Vector2f(t.x, t.y), Vector2f(treeFootprint, treeFootprint)))) return;  // R45-F1b: nor in the ruin site
     trees.push_back(t);
 
     tris.push_back(makeTreeTri(t.x, t.y));
@@ -7740,6 +7822,186 @@ void checkQuarters(vector<tree>& trees, vector<CircleShape>& tris, vector<Rectan
     }
 }
 
+// R45-F1b: one ruin site, after the quarters, lakes, bushes and the quarter top-up. The site centre is at least ruinMinDist
+// from the campfire (second pass: ruinFallbackDist), outside every quarter's startup resource ring, inside the map below
+// the HUD, and dry over its whole square. No spot = no ruins (and so no ridge or camps). Startup trees (trees/tris/stumps),
+// rocks (rocks/octs) and bushes (bushes/bushshapes) touching the site disc are removed together; then the ridge's rocks
+// are added on the far side, and each race's lean-to spot is fixed on the village-facing side.
+void spawnRuins(vector<tree>& trees, vector<CircleShape>& tris, vector<RectangleShape>& stumps, vector<rock>& rocks,
+                vector<CircleShape>& octs, vector<bush>& bushes, vector<CircleShape>& bushshapes) {
+    ruinStones.clear();
+    camps.clear();
+    float lo = ruinSiteRadius + ruinEdgeMargin;
+    uniform_real_distribution<float> sx(lo, worldSize - lo), sy(hudBarHeight + lo, worldSize - lo);
+    bool found = false;
+    for (float minDist : {ruinMinDist, ruinFallbackDist}) {
+        for (int k = 0; k < ruinPlaceTries && !found; k++) {
+            Vector2f c(round(sx(gen)), round(sy(gen)));
+            if (hypot(c.x - villageCenter.x, c.y - villageCenter.y) < minDist) continue;
+            if (nearQuarter(c, ruinQuarterGap)) continue;
+            if (!lakeClear(FloatRect(c - Vector2f(ruinSiteRadius, ruinSiteRadius), Vector2f(2 * ruinSiteRadius, 2 * ruinSiteRadius)))) continue;
+            ruinCentre = c;
+            found = true;
+        }
+        if (found) break;
+    }
+    if (!found) { printf("Ruins: no spot found, none placed\n"); return; }
+
+    // Stones: a rough ring (feet on the ring), two of them broken on opposite sides, one fallen stone in the middle
+    uniform_real_distribution<float> twist(-ruinRingJitter, ruinRingJitter), startAng(0.0f, 6.2831853f);
+    uniform_int_distribution<int> pickBroken(0, ruinStoneCount - 1);
+    int brokenA = pickBroken(gen), brokenB = (brokenA + ruinStoneCount / 2) % ruinStoneCount;
+    float a0 = startAng(gen);
+    for (int i = 0; i < ruinStoneCount; i++) {
+        float a = a0 + 6.2831853f * i / ruinStoneCount + twist(gen);
+        Vector2f foot = ruinCentre + Vector2f(cos(a), sin(a)) * ruinRingRadius;
+        float h = i == brokenA ? ruinBrokenH[0] : i == brokenB ? ruinBrokenH[1] : ruinStoneSize.y;
+        ruinStones.push_back(FloatRect(snapPx(foot - Vector2f(ruinStoneSize.x / 2, h)), Vector2f(ruinStoneSize.x, h)));
+    }
+    ruinStones.push_back(FloatRect(snapPx(ruinCentre - ruinFallenSize / 2.0f), ruinFallenSize));
+    sort(ruinStones.begin(), ruinStones.end(), [](const FloatRect& p, const FloatRect& q) {   // nearer (lower) stones drawn last
+        return p.position.y + p.size.y < q.position.y + q.size.y;
+    });
+
+    int clearedT = 0, clearedR = 0, clearedB = 0;
+    for (int i = (int)tris.size() - 1; i >= 0; i--) {
+        if (ruinsClear(FloatRect(tris[i].getPosition(), Vector2f(treeFootprint, treeFootprint)))) continue;
+        swapRemove(trees, i); swapRemove(tris, i); swapRemove(stumps, i);
+        clearedT++;
+    }
+    for (int i = (int)octs.size() - 1; i >= 0; i--) {
+        if (ruinsClear(octs[i].getGlobalBounds())) continue;
+        swapRemove(rocks, i); swapRemove(octs, i);
+        clearedR++;
+    }
+    for (int i = (int)bushshapes.size() - 1; i >= 0; i--) {
+        if (ruinsClear(bushshapes[i].getGlobalBounds())) continue;
+        swapRemove(bushes, i); swapRemove(bushshapes, i);
+        clearedB++;
+    }
+
+    // Camps: fanned by race round the direction back to the campfire
+    Vector2f toVillage = villageCenter - ruinCentre;
+    float homeAng = atan2(toVillage.y, toVillage.x);
+    for (int r = 0; r < raceCount; r++) {
+        float a = homeAng + (r - (raceCount - 1) / 2.0f) * campSpreadRad;
+        campSpot[r] = snapPx(ruinCentre + Vector2f(cos(a), sin(a)) * campRuinDist - campSize / 2.0f);
+    }
+
+    // Ridge: ordinary rocks on an arc away from the village; trees under a ridge rock are removed so it reads
+    const Vector2f rockSz(12.0f, 12.0f);   // 6px-radius pentagon, as everywhere else
+    uniform_real_distribution<float> jit(-ridgeJitterPx, ridgeJitterPx);
+    int steps = max(1, (int)(2 * ridgeHalfSpan * ridgeRadius / ridgeStepPx));
+    int ridgeFirst = (int)octs.size();
+    for (int i = 0; i <= steps; i++) {
+        float a = homeAng + 3.1415927f - ridgeHalfSpan + 2 * ridgeHalfSpan * i / steps;
+        Vector2f p = snapPx(ruinCentre + Vector2f(cos(a), sin(a)) * (ridgeRadius + jit(gen)) - rockSz / 2.0f);
+        FloatRect rr(p, rockSz);
+        if (p.x < 0.0f || p.y < hudBarHeight || p.x + rockSz.x > worldSize || p.y + rockSz.y > worldSize) continue;
+        if (inClearing(p) || !lakeClear(rr) || !ruinsClear(rr)) continue;
+        rocks.push_back(rock{(int)p.x, (int)p.y, false});
+        CircleShape oct;
+        oct.setPointCount(5);
+        oct.setPosition(p);
+        oct.setRadius(6);
+        oct.setFillColor(Color(125, 125, 125));
+        octs.push_back(oct);
+    }
+    for (int i = (int)tris.size() - 1; i >= 0; i--) {
+        FloatRect tb(tris[i].getPosition(), Vector2f(treeFootprint, treeFootprint));
+        for (int k = ridgeFirst; k < (int)octs.size(); k++) {
+            if (!tb.findIntersection(octs[k].getGlobalBounds())) continue;
+            swapRemove(trees, i); swapRemove(tris, i); swapRemove(stumps, i);
+            break;
+        }
+    }
+    printf("Ruins at (%.0f, %.0f), %.0f px out: %zu stones, %d ridge rocks (cleared %d trees, %d rocks, %d bushes)\n",
+           ruinCentre.x, ruinCentre.y, hypot(ruinCentre.x - villageCenter.x, ruinCentre.y - villageCenter.y), ruinStones.size(),
+           (int)octs.size() - ridgeFirst, clearedT, clearedR, clearedB);
+}
+
+// R45-F1b: one lean-to per race at the ruins, through buildOneOff (jobCamp) by a builder of that race, once its crate
+// stands and it has campMinHouses houses of its own; wood is paid at claim (houseWoodCost kept back). The claim is not
+// stored: it is "a barb of this race holds jobCamp", so a lost builder frees it through releaseBarbWork()'s reset.
+void buildcamps(vector<barb>& barbs, vector<RectangleShape>& squares, const vector<house>& houses, const storehouse (&stores)[raceCount]) {
+    if (!hasRuins()) return;
+    for (int r = 0; r < raceCount; r++) {
+        if (campBuilt(r) || !stores[r].built) continue;
+        bool claimed = false;
+        for (auto& b : barbs) if (b.jobKind == jobCamp && b.race == r) claimed = true;
+        bool done = buildOneOff(barbs, squares, claimed, jobCamp, campSpot[r] + campStandOffset, "LEAN-TO",
+            [&](const barb&) {
+                int raceHouses = 0;
+                for (auto& h : houses) if (h.race == r) raceHouses++;
+                if (raceHouses < campMinHouses) return -1;
+                if (!canAfford(stock[r], campWoodCost + houseWoodCost, 0)) return -1;
+                spend(stock[r], campWoodCost, 0);
+                return 1;
+            }, r);
+        if (!done) continue;
+        camps.push_back(leanTo{r, campSpot[r]});
+        printf("---LEAN-TO BUILT--- %s camp at the ruins (%.0f, %.0f)\n", raceDefs[r].name, campSpot[r].x, campSpot[r].y);
+        logRaceEvent(string(racePlurals[r]) + " pitch a lean-to by the ruins", r);
+    }
+}
+
+// R45-F1b: pale stones, one vertex array: body, 1px weathered cap (broken stones: a 4px stub, the corner knocked off),
+// 1px shaded right column, moss at the foot of every other stone. Drawn with the buildings, under barbs and trees.
+void drawRuins(RenderWindow& window) {
+    if (!hasRuins()) return;
+    static VertexArray va(PrimitiveType::Triangles);
+    va.clear();
+    for (int i = 0; i < (int)ruinStones.size(); i++) {
+        Vector2f p = ruinStones[i].position, s = ruinStones[i].size;
+        bool broken = s.x == ruinStoneSize.x && s.y < ruinStoneSize.y;
+        pushQuad(va, p + Vector2f(0.0f, 1.0f), Vector2f(s.x, s.y - 1.0f), ruinStoneColor);
+        pushQuad(va, p, Vector2f(broken ? s.x - 2.0f : s.x, 1.0f), ruinStoneTopColor);
+        pushQuad(va, p + Vector2f(s.x - 1.0f, 1.0f), Vector2f(1.0f, s.y - 1.0f), ruinStoneShadeColor);
+        if (i % 2 == 0) pushQuad(va, p + Vector2f(0.0f, s.y - 1.0f), Vector2f(1.0f, 1.0f), ruinMossColor);
+    }
+    window.draw(va);
+}
+
+// R45-F1b: 5x4 lean-to, roof sloping down to the right in the race's crate colour (lit top rows, darker eave), a timber
+// pole at each end and a dark open front under the roof.
+void drawCamps(RenderWindow& window) {
+    static VertexArray va(PrimitiveType::Triangles);
+    va.clear();
+    for (auto& c : camps) {
+        Color roof = storehouseColors[clampRace(c.race)];
+        Color lit = lerpColor(roof, Color::White, 0.15f);
+        Vector2f o = snapPx(c.pos);
+        pushQuad(va, o + Vector2f(1.0f, 2.0f), Vector2f(3.0f, 2.0f), campInsideColor);   // open front
+        pushQuad(va, o + Vector2f(0.0f, 1.0f), Vector2f(1.0f, 3.0f), campPoleColor);     // back pole, under the roof edge
+        pushQuad(va, o + Vector2f(4.0f, 3.0f), Vector2f(1.0f, 1.0f), campPoleColor);     // short front pole
+        pushQuad(va, o, Vector2f(2.0f, 1.0f), lit);                                      // roof, top row
+        pushQuad(va, o + Vector2f(1.0f, 1.0f), Vector2f(3.0f, 1.0f), roof);              // roof, middle row
+        pushQuad(va, o + Vector2f(3.0f, 2.0f), Vector2f(2.0f, 1.0f), shade(roof, 0.8f)); // eave
+    }
+    if (va.getVertexCount() > 0) window.draw(va);
+}
+
+// R45-F1b: faint breathing glow over the ruins in the evening hours, after the day/night overlay (additive, like the
+// campfire); rain dims it to ruinGlowRainMult.
+void drawRuinGlow(RenderWindow& window, const View& worldView, int frame) {
+    if (!hasRuins()) return;
+    window.setView(worldView);
+    float breath = 1.0f + ruinGlowBreathDepth * sin(frame * 6.2831853f / ruinGlowBreathFrames);
+    Color col = ruinGlowColor;
+    col.a = (uint8_t)(ruinGlowLayerAlpha * breath * (raining ? ruinGlowRainMult : 1.0f));
+    if (col.a == 0) return;
+    CircleShape c;
+    c.setPosition(ruinCentre);
+    c.setFillColor(col);
+    c.setPointCount(40);
+    for (int i = 1; i <= ruinGlowLayers; i++) {
+        float r = ruinGlowRadius * i / ruinGlowLayers;
+        c.setRadius(r);
+        c.setOrigin({r, r});
+        window.draw(c, BlendAdd);
+    }
+}
+
 // Bare bushes ripen again after bushRegrowTicks (rainRegrowMult times faster in rain)
 void bushTick(vector<bush>& bushes, vector<CircleShape>& bushshapes) {
     for (int i = 0; i < (int)bushes.size(); i++) {
@@ -7835,6 +8097,7 @@ int main() {
     vector<CircleShape> bushshapes;
     spawnBushes(bushes, bushshapes, trees, tris, stumps);
     checkQuarters(trees, tris, stumps, rocks, octs, bushshapes);   // R30-F1: no quarter short of wood/stone
+    spawnRuins(trees, tris, stumps, rocks, octs, bushes, bushshapes);   // R45-F1b: last, so it clears whatever landed on the site
     for (auto& s : stock) {   // RACE-F1: every race starts with at least startStock
         s.wood = max(s.wood, startStock.wood);
         s.stone = max(s.stone, startStock.stone);
@@ -7950,6 +8213,7 @@ int main() {
                 buildforge(barbs, squares, houses, dwarfForge);
                 buildstorehouses(barbs, squares, houses, stores, fields);
                 buildshafts(barbs, squares, stores);   // R34-F1
+                buildcamps(barbs, squares, houses, stores);   // R45-F1b: lean-tos at the ruins
                 buildfield(barbs, squares, houses, shrines, stores, fields);
                 buildmills(barbs, squares, fields);   // FARM-F2
                 buildkeeps(barbs, squares, stores);   // R31-F1: Town era
@@ -8050,6 +8314,8 @@ int main() {
 	drawGateTowers(window);     // R33-F2: with the keeps, over the wall ends and ground marks, under barbs
 	drawShrines(window, shrines);
 	drawSmokehouse(window, smoke, stores);
+	drawRuins(window);   // R45-F1b: with the buildings, under barbs and trees
+	drawCamps(window);
 	drawStall(window, activeTrader);
 	drawForge(window, dwarfForge, frameCount, forgeBonusPending(barbs, dwarfForge));
 	if (forgeEmberFrames > 0 && !paused) forgeEmberFrames--;
@@ -8115,6 +8381,7 @@ int main() {
         else                            dncColor = Color(255, 178, 127, 50);  // Evening
         drawOverlay(window, dnc, dncColor);
         if (raining) drawOverlay(window, dnc, rainOverlayColor);
+        if (t >= eveningStartHour && t < nightStartHour) drawRuinGlow(window, worldView, frameCount);   // R45-F1b: dusk only
         if (isNightHour(t)) drawCampfireGlow(window, worldView, fire, frameCount);
         if (isNightHour(t)) drawHouseLights(window, worldView, houses, houseshapes);
         drawBallots(window, worldView, zoom, barbs, squares); // above the overlays so the pips read true; under hover marks
