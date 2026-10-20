@@ -452,6 +452,25 @@ const int wolfStepInterval = 2;            // ticks per 1px step (deer step ever
 const Vector2f wolfSize(5.0f, 3.0f);
 const Color wolfColor(150, 150, 160);      // cool mid grey: lighter than rocks, darker than birds, far from deer tan
 
+// R48-F1 Night Prowlers, phase 1: shadow creatures come in from the map edge during the night, chase the nearest barb or
+// house outside the lit campfire's safe zone and bite barbs; they dissolve at dawn or on entering the safe zone.
+const int prowlerCapByEra[3] = {1, 2, 3};   // prowlers per night (total spawned, not concurrent): Camp / Hamlet / Town
+const int prowlerSpawnChance = 2400;        // 1-in-N per night tick while below tonight's cap (~40s at 1x)
+const float prowlerEdgeInsetPx = 4.0f;      // spawn this far in from the map border
+const int prowlerStepInterval = 4;          // ticks per 1px step (barbs step every 10, wolves every 2)
+const int prowlerSearchTicks = 60;          // nearest-target search throttle (~1s at 1x); targets re-validated every tick
+const float prowlerSafeRadius = 90.0f;      // px from the campfire: no targets inside, a prowler entering dissolves (fire lit)
+const float prowlerBiteRangePx = 3.0f;      // centre distance to bite a barb
+const int prowlerBiteDamage = 4;            // hp per bite (barbMaxHealth 100)
+const int prowlerBiteCooldownTicks = 300;   // ticks between bites (~5s at 1x)
+const int prowlerFadeTicks = 120;           // dissolve fade (dawn and campfire share it), then removed
+const Vector2f prowlerSize(5.0f, 4.0f);     // a touch bulkier than a 5x3 wolf
+const Color prowlerColor(172, 156, 208);    // pale lavender: reads through the night overlay, apart from the 190,140,230 trader
+const Color prowlerOutlineColor(222, 214, 240, 150); // pale 1px rim
+const Color prowlerEyeColor(235, 50, 45);   // two 1px red eyes, drawn after the night overlay
+const Color prowlerSafeRingColor(235, 165, 85, 60);  // faint warm 1px ring marking the safe zone at night (fire lit)
+const Color prowlerEventColor(185, 160, 225);        // ticker tint for the first prowler of a night
+
 // Skittish deer: bolt away from a nearby barb for a short, capped time, then a cooldown so hunts can still land
 const int deerStepInterval = 3;            // ticks per 1px step while wandering (deer row of speciesDefs)
 const int deerFleeStepInterval = 1;        // ticks per 1px step while fleeing (3x wander speed; barbs step every 10)
@@ -2757,6 +2776,21 @@ struct wolf {
     int stepTimer = 0;
     RectangleShape shape;
 };
+
+// R48-F1: prowlers own their state (no parallel vector). Targets are stable ids (barb.id / house.id), never indices,
+// re-resolved every tick. fade > 0 = dissolving (dawn or campfire, one path); removed when it runs out.
+struct prowler {
+    int id = -1;
+    Vector2f pos;             // hitbox top-left
+    int targetBarbId = -1;    // at most one of the two targets is set
+    int targetHouseId = -1;
+    int sniffedHouseId = -1;  // last house reached; skipped by the search so the prowler moves on
+    int searchTimer = 0;      // ticks until the next nearest-target search
+    int stepTimer = 0;
+    int biteCooldown = 0;
+    int fade = 0;
+};
+int nextProwlerId = 0;
 
 char tradeMsg[64] = "";
 int tradeMsgTimer = 0;
@@ -7668,6 +7702,167 @@ void ungarrison(barb& b) {
     b.target = targetNone;
 }
 
+// R48-F1: the safe zone exists only while the campfire is lit
+bool inProwlerSafeZone(Vector2f p, const campfire& fire) {
+    Vector2f d = p - villageCenter;
+    return fire.lit && d.x * d.x + d.y * d.y < prowlerSafeRadius * prowlerSafeRadius;
+}
+
+// R48-F1: a barb a prowler may chase: on the map surface, alive, and outside the lit safe zone
+bool prowlerBarbOk(const barb& b, Vector2f centre, const campfire& fire) {
+    return b.health > 0 && !barbHidden(b) && !barbUnderground(b) && !inProwlerSafeZone(centre, fire);
+}
+
+// R48-F1: the one way a prowler starts to go (dawn or the campfire); removal happens when the fade runs out
+void dissolveProwler(prowler& p, const char* why) {
+    if (p.fade > 0) return;
+    p.fade = prowlerFadeTicks;
+    p.targetBarbId = p.targetHouseId = -1;
+    printf("PROWLER %d dissolves (%s) at (%.0f, %.0f)\n", p.id, why, p.pos.x, p.pos.y);
+}
+
+// R48-F1: runs right after wolfTick(). Spawns up to tonight's era cap at the map edge, chases the nearest barb or house
+// outside the safe zone (throttled search, ids re-validated every tick), bites barbs, and dissolves at dawn or in the
+// lit safe zone. Deaths are left to starveDeathTick() at the end of the tick (health <= 0).
+void prowlerTick(vector<prowler>& prowlers, vector<barb>& barbs, const vector<RectangleShape>& squares,
+                 const vector<house>& houses, const vector<RectangleShape>& houseshapes, const campfire& fire) {
+    static bool wasNight = false;
+    static int spawnedTonight = 0;
+    bool night = isNightHour(game_time);
+    if (night && !wasNight) spawnedTonight = 0;   // dusk: a fresh night's allowance
+    wasNight = night;
+
+    int cap = prowlerCapByEra[min((int)currentEra, 2)];
+    if (night && spawnedTonight < cap && uniform_int_distribution<int>(0, prowlerSpawnChance - 1)(gen) == 0) {
+        prowler p;
+        p.id = nextProwlerId++;
+        float lo = prowlerEdgeInsetPx, hi = worldSize - prowlerEdgeInsetPx - prowlerSize.x;
+        float a = uniform_real_distribution<float>(lo, hi)(gen);
+        switch (uniform_int_distribution<int>(0, 3)(gen)) {
+            case 0:  p.pos = Vector2f(lo, a); break;
+            case 1:  p.pos = Vector2f(hi, a); break;
+            case 2:  p.pos = Vector2f(a, lo); break;
+            default: p.pos = Vector2f(a, hi); break;
+        }
+        prowlers.push_back(p);
+        const char* dir = compassName(p.pos - villageCenter);
+        printf("PROWLER %d arriving from the %s (%.0f, %.0f) - %d of %d tonight\n", p.id, dir, p.pos.x, p.pos.y,
+               spawnedTonight + 1, cap);
+        if (spawnedTonight == 0) logEvent(string("Something stirs in the dark to the ") + dir, prowlerEventColor);
+        spawnedTonight++;
+    }
+
+    for (int i = (int)prowlers.size() - 1; i >= 0; i--) {   // backward, so swapRemove only pulls in a visited prowler
+        prowler& p = prowlers[i];
+        if (p.fade > 0) {
+            if (--p.fade <= 0) swapRemove(prowlers, i);
+            continue;
+        }
+        Vector2f c = p.pos + prowlerSize / 2.0f;
+        if (!night) { dissolveProwler(p, "dawn"); continue; }
+        if (inProwlerSafeZone(c, fire)) { dissolveProwler(p, "campfire"); continue; }
+        if (p.biteCooldown > 0) p.biteCooldown--;
+
+        // re-validate the stored target by id every tick
+        int bi = findBarbById(barbs, p.targetBarbId);
+        if (bi >= 0 && (bi >= (int)squares.size()
+                        || !prowlerBarbOk(barbs[bi], squares[bi].getPosition() + squares[bi].getSize() / 2.0f, fire))) bi = -1;
+        if (bi < 0) p.targetBarbId = -1;
+        int hi = findHouseById(houses, p.targetHouseId);
+        if (hi >= 0 && (hi >= (int)houseshapes.size()
+                        || inProwlerSafeZone(houseshapes[hi].getPosition() + houseshapes[hi].getSize() / 2.0f, fire))) hi = -1;
+        if (hi < 0) p.targetHouseId = -1;
+
+        if (--p.searchTimer <= 0) {   // throttled nearest search over barbs and houses only
+            p.searchTimer = prowlerSearchTicks;
+            float best = numeric_limits<float>::infinity();
+            int nb = -1, nh = -1;
+            for (int k = 0; k < (int)barbs.size() && k < (int)squares.size(); k++) {
+                Vector2f bc = squares[k].getPosition() + squares[k].getSize() / 2.0f;
+                if (!prowlerBarbOk(barbs[k], bc, fire)) continue;
+                Vector2f d = bc - c;
+                float dSq = d.x * d.x + d.y * d.y;
+                if (dSq < best) { best = dSq; nb = k; }
+            }
+            for (int k = 0; k < (int)houses.size() && k < (int)houseshapes.size(); k++) {
+                Vector2f hc = houseshapes[k].getPosition() + houseshapes[k].getSize() / 2.0f;
+                if (houses[k].id == p.sniffedHouseId || inProwlerSafeZone(hc, fire)) continue;
+                Vector2f d = hc - c;
+                float dSq = d.x * d.x + d.y * d.y;
+                if (dSq < best) { best = dSq; nh = k; nb = -1; }
+            }
+            bi = nb; hi = nh;
+            p.targetBarbId = nb >= 0 ? barbs[nb].id : -1;
+            p.targetHouseId = nh >= 0 ? houses[nh].id : -1;
+        }
+
+        // no target: drift toward the village (and so into the fire's light, if it is lit)
+        Vector2f goal = villageCenter;
+        if (bi >= 0) goal = squares[bi].getPosition() + squares[bi].getSize() / 2.0f;
+        else if (hi >= 0) goal = houseshapes[hi].getPosition() + houseshapes[hi].getSize() / 2.0f;
+        Vector2f diff = goal - c;
+        float dSq = diff.x * diff.x + diff.y * diff.y;
+
+        if (bi >= 0 && dSq <= prowlerBiteRangePx * prowlerBiteRangePx && p.biteCooldown == 0) {
+            barb& b = barbs[bi];
+            b.health = max(0, b.health - prowlerBiteDamage);
+            p.biteCooldown = prowlerBiteCooldownTicks;
+            printf("PROWLER %d bit %s (id %d) - %d hp\n", p.id, b.name, b.id, b.health);
+            if (b.health <= 0) logRaceEvent(string(b.name) + " was taken by a night prowler", b.race);
+        }
+        if (hi >= 0 && bi < 0 && dSq <= prowlerBiteRangePx * prowlerBiteRangePx) {   // sniffed the door: on to the next
+            p.sniffedHouseId = p.targetHouseId;
+            p.targetHouseId = -1;
+            p.searchTimer = 0;
+        }
+        if (dSq >= 1.0f && ++p.stepTimer >= prowlerStepInterval) {
+            p.stepTimer = 0;
+            p.pos += diff / sqrt(dSq);
+        }
+    }
+}
+
+// R48-F1: bodies, in the world layer before the night overlay; alpha follows the dissolve fade
+void drawProwlers(RenderWindow& window, const vector<prowler>& prowlers) {
+    RectangleShape body(prowlerSize - Vector2f(2.0f, 2.0f));   // 1px outline drawn outward keeps the 5x4 footprint
+    for (auto& p : prowlers) {
+        float a = p.fade > 0 ? (float)p.fade / prowlerFadeTicks : 1.0f;
+        Color fill = prowlerColor, rim = prowlerOutlineColor;
+        fill.a = (uint8_t)(fill.a * a);
+        rim.a = (uint8_t)(rim.a * a);
+        body.setFillColor(fill);
+        body.setOutlineThickness(1.0f);
+        body.setOutlineColor(rim);
+        body.setPosition(snapPx(p.pos) + Vector2f(1.0f, 1.0f));
+        window.draw(body);
+    }
+}
+
+// R48-F1: after the night overlay (and the lamps), so the eyes glow; plus the faint safe-zone ring while the fire is lit
+void drawProwlerOverlay(RenderWindow& window, const View& worldView, const vector<prowler>& prowlers, const campfire& fire) {
+    window.setView(worldView);
+    if (isNightHour(game_time) && fire.lit) {
+        CircleShape ring(prowlerSafeRadius, 96);
+        ring.setOrigin({prowlerSafeRadius, prowlerSafeRadius});
+        ring.setPosition(villageCenter);
+        ring.setFillColor(Color::Transparent);
+        ring.setOutlineThickness(1.0f);
+        ring.setOutlineColor(prowlerSafeRingColor);
+        window.draw(ring);
+    }
+    RectangleShape eye({1.0f, 1.0f});
+    for (auto& p : prowlers) {
+        Color col = prowlerEyeColor;
+        if (p.fade > 0) col.a = (uint8_t)(255.0f * p.fade / prowlerFadeTicks);
+        eye.setFillColor(col);
+        Vector2f o = snapPx(p.pos);
+        eye.setPosition(o + Vector2f(1.0f, 1.0f));
+        window.draw(eye);
+        eye.setPosition(o + Vector2f(3.0f, 1.0f));
+        window.draw(eye);
+    }
+}
+
 // Runs right after wolfTick(). Rings/silences each race's bell, then walks garrisoned barbs to their doorstep and hides them.
 // Garrisoning drops the barb's work through releaseBarbWork() (and frees the tree/rock/bush it was working); haulers finish
 // their trip first. Every garrisoned barb's house is re-resolved by id each tick; a missing house releases the barb.
@@ -10098,6 +10293,7 @@ int main() {
     RectangleShape birdShape;
     int frameCount = 0;
     vector<wolf> wolves;
+    vector<prowler> prowlers;   // R48-F1
     campfire fire;
 
     while (window.isOpen()) {
@@ -10194,6 +10390,7 @@ int main() {
                 deerwander(deershape, deers, squares, barbs);
                 deerkilling(deers, deershape, barbs, squares, smoke);
                 wolfTick(wolves, deers, deershape, barbs);
+                prowlerTick(prowlers, barbs, squares, houses, houseshapes, fire);   // R48-F1: bites land before starveDeathTick()
                 bellTick(barbs, squares, houses, houseshapes, wolves, stores, smoke, dwarfForge, fields,
                          trees, tris, rocks, octs, bushes);   // INBOX-F1: after the wolves move
                 expeditionTick(barbs, squares, wolves, stores);   // R45-F2: after the wolves and the bell, before hungerTick()
@@ -10313,6 +10510,7 @@ int main() {
 
 	for (auto& w : wolves)
 		drawSnapped(window, w.shape);
+	drawProwlers(window, prowlers);   // R48-F1: bodies under the night overlay; eyes after it
 
         {
             // R45-F1a: thousands of stumps (R47-F1: ~12k on the 2400 map), so only the ones in (or touching) the view are drawn
@@ -10366,6 +10564,7 @@ int main() {
         drawPoiGlow(window, worldView, camRect, frameCount);   // R47-F4: found sites, any hour
         if (isNightHour(t)) drawCampfireGlow(window, worldView, fire, frameCount);
         if (isNightHour(t)) drawHouseLights(window, worldView, houses, houseshapes);
+        drawProwlerOverlay(window, worldView, prowlers, fire);   // R48-F1: red eyes + safe-zone ring, above the night overlay
         drawBallots(window, worldView, zoom, barbs, squares); // above the overlays so the pips read true; under hover marks
         if (ballotFramesLeft > 0 && !paused) ballotFramesLeft--;
         if (window.hasFocus() && Keyboard::isKeyPressed(Keyboard::Key::H))   // R44-F2: held, not toggled; under select/hover marks
