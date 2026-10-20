@@ -356,6 +356,24 @@ const float veilFullLocal = 0.5f;                 // ether in the 3x3 cells roun
 constexpr float veilBirthFloor = 0.7f;               // the slowest birth rate the veil allows (x0.7): mild, never a gate
 static_assert(veilBirthFloor > 0.0f && veilBirthFloor <= 1.0f, "the veil must never fully gate births");
 const float veilBirthDraw = 0.25f;                // ether a birth draws from the 3x3 cells round its spot
+// R50-F1b The Veil, phase 2 (omens): faint shimmer motes rise over recent death sites while their souls linger, a birth
+// that drew a soul tints its ring toward that race, and a rare ticker omen (shared cooldown) marks veil moments.
+const int veilSiteMax = 8;                        // death sites remembered for motes; a new one evicts the oldest
+const float veilSiteQuietBelow = 0.15f;           // own-race ether in the site's 3x3 cells below this: site forgotten
+const int veilMoteMax = 10;                       // motes alive at once over the whole map (hard cap)
+const int veilMoteOneIn = 40;                     // per site per veil step at full ether: ~1 mote per 400 ticks (~7s)
+const int veilMoteTicks = 180;                    // ~3s life: fades in, shimmers, fades out
+const float veilMoteRisePx = 6.0f;                // drifts up this far over its life
+const float veilMoteSwayPx = 0.8f;                // gentle side-to-side drift
+const float veilMoteScatterPx = 3.0f;             // spawn offset round the site centre
+const Vector2f veilMoteSize(1.0f, 1.0f);          // 1px: smaller than a 2px barb
+const Color veilMoteColor(214, 222, 226);         // pale silver, mixed a little toward the race tint
+const float veilMoteRaceTint = 0.3f;
+const uint8_t veilMoteMaxAlpha = 80;              // low alpha: a hint on the dark green, never a marker
+const float veilRingTint = 0.35f;                 // share of raceEventColors in a soul-drawn birth ring: subtle, still cream
+const int veilOmenCooldownTicks = 4 * ticksPerMinute;   // at most one omen line per 4 min at 1x
+const int veilOmenOneIn = 3;                      // an eligible omen fires only 1 in this many times
+const Color veilOmenColor(176, 196, 204);         // pale ash-blue: greyer than dusk blue, apart from prowler/race tints
 
 const int eventMaxLines = 5;              // ticker shows (and stores) at most this many events
 const int eventFadeTicks = 300;           // frames an event stays on screen (~5s at 60fps)
@@ -3797,8 +3815,15 @@ struct veilState {
     int slowedBirths = 0;         // births the veil held back (for phase 2 omens)
     int lastSlowedRace = -1;      // house race of the last held-back birth
     int lastDrawnRace = -1;       // race of the soul the last birth drew, -1 if none (phase 2 ring tint)
+    int omenCooldown = 0;         // R50-F1b: ticks until the next omen line may show
+    int moteTimer = 0;            // R50-F1b: mote spawn pass runs once per veilStepTicks
 };
 veilState veil;
+// R50-F1b: own vectors, values only (the name points into the static name table, never at a barb)
+struct veilSite {Vector2f pos; int race = 0; const char* name = ""; bool shimmered = false;};
+struct veilMote {Vector2f pos; int race = 0; int age = 0; float phase = 0.0f;};
+vector<veilSite> veilSites;
+vector<veilMote> veilMotes;
 
 int veilCell(int cx, int cy) { return clamp(cy, 0, veilGridN - 1) * veilGridN + clamp(cx, 0, veilGridN - 1); }
 int veilCellX(Vector2f p) { return clamp((int)(p.x / veilCellPx), 0, veilGridN - 1); }
@@ -3892,6 +3917,56 @@ void veilTick() {
         veil.pool[r] = total;
     }
     veil.front = dst;
+}
+
+// R50-F1b: a rare omen line. Every omen shares one cooldown and fires only 1 in veilOmenOneIn eligible times.
+bool veilOmen(const string& text) {
+    if (veil.omenCooldown > 0) return false;
+    if (uniform_int_distribution<int>(0, veilOmenOneIn - 1)(gen) != 0) return false;
+    veil.omenCooldown = veilOmenCooldownTicks;
+    printf("VEIL OMEN - %s\n", text.c_str());
+    logEvent(text, veilOmenColor);
+    return true;
+}
+
+// R50-F1b: called from removeBarb() only, beside veilDeposit, with everything copied by value
+void veilAddSite(int race, Vector2f p, const char* name) {
+    if ((int)veilSites.size() >= veilSiteMax) veilSites.erase(veilSites.begin());   // oldest-first eviction
+    veilSite s;
+    s.pos = p;
+    s.race = clampRace(race);
+    s.name = name ? name : "";
+    veilSites.push_back(s);
+}
+
+// R50-F1b: ages motes every tick; once per veilStepTicks each site whose soul lingers may raise a mote (capped),
+// and sites whose soul has thinned out are forgotten.
+void veilOmenTick() {
+    if (veil.omenCooldown > 0) veil.omenCooldown--;
+    for (auto& m : veilMotes) m.age++;
+    for (int i = (int)veilMotes.size() - 1; i >= 0; i--)
+        if (veilMotes[i].age >= veilMoteTicks) swapRemove(veilMotes, i);
+    if (++veil.moteTimer < veilStepTicks) return;
+    veil.moteTimer = 0;
+    static uniform_real_distribution<float> roll(0.0f, 1.0f);
+    static uniform_real_distribution<float> scatter(-veilMoteScatterPx, veilMoteScatterPx);
+    for (int i = (int)veilSites.size() - 1; i >= 0; i--) {
+        veilSite& s = veilSites[i];
+        float local = veilLocal(s.race, s.pos);
+        if (local < veilSiteQuietBelow) { veilSites.erase(veilSites.begin() + i); continue; }
+        if ((int)veilMotes.size() >= veilMoteMax) continue;
+        float fill = min(1.0f, local / veilFullLocal);
+        if (roll(gen) >= fill / veilMoteOneIn) continue;
+        veilMote m;
+        m.pos = s.pos + Vector2f(scatter(gen), scatter(gen) * 0.5f);
+        m.race = s.race;
+        m.phase = roll(gen) * 6.2832f;
+        veilMotes.push_back(m);
+        if (!s.shimmered) {
+            s.shimmered = true;
+            veilOmen(string("Something shimmers where ") + s.name + " fell");
+        }
+    }
 }
 
 // Called from removeBarb() only. The stone stands where the barb's feet were, nudged off any stone already there.
@@ -6828,7 +6903,7 @@ void millFrameTick() {
     }
 }
 
-struct birthRing {Vector2f pos; int age = 0;};
+struct birthRing {Vector2f pos; int age = 0; int soulRace = -1;};   // R50-F1b: race of the drawn soul, -1 = untinted
 
 int nextBarbId = 0;
 
@@ -6959,6 +7034,8 @@ void drawBirthRings(RenderWindow& window, const vector<birthRing>& rings) {
         float t = (float)r.age / birthRingTicks;
         float rad = birthRingStartRadius + (birthRingEndRadius - birthRingStartRadius) * t;
         Color col = birthRingColor;
+        if (r.soulRace >= 0 && r.soulRace < raceCount)   // R50-F1b: a soul-drawn birth leans faintly toward that race
+            col = lerpColor(birthRingColor, raceEventColors[r.soulRace], veilRingTint);
         col.a = (uint8_t)(birthRingMaxAlpha * (1.0f - t));
         c.setRadius(rad);
         c.setOrigin({rad, rad});
@@ -6966,6 +7043,24 @@ void drawBirthRings(RenderWindow& window, const vector<birthRing>& rings) {
         c.setOutlineColor(col);
         window.draw(c);
     }
+}
+
+// R50-F1b: veil motes, world layer under the day/night overlay. One batched draw; 1px, low alpha, a sin fade in/out
+// with a soft shimmer, rising and swaying a little. Aged in veilOmenTick (sim ticks), so they hold still while paused.
+void drawVeilMotes(RenderWindow& window, const FloatRect& camRect) {
+    if (veilMotes.empty()) return;
+    static VertexArray va(PrimitiveType::Triangles);
+    va.clear();
+    for (auto& m : veilMotes) {
+        float t = (float)m.age / veilMoteTicks;
+        Vector2f p = m.pos + Vector2f(veilMoteSwayPx * sin(m.phase + m.age * 0.05f), -veilMoteRisePx * t);
+        if (!camRect.contains(p)) continue;
+        float shimmer = 0.65f + 0.35f * sin(m.phase + m.age * 0.3f);
+        Color c = lerpColor(veilMoteColor, raceEventColors[clampRace(m.race)], veilMoteRaceTint);
+        c.a = (uint8_t)(veilMoteMaxAlpha * sin(3.14159f * t) * shimmer);
+        pushQuad(va, snapPx(p), veilMoteSize, c);
+    }
+    if (va.getVertexCount() > 0) window.draw(va);
 }
 
 // Catch rings reuse the birthRing record: one expanding ripple where the line meets the water, per fish landed
@@ -7775,6 +7870,7 @@ void removeBarb(vector<barb>& barbs, vector<RectangleShape>& squares, int i,
            isGentry(b) ? "Gentry" : "Commoner", b.id, (int)barbs.size() - 1);
     addGrave(b, squares[i]);   // R47-F9: copied out by value; nothing in graves points back at barbs
     veilDeposit(b.race, squares[i].getPosition() + squares[i].getSize() / 2.0f, veilSoulPerDeath);   // R50-F1a: by value
+    veilAddSite(b.race, squares[i].getPosition() + squares[i].getSize() / 2.0f, b.name);   // R50-F1b: mote site, by value
     b.homeHouse = -1;
     clearRoute(b);   // R39-F1: the route lives in the struct; the swapped-in barb keeps its own route
     swapRemove(barbs, i);
@@ -8658,6 +8754,7 @@ void barbspawner(vector<RectangleShape>& squares, vector<barb>& barbs, const vec
                 veil.slowedBirths++;
                 veil.lastSlowedRace = r;
                 printf("VEIL - %s birth held back (factor %.2f, %d held)\n", racePlurals[r], veilFactor, veil.slowedBirths);
+                veilOmen(string(racePlurals[r]) + ": the air is still here");   // R50-F1b: rare, shared cooldown
                 continue;   // nothing paid: the next roll may succeed
             }
         }
@@ -8665,6 +8762,11 @@ void barbspawner(vector<RectangleShape>& squares, vector<barb>& barbs, const vec
         spend(rs, 0, 0, birthFoodCost);
         makeBarb(Vector2i((int)birthSpot.x, (int)birthSpot.y), barbs, squares, rings, houses[i].id, houses[i].race);   // R28-F1: born into the house's clan
         veil.lastDrawnRace = veilDraw(birthSpot, veilBirthDraw);   // R50-F1a: -1 if no soul was near
+        if (veil.lastDrawnRace >= 0 && !rings.empty()) {   // R50-F1b: makeBarb just pushed this birth's ring
+            rings.back().soulRace = veil.lastDrawnRace;
+            if (veil.lastDrawnRace != r)
+                veilOmen(string(barbs.back().name) + " is born with old eyes (" + racePlurals[veil.lastDrawnRace] + ")");
+        }
         logEvent(string(barbs.back().name) + " the " + traitOf(barbs.back()).name + " is born (pop " + to_string(barbs.size()) + ")" +
                  (paid > 0 ? " -" + to_string(paid) + " food" : ""));
         if (paid > 0) foodFlashFrames = birthFlashFrames;
@@ -10537,6 +10639,7 @@ int main() {
                 traderTick(activeTrader, barbs, stores);
                 graveTick(barbs, squares);   // R47-F9: morale term per race, before hungerTick() reads it
                 veilTick();   // R50-F1a: throttled diffusion/decay of the hidden soul-ether
+                veilOmenTick();   // R50-F1b: death-site motes and the omen cooldown
                 hungerTick(barbs);
                 trailTick();
                 birdTick(birds, birdHeading, squares, barbs);
@@ -10685,6 +10788,7 @@ int main() {
                 drawBar(window, Vector2f(b.targetx - 10, b.targety - 16), (float)b.timer / mineTicksFor(b), pal.barMine);   // R41-F2: tempered scale
 	}
 	drawBirthRings(window, birthRings);
+	drawVeilMotes(window, camRect);   // R50-F1b: faint shimmer over recent death sites, under the overlay
 	drawCatchRings(window, catchRings);
 	drawQuarterPulses(window);   // R47-F10: step dust ring, world layer under the overlay
 	drawShinobiPuffs(window, shinobiPuffs);   // world layer, under the day/night overlay
