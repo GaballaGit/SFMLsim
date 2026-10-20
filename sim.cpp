@@ -1066,9 +1066,18 @@ const Color stockEmptyRaceColor(120, 118, 108); // a race with no living members
 // stays >= 210-63 = 147 clear of the village clearing (50). quarterLayoutSweepOk() re-checks this at startup over a full
 // turn of rotations at both radii, so quarterLayoutOk() always passes and the fallback should never fire.
 // Lakes are placed after the quarters and keep quarterClearRadius + lakeMinGap off each one.
-const float raceMinSeparation = 185.0f;      // min distance between two races' crates (startup check)
+const float raceMinSeparation = 260.0f;      // min distance between two races' crates (startup check; R47-F3: was 185)
+const bool quarterForceFallback = false;     // R47-F3 test switch: true skips the random layout so the fixed fallback runs
+// R47-F3 Frontier Spacing: each race's frontier is the disc of frontierRadius round its crate centre. Crates are at least
+// raceMinSeparation apart, so frontiers never touch and the land between them is a gap the trader walks through. The wide
+// work look (barbWorkFallbackRadius) skips targets inside another race's frontier. Shown only as a faint dotted circle
+// on the minimap; nothing is drawn in the main view.
+const float frontierRadius = raceMinSeparation / 2.0f;   // 130 = houseSpreadFar, so homesteads stay inside their frontier
+const float frontierMinimapDotGap = 3.0f;    // minimap px between border dots (1px each)
+const uint8_t frontierMinimapAlpha = 80;     // faint: under the house/crate/barb dots on the dark backing
 const float quarterMinRadius = 210.0f;       // crate centre distance from the campfire (R44-F4b: was 165)
 const float quarterMaxRadius = 250.0f;       // (R44-F4b: was 200)
+const float traderGapRadius = quarterMaxRadius;   // R47-F3: trader's waypoint on a gap's bisector, this far from the campfire
 const int quarterPlaceTries = 50;            // random layouts tried before the fixed fallback layout
 const int quarterSweepSteps = 360;           // R47-F2: startup check of quarterLayoutOk's rules at every 1 deg rotation
 const float quarterHouseRadius = 56.0f;      // house spot within this of the crate centre (+25% over R30-F1's 45)
@@ -1787,29 +1796,54 @@ bool layoutDiscOk(Vector2f c, float rad) {
     return hypot(c.x - villageCenter.x, c.y - villageCenter.y) >= sqrt(clearRadiusSq) + rad;
 }
 
-bool quarterLayoutOk() {
+// R47-F3: a candidate layout (crate top-lefts only). Computed and checked first; placeQuarters() commits exactly one.
+struct quarterLayout {Vector2f crate[raceCount];};
+
+quarterLayout quarterLayoutAt(float a0, float r) {
+    quarterLayout L;
+    for (int k = 0; k < raceCount; k++) {
+        float a = a0 + 6.2831853f * k / raceCount;
+        L.crate[k] = snapPx(Vector2f(villageCenter.x + cos(a) * r, villageCenter.y + sin(a) * r) - storehouseSize / 2.0f);
+    }
+    return L;
+}
+
+bool quarterLayoutOk(const quarterLayout& L) {
     for (int a = 0; a < raceCount; a++) {
-        Vector2f c = quarterCentre(a);
-        if (!layoutDiscOk(c, quarterClearRadius)) return false;
+        if (!layoutDiscOk(L.crate[a] + storehouseSize / 2.0f, quarterClearRadius)) return false;
         for (int b = a + 1; b < raceCount; b++) {
-            Vector2f d = storehousePos[a] - storehousePos[b];
+            Vector2f d = L.crate[a] - L.crate[b];
             if (hypot(d.x, d.y) < raceMinSeparation) return false;
         }
     }
     return true;
 }
 
+// R47-F3: the gaps between frontiers, set when the layout is committed. Gap i bisects the i-th and next crate in angle
+// order round villageCenter; frontierGapOf[race] holds the two gaps flanking that race's crate.
+float frontierGapAngle[raceCount] = {};
+int frontierGapOf[raceCount][2] = {};
+
+// R47-F3: true if p lies inside the frontier of a race other than race (the wide work look skips such targets)
+bool inOtherFrontier(Vector2f p, int race) {
+    for (int r = 0; r < raceCount; r++) {
+        if (r == race) continue;
+        Vector2f d = p - quarterCentre(r);
+        if (d.x * d.x + d.y * d.y < frontierRadius * frontierRadius) return true;
+    }
+    return false;
+}
+
 // Places the crates once, before anything else is spawned: a random rotation/radius of an even 3-way split, checked by
 // quarterLayoutOk(); if no try passes, the fixed layout (human north, others 120 deg apart) is used. Builds the rings.
+// R47-F3: every candidate is computed and checked without touching any state; only the chosen layout is committed.
 bool quarterFallbackUsed = false;   // INBOX-F3: set by placeQuarters() when the fixed layout was used
 void placeQuarters() {
     quarterFallbackUsed = false;
     uniform_real_distribution<float> ang(0.0f, 6.2831853f), rad(quarterMinRadius, quarterMaxRadius);
-    auto layout = [](float a0, float r) {
+    auto commit = [](const quarterLayout& L) {
         for (int k = 0; k < raceCount; k++) {
-            float a = a0 + 6.2831853f * k / raceCount;
-            Vector2f c(villageCenter.x + cos(a) * r, villageCenter.y + sin(a) * r);
-            storehousePos[k] = snapPx(c - storehouseSize / 2.0f);
+            storehousePos[k] = L.crate[k];
             smokehousePos[k] = storehousePos[k] + smokehouseCrateOffset;   // INBOX2-F1: hut beside the crate
             Vector2f kp = storehousePos[k] + keepCrateOffset;              // R31-F1: keep below the crate
             keeps[k] = keep{-1, k, (int)kp.x, (int)kp.y, false};
@@ -1824,27 +1858,46 @@ void placeQuarters() {
         wallsegs.clear();
     };
     // R47-F2: with the village at the map centre, check quarterLayoutOk() at every rotation and at both radius limits
-    // (only the crate positions are set; the real layout below overwrites them)
+    // (R47-F3: candidates only, no state is written)
     int sweepFails = 0;
     for (float r : {quarterMinRadius, quarterMaxRadius})
-        for (int s = 0; s < quarterSweepSteps; s++) {
-            float a0 = 6.2831853f * s / quarterSweepSteps;
-            for (int k = 0; k < raceCount; k++) {
-                float a = a0 + 6.2831853f * k / raceCount;
-                storehousePos[k] = snapPx(Vector2f(villageCenter.x + cos(a) * r, villageCenter.y + sin(a) * r) - storehouseSize / 2.0f);
-            }
-            if (!quarterLayoutOk()) sweepFails++;
-        }
-    printf("Race quarters: rotation sweep %s (%d of %d layouts fail)\n", sweepFails ? "FAILS" : "ok", sweepFails, 2 * quarterSweepSteps);
+        for (int s = 0; s < quarterSweepSteps; s++)
+            if (!quarterLayoutOk(quarterLayoutAt(6.2831853f * s / quarterSweepSteps, r))) sweepFails++;
+    printf("Race quarters: rotation sweep %s (%d of %d layouts fail, min separation %.0f)\n", sweepFails ? "FAILS" : "ok",
+           sweepFails, 2 * quarterSweepSteps, raceMinSeparation);
+    // R47-F3: the fallback is computed and checked up front, so every start reports whether it would hold
+    quarterLayout fixedLayout = quarterLayoutAt(-1.5707963f, (quarterMinRadius + quarterMaxRadius) / 2.0f);
+    bool fixedOk = quarterLayoutOk(fixedLayout);
+    printf("Race quarters: fixed fallback layout %s\n", fixedOk ? "ok" : "FAILS");
+    quarterLayout chosen;
     bool ok = false;
-    for (int t = 0; t < quarterPlaceTries && !ok; t++) {
-        layout(ang(gen), rad(gen));
-        ok = quarterLayoutOk();
+    for (int t = 0; t < quarterPlaceTries && !ok && !quarterForceFallback; t++) {
+        chosen = quarterLayoutAt(ang(gen), rad(gen));
+        ok = quarterLayoutOk(chosen);
     }
     if (!ok) {
-        layout(-1.5707963f, (quarterMinRadius + quarterMaxRadius) / 2.0f);
-        printf("Race quarters: random layout failed the check, using the fixed layout (%s)\n", quarterLayoutOk() ? "ok" : "STILL FAILS");
+        chosen = fixedLayout;
+        printf("Race quarters: random layout failed the check%s, using the fixed layout (%s)\n",
+               quarterForceFallback ? " (forced)" : "", fixedOk ? "ok" : "STILL FAILS");   // once: placeQuarters runs once per start
         quarterFallbackUsed = true;   // INBOX-F3: main logs one ticker line per layout
+    }
+    commit(chosen);
+    // R47-F3: frontier gaps from the committed crates
+    float crateAng[raceCount];
+    int order[raceCount];
+    for (int k = 0; k < raceCount; k++) {
+        Vector2f d = quarterCentre(k) - villageCenter;
+        crateAng[k] = atan2(d.y, d.x);
+        order[k] = k;
+    }
+    sort(order, order + raceCount, [&](int a, int b) { return crateAng[a] < crateAng[b]; });
+    for (int i = 0; i < raceCount; i++) {
+        int a = order[i], b = order[(i + 1) % raceCount];
+        float lo = crateAng[a], hi = crateAng[b];
+        if (hi <= lo) hi += 6.2831853f;
+        frontierGapAngle[i] = (lo + hi) / 2.0f;
+        frontierGapOf[a][1] = i;
+        frontierGapOf[b][0] = i;
     }
     for (int k = 0; k < raceCount; k++)
         printf("Race quarter %s: crate at (%.0f, %.0f)\n", raceDefs[k].name, storehousePos[k].x, storehousePos[k].y);
@@ -2293,6 +2346,8 @@ struct trader {
     int race = -1;            // POL-F4: race served this visit; -1 = nobody (campfire, buys nothing)
     bool buysFood = false;    // POL-F4: food-for-wood fallback (no race could pay in stone)
     bool toStore = false;     // POL-F4: walking to/at race's storehouse; false = campfire
+    Vector2f gap;             // R47-F3: waypoint in the gap between two frontiers, walked through on the way in and out
+    bool pastGap = false;     // R47-F3: reached the gap on this leg (reset when leaving)
 };
 int raceCooldown[raceCount] = {};   // POL-F4: visits left before a race can be served again
 
@@ -3635,6 +3690,7 @@ int traderPickRace(const vector<barb>& barbs, bool food) {
 }
 
 Vector2f traderGoal(const trader& t) {
+    if (!t.pastGap) return t.gap;   // R47-F3: each leg first walks the gap between frontiers
     if (t.phase == trader::Leaving) return t.exit;
     return t.toStore ? storehousePos[t.race] + traderStoreOffset : villageCenter;
 }
@@ -3651,13 +3707,19 @@ void traderTick(optional<trader>& tr, const vector<barb>& barbs, const storehous
         for (int r = 0; r < raceCount; r++) if (raceCooldown[r] > 0) raceCooldown[r]--;
         if (t.race >= 0) raceCooldown[t.race] = traderRaceCooldownVisits;
         t.toStore = t.race >= 0 && stores[t.race].built;
-        float along = clamp((float)distrib(gen), mapEdgeInset, worldSize - mapEdgeInset);
-        switch (uniform_int_distribution<int>(0, 3)(gen)) {
-            case 0:  t.exit = Vector2f(-10.0f, along); break;
-            case 1:  t.exit = Vector2f(worldSize + 10.0f, along); break;
-            case 2:  t.exit = Vector2f(along, -10.0f); break;
-            default: t.exit = Vector2f(along, worldSize + 10.0f); break;
-        }
+        // R47-F3: enter and leave along a gap's bisector (one flanking the served race; any gap for the campfire), from
+        // the map edge 10px out, through a waypoint traderGapRadius from the campfire, so the walk stays between frontiers
+        int g = t.race >= 0 ? frontierGapOf[t.race][uniform_int_distribution<int>(0, 1)(gen)]
+                            : uniform_int_distribution<int>(0, raceCount - 1)(gen);
+        Vector2f dir(cos(frontierGapAngle[g]), sin(frontierGapAngle[g]));
+        t.gap = villageCenter + dir * traderGapRadius;
+        float reachX = dir.x > 0.0f ? (worldSize + 10.0f - villageCenter.x) / dir.x
+                     : dir.x < 0.0f ? (-10.0f - villageCenter.x) / dir.x : numeric_limits<float>::max();
+        float reachY = dir.y > 0.0f ? (worldSize + 10.0f - villageCenter.y) / dir.y
+                     : dir.y < 0.0f ? (-10.0f - villageCenter.y) / dir.y : numeric_limits<float>::max();
+        t.exit = villageCenter + dir * min(reachX, reachY);
+        if (reachX < reachY) t.exit.y = clamp(t.exit.y, mapEdgeInset, worldSize - mapEdgeInset);   // keep off the corners
+        else                 t.exit.x = clamp(t.exit.x, mapEdgeInset, worldSize - mapEdgeInset);
         t.shape.setSize(traderSize);
         t.shape.setFillColor(traderColor);
         t.shape.setPosition(t.exit);
@@ -3695,6 +3757,7 @@ void traderTick(optional<trader>& tr, const vector<barb>& barbs, const storehous
     if (t.phase == trader::Trading) {
         if (++t.timer >= traderTradeTicks) {
             t.phase = trader::Leaving;
+            t.pastGap = false;   // R47-F3: back out through the same gap
             printf("Trader leaving\n");
             logEvent("Trader leaving");
         }
@@ -3704,6 +3767,10 @@ void traderTick(optional<trader>& tr, const vector<barb>& barbs, const storehous
     Vector2f diff = goal - t.shape.getPosition();
     float dSq = diff.x * diff.x + diff.y * diff.y;
     if (dSq < 1.0f) {
+        if (!t.pastGap) {   // R47-F3: through the gap; head on to the crate/campfire (or the edge when leaving)
+            t.pastGap = true;
+            return;
+        }
         if (t.phase == trader::Leaving) {
             tr.reset();
             return;
@@ -4400,6 +4467,17 @@ void drawMinimap(RenderWindow& window, VertexArray& va, const View& worldView,
 
     Vector2f inner = r.position + Vector2f(MM_BORDER_PX, MM_BORDER_PX);
     va.clear();
+    // R47-F3: each race's frontier as a faint dotted circle in its lifted crate colour, under every other dot
+    float frontierPx = frontierRadius * minimapScale();
+    int frontierDots = max(8, (int)round(6.2831853f * frontierPx / frontierMinimapDotGap));
+    for (int k = 0; k < raceCount; k++) {
+        Color col = MM_STORE_COLORS[k];
+        col.a = frontierMinimapAlpha;
+        for (int i = 0; i < frontierDots; i++) {
+            float a = 6.2831853f * i / frontierDots;
+            minimapDot(va, inner, quarterCentre(k) + Vector2f(cos(a), sin(a)) * frontierRadius, 1.0f, col);
+        }
+    }
     for (int i = 0; i < (int)houses.size(); i++)
         minimapDot(va, inner, houseshapes[i].getPosition() + houseshapes[i].getSize() / 2.0f, MM_HOUSE_PX, storehouseColors[houses[i].race]);
     for (int k = 0; k < raceCount; k++)
@@ -7892,14 +7970,18 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
             // the bigger map head for the nearest tree, rock or ripe bush instead of wandering empty ground
             if (best == -1 && !bestIsBush && !b.moving && !b.deertargeting) {
                 float wTreeDSq, wRockDSq, wBushDSq;
+                // R47-F3: race-aware: the wide look never reaches into another race's frontier
                 int wTree = findNearestTree(tris, bpos, barbWorkFallbackRadius,
-                                        [&](int i) { return trees[i].dying || (treeClaim[i] != -1 && treeClaim[i] != j); }, &wTreeDSq);
+                                        [&](int i) { return trees[i].dying || (treeClaim[i] != -1 && treeClaim[i] != j)
+                                                            || inOtherFrontier(tris[i].getPosition() + treeWorkOffset, b.race); }, &wTreeDSq);
                 int wRock = findNearest(bpos, barbWorkFallbackRadius, (int)rocks.size(),
                                         [&](int k) { return octs[k].getPosition() + rockWorkOffset; },
-                                        [&](int k) { return rocks[k].dying || (rockClaim[k] != -1 && rockClaim[k] != j); }, &wRockDSq);
+                                        [&](int k) { return rocks[k].dying || (rockClaim[k] != -1 && rockClaim[k] != j)
+                                                            || inOtherFrontier(octs[k].getPosition() + rockWorkOffset, b.race); }, &wRockDSq);
                 int wBush = findNearest(bpos, barbWorkFallbackRadius, (int)bushes.size(),
                                         [&](int k) { return bushWorkSpot(bushshapes[k]); },
-                                        [&](int k) { return !bushes[k].ripe || bushes[k].picking; }, &wBushDSq);
+                                        [&](int k) { return !bushes[k].ripe || bushes[k].picking
+                                                            || inOtherFrontier(bushWorkSpot(bushshapes[k]), b.race); }, &wBushDSq);
                 float wTreeScore = wTree != -1 ? wTreeDSq / (treeW * treeW) : notFound;
                 float wRockScore = wRock != -1 ? wRockDSq / (rockW * rockW) : notFound;
                 float wBushScore = wBush != -1 ? wBushDSq / (bushW * bushW) : notFound;
