@@ -1139,6 +1139,29 @@ const float MM_RUIN_PX = 3.0f;
 const Color MM_RUIN_COLOR(206, 198, 176);
 const float MM_CAMP_PX = 2.0f;
 
+// Expeditions (R45-F2, phase 1): one party at a time of expPartySize same-race barbs walks from its crate to its race's
+// lean-to, delves at the ruin stones, and walks home with a relic (or nothing). Rations are paid from the race's food.
+const int expPartySize = 2;                // members per party, all one race
+const int expRelicCap = 3;                 // relics a race can ever bring home; a capped race sends no more parties
+const int expRationFood = 4;               // food taken from the race's stock at departure; leftovers go back on return
+const int expFoodReserve = 6;              // the race keeps at least this much food after paying the rations
+const int expLaunchOneIn = 2400;           // 1-in-N per tick that a launch is tried while no party is out
+const int expFirstDelayTicks = 7200;       // ~2 min at 1x before the first party can leave
+const int expCooldownTicks = 5400;         // after any party ends (home or broken up) before the next can leave
+const float expRecruitRadius = 140.0f;     // members are the nearest eligible barbs within this of their crate
+const int expMinHealth = 60;               // a wounded barb stays home
+const int expDelveTicks = 600;             // ~10s at 1x of digging once both members stand at their stones
+const float expRelicChance = 0.6f;         // per delve; otherwise the party comes home empty-handed
+const int expRelicStone = 3;               // modest reward: worked stone the relic is set in, added to the race's stock
+const float expMemberGapPx = 4.0f;         // members stand this far apart at the camp and the crate
+const float expWolfRadius = 24.0f;         // a wolf this close (centre to centre) to a member on the road wounds it
+const int expWolfWoundHp = 25;             // hp a wolf takes per wound
+const int expWolfMinHp = 20;               // wolves wound, never kill: a wound never takes a member below this
+const int expWolfWoundCooldownTicks = 300; // ticks between wounds on one party
+const Color relicGlintColor(236, 224, 178);    // 1px relic beside the carrier on the walk home: pale cream gold
+const Color relicGlintDimColor(170, 158, 120); // twinkle low phase
+const int relicGlintFrames = 12;               // glint alternates bright/dim every this many frames
+
 // Lakeside angling (R19-F1): a barb with no tree/rock/bush in reach walks to a free cached shore point and fishes.
 // One angler per shore point; stand spots sit on the bank and are never lakeClear()-checked (they are inside the keep-clear zone).
 const float fishSearchRadius = 60.0f;      // wider than barbWorkSearchRadius: lakes are few and away from the village
@@ -2064,6 +2087,7 @@ struct barb {
     int temperTimer = 0;         // R41-F2: work ticks at the forge; separate from timer; cleared by clearTemper()
     bool temperPaid = false;     // R41-F2: kTemperStoneCost already taken; refunded by clearTemper() unless the temper finished
     int toolCharges = 0;         // R41-F2: tempered rock mines left; set on a finished temper, reset by clearTemper() and makeBarb()
+    bool onExpedition = false;   // R45-F2: the one expedition flag; exclusive state owned by expeditionTick(), set/cleared only there
 };
 // R39-F1: the one route reset, called wherever moving/movingbspot is cleared and before a barb is swapRemoved
 void clearRoute(barb& b) {
@@ -2072,6 +2096,34 @@ void clearRoute(barb& b) {
     b.route.planned = false;
 }
 bool barbHidden(const barb& b) { return b.garrisoned && b.garrisonInside; }   // INBOX-F1
+// R45-F2: the one eligibility gate every job selector checks: false while bellTick() (garrison) or expeditionTick() owns the barb
+bool barbAvailable(const barb& b) { return !b.garrisoned && !b.onExpedition; }
+
+// R45-F2: the one party. Members are held by barb id (never an index) and re-resolved by expeditionTick() every tick;
+// removeBarb() invalidates a dying member's id through expeditionMemberLost(), so the party dissolves the next tick.
+struct expeditionParty {
+    enum Phase {Out, Delve, Back} phase = Out;
+    bool active = false;
+    int race = -1;
+    int memberIds[expPartySize] = {};
+    Vector2f delveSpot[expPartySize];   // each member's stand spot at its own ruin stone, picked at launch
+    int rations = 0;                    // food carried; a hungry member eats one
+    int timer = 0;                      // delve ticks, counted once every member stands at its stone
+    int woundCooldown = 0;
+    bool relic = false;                 // found on the delve; memberIds[0] carries it home
+    const char* lostName = nullptr;     // name of a member removed by removeBarb() (names point into static tables)
+};
+expeditionParty party;
+int raceRelics[raceCount] = {0, 0, 0};   // relics each race has brought home, capped at expRelicCap
+int expeditionCooldown = expFirstDelayTicks;
+void expeditionMemberLost(const barb& b) {
+    if (!party.active || !b.onExpedition) return;
+    for (auto& id : party.memberIds) if (id == b.id) { id = -1; party.lostName = b.name; }
+}
+// R45-F2: the relic carrier on the walk home, for drawBarbs(); -1 = nobody
+int relicCarrierId() {
+    return party.active && party.relic && party.phase == expeditionParty::Back ? party.memberIds[0] : -1;
+}
 
 const raceDef& raceOf(const barb& b) { return raceDefs[b.race]; }
 const traitDef& traitOf(const barb& b) { return traitDefs[b.trait]; }
@@ -2335,6 +2387,9 @@ Color barbColor(const barb& b) {
 // Same priority as barbColor() so the tooltip always matches the colour on screen
 const char* barbTaskName(const barb& b) {
     if (b.garrisoned) return b.garrisonInside ? "sheltering" : "running to shelter";   // INBOX-F1
+    if (b.onExpedition)   // R45-F2
+        return party.phase == expeditionParty::Out ? "expedition: setting out"
+             : party.phase == expeditionParty::Delve ? "expedition: delving" : "expedition: heading home";
     if (b.deertargeting) return b.hasSpear ? "hunting (spear)" : "hunting";
     if (b.building) return "building";
     if (b.tempering) return "tempering pick";   // R41-F2
@@ -2389,7 +2444,7 @@ void deerkilling(vector<deer>& deers, vector<RectangleShape>& deershape, vector<
 		for (int j = 0; j < (int)barbs.size(); ++j) {
 			auto& b = barbs[j];
 			auto& sq = squares[j];
-			if (b.garrisoned || b.building || b.movingbspot || b.chopping || b.timer > 0 || b.carryKind != carryNone || b.tempering) continue;   // R29-F1: haulers finish the trip; R41-F2: so do temperers
+			if (!barbAvailable(b) || b.building || b.movingbspot || b.chopping || b.timer > 0 || b.carryKind != carryNone || b.tempering) continue;   // R29-F1: haulers finish the trip; R41-F2: so do temperers; R45-F2
 			if (!b.deertargeting) {
 				Vector2f bpos = sq.getPosition();
 				float dx = deerpos.x - bpos.x, dy = deerpos.y - bpos.y;
@@ -3001,7 +3056,7 @@ void hungerTick(vector<barb>& barbs) {
                 hungryLogCooldown = eventHungryCooldownTicks;
             }
         }
-        if (isHungry(b) && !isGentry(b)) hungryCommoners[clampRace(b.race)]++;
+        if (isHungry(b) && !isGentry(b) && !b.onExpedition) hungryCommoners[clampRace(b.race)]++;   // R45-F2: away members eat rations
     }
     // Pass 2 (R24-F1): eating, Gentry first. While a Commoner is hungry, Gentry leave gentryFoodReserve
     // so the Commoners are never shut out of the larder entirely.
@@ -3019,10 +3074,10 @@ void hungerTick(vector<barb>& barbs) {
     };
     for (auto& b : barbs) {
         int gentryKeep = hungryCommoners[clampRace(b.race)] > 0 ? gentryFoodReserve : 0;
-        if (isGentry(b) && isHungry(b) && stockOf(b).food > gentryKeep) eat(b, gentryKeep);
+        if (isGentry(b) && isHungry(b) && !b.onExpedition && stockOf(b).food > gentryKeep) eat(b, gentryKeep);
     }
     for (auto& b : barbs)
-        if (!isGentry(b) && isHungry(b) && stockOf(b).food > 0) eat(b, 0);
+        if (!isGentry(b) && isHungry(b) && !b.onExpedition && stockOf(b).food > 0) eat(b, 0);   // R45-F2: rations only, in expeditionTick()
     // Pass 3 (R30-F5): whoever is still hungry after the meal goes on starving; damage only past the grace period.
     // Health is only lowered here; deaths are removed by starveDeathTick() at the end of the tick.
     for (auto& b : barbs) {
@@ -3078,6 +3133,7 @@ fishPose fishPoseOf(const barb& b, const RectangleShape& sq) {
 void drawBarbs(RenderWindow& window, const vector<barb>& barbs, const vector<RectangleShape>& squares, int frame, float zoom) {
     RectangleShape body(barbBodySize), stripe(Vector2f(barbBodySize.x, barbStripeH)), tool(barbToolSize), hat, tip, dot(Vector2f(1.0f, 1.0f));
     bool showTraits = zoom >= traitDotMinZoom;
+    int carrierId = relicCarrierId();   // R45-F2
     static VertexArray lookVerts(PrimitiveType::Triangles);   // R35-F1: every race mark this frame, one draw after the loop
     lookVerts.clear();
     auto addLookQuad = [](Vector2f p, Vector2f sz, Color c) {
@@ -3219,6 +3275,11 @@ void drawBarbs(RenderWindow& window, const vector<barb>& barbs, const vector<Rec
             tool.setPosition(top - Vector2f(0.0f, spearTipSize.y));   // top edge = bodyTop - 2
             window.draw(tool);
             tool.setSize(barbToolSize);
+        }
+        if (b.id == carrierId) {   // R45-F2: 1px relic held low, one column out from the arm/spear column, twinkling
+            dot.setFillColor((frame / relicGlintFrames) % 2 == 0 ? relicGlintColor : relicGlintDimColor);
+            dot.setPosition(Vector2f(side + 1.0f, bodyTop + bodyH - 1.0f));
+            window.draw(dot);
         }
         if (zoom >= healthBarMinZoom && b.health < barbMaxHealth) {   // R30-F5: 1px bar under the feet, only when hurt
             float barX = base.x + floor((bodySize.x - healthBarW) / 2.0f), barY = feet + healthBarGap;
@@ -3733,7 +3794,7 @@ void drawOrderPips(RenderWindow& window, const View& worldView, float zoom, int 
     RectangleShape pip(orderPipSize);
     for (int i = 0; i < (int)squares.size() && i < (int)barbs.size(); i++) {
         const barb& b = barbs[i];
-        if (b.order == needNone || b.garrisoned || barbUnderground(b)) continue;   // R40-F1: no pip over an empty stand spot
+        if (b.order == needNone || !barbAvailable(b) || barbUnderground(b)) continue;   // R40-F1: no pip over an empty stand spot
         if (!all && b.id != hoveredBarb) continue;
         Vector2f base = snapPx(squares[i].getPosition());
         float feet = base.y + squares[i].getSize().y;
@@ -3857,7 +3918,7 @@ void drawBeacons(RenderWindow& window, const View& worldView, float zoom, int fr
     int count = 0;
     for (int i = 0; i < (int)barbs.size() && i < (int)squares.size() && count < beaconMaxCount; i++) {
         const barb& b = barbs[i];
-        if (!barbIdle(b) || b.garrisoned || barbHidden(b) || barbUnderground(b)) continue;
+        if (!barbIdle(b) || !barbAvailable(b) || barbHidden(b) || barbUnderground(b)) continue;   // R45-F2: a party member is not jobless
         FloatRect box(squares[i].getPosition(), squares[i].getSize());
         if (!view.findIntersection(box)) continue;
         appendBeacon(va, box, line, c);
@@ -4555,7 +4616,7 @@ void buildhouse(vector<barb>& barbs,vector<RectangleShape>& squares, vector<hous
     for (int i = 0; i < (int)squares.size(); i++) {
         auto& sq = squares[i];
         auto& b  = barbs[i];
-        if (b.garrisoned) continue;           // INBOX-F1: bellTick() owns this barb
+        if (!barbAvailable(b)) continue;      // INBOX-F1: bellTick() owns this barb; R45-F2: or expeditionTick()
         if (b.jobKind != jobNone) continue;   // buildshrine() / buildsmokehouse() / buildstall() / buildforge() / buildfield() own this barb
         if (b.chopping || (b.timer > 0 && !b.building)) continue;
         if (!b.movingbspot && !b.moving) {
@@ -4670,7 +4731,7 @@ void buildshrine(vector<barb>& barbs, vector<RectangleShape>& squares, const vec
     for (int i = 0; i < (int)squares.size() && i < (int)barbs.size(); i++) {
         auto& sq = squares[i];
         auto& b  = barbs[i];
-        if (b.garrisoned) continue;   // INBOX-F1: bellTick() owns this barb
+        if (!barbAvailable(b)) continue;   // INBOX-F1: bellTick() owns this barb; R45-F2: or expeditionTick()
         if (b.jobKind != jobNone && b.jobKind != jobShrine) continue; // buildsmokehouse() / buildstall() / buildforge() own this barb
         if (b.chopping || (b.timer > 0 && !b.building)) continue;
         if (!b.movingbspot && !b.moving) {
@@ -4768,7 +4829,7 @@ bool buildOneOff(vector<barb>& barbs, vector<RectangleShape>& squares, bool& cla
     for (int i = 0; i < (int)squares.size() && i < (int)barbs.size(); i++) {
         auto& sq = squares[i];
         auto& b  = barbs[i];
-        if (b.garrisoned) continue;   // INBOX-F1: bellTick() owns this barb
+        if (!barbAvailable(b)) continue;   // INBOX-F1: bellTick() owns this barb; R45-F2: or expeditionTick()
         if (onlyRace >= 0 && b.race != onlyRace) continue;
         if (!claimed) {
             if (b.jobKind != jobNone || b.chopping || b.timer > 0 || b.moving || b.movingbspot || b.building) continue;
@@ -5532,7 +5593,7 @@ void craftspear(vector<barb>& barbs, vector<RectangleShape>& squares, const forg
             if (pick < 0) return;
             tried[pick] = true;
             for (auto& b : barbs) {
-                if (b.garrisoned || b.race != pick || b.hasSpear || b.jobKind != jobNone || b.deertargeting || b.chopping || b.timer > 0
+                if (!barbAvailable(b) || b.race != pick || b.hasSpear || b.jobKind != jobNone || b.deertargeting || b.chopping || b.timer > 0
                     || b.moving || b.movingbspot || b.building) continue;
                 spend(stockOfRace(pick), spearWoodCost, spearStoneCost);   // POL-F3: paid up front by the crafter's race
                 b.spearPaid = true;
@@ -5775,7 +5836,7 @@ void shinobiTick(vector<barb>& barbs, vector<RectangleShape>& squares, const vec
     for (int i = 0; i < (int)barbs.size() && i < (int)squares.size(); i++) {
         barb& b = barbs[i];
         if (!b.shinobi) continue;
-        if (b.garrisoned || b.moving || b.chopping || b.building || b.movingbspot || b.deertargeting || b.timer > 0 || b.jobKind != jobNone) continue;
+        if (!barbAvailable(b) || b.moving || b.chopping || b.building || b.movingbspot || b.deertargeting || b.timer > 0 || b.jobKind != jobNone) continue;
         if (blinkChance(gen) != 0) continue;
         Vector2f from = squares[i].getPosition(), size = squares[i].getSize();
         for (int t = 0; t < shinobiBlinkTries; t++) {
@@ -5954,7 +6015,7 @@ void paveTick(vector<barb>& barbs, vector<RectangleShape>& squares) {
     float whoDSq = 0.0f;
     for (int i = 0; i < (int)barbs.size(); i++) {
         auto& b = barbs[i];
-        if (b.garrisoned || b.jobKind != jobNone || b.deertargeting || b.chopping || b.timer > 0
+        if (!barbAvailable(b) || b.jobKind != jobNone || b.deertargeting || b.chopping || b.timer > 0
             || b.moving || b.movingbspot || b.building) continue;
         if (!canAfford(stockOf(b), 0, paveStoneCost + houseStoneCost)) continue;
         Vector2f d = squares[i].getPosition() - bestCentre;
@@ -6533,6 +6594,7 @@ void removeBarb(vector<barb>& barbs, vector<RectangleShape>& squares, int i,
     barb& b = barbs[i];
     releaseBarbWork(b, sh, fg, stores, fields);   // garrison state (INBOX-F1) lives in the struct and goes with the swapRemove
     ungarrison(b);                                // R31-F3: the shared reset also frees any keep slot before the swapRemove
+    expeditionMemberLost(b);                      // R45-F2: invalidates its party id; expeditionTick() dissolves the party
     if (isLeader(b)) loseLeader(b.race);
     printf("BARB DIED - %s the %s (%s, %s), id %d - %d left\n", b.name, traitOf(b).name, raceOf(b).name,
            isGentry(b) ? "Gentry" : "Commoner", b.id, (int)barbs.size() - 1);
@@ -6674,6 +6736,7 @@ void bellTick(vector<barb>& barbs, vector<RectangleShape>& squares, const vector
             } else walkStep(b, sq);   // R39-F1
             continue;
         }
+        if (!barbAvailable(b)) continue;   // R45-F2: a party member is out at the ruins, not at the crate
         if (raceBell[b.race] == 0 || b.carryKind != carryNone) continue;   // haulers deposit first, then shelter
         Vector2f pos = sq.getPosition();
         Vector2f dq = pos - quarterCentre(b.race);
@@ -6784,7 +6847,7 @@ void rankRaceNeed(const vector<barb>& barbs, int r) {
 
 // INBOX-F2b: idle = no work, build, hunt, haul or job claim. Garrisoned barbs are never idle, so an order never touches shelter
 bool orderIdle(const barb& b) {
-    return !b.garrisoned && !b.chopping && !b.building && !b.movingbspot && !b.deertargeting && b.jobKind == jobNone && b.carryKind == carryNone && !b.tempering;
+    return barbAvailable(b) && !b.chopping && !b.building && !b.movingbspot && !b.deertargeting && b.jobKind == jobNone && b.carryKind == carryNone && !b.tempering;
 }
 
 // INBOX-F2b: right after the leader names its need, it hands that need as an individual order to idle members (not
@@ -6893,6 +6956,200 @@ int popCap(const vector<house>& houses) {
     return (int)houses.size() * popPerHouse;
 }
 
+// R45-F2: the one walk/work reset, on entry to and exit from an expedition. Eligible barbs hold no job, haul, hunt or
+// temper, so this only drops wander walks, stale targets and the route.
+void expeditionReset(barb& b) {
+    if (b.deertargeting) clearHunt(b);
+    b.deertargeting = false;
+    b.moving = b.chopping = b.building = b.movingbspot = false;
+    b.timer = 0;
+    clearRoute(b);
+    leaveMine(b);
+    b.stepTimer = 0;
+    b.target = targetNone;
+    b.targetBush = b.targetShore = -1;
+    b.targetx = b.targety = -1;
+    b.wanderX = b.wanderY = -1;
+}
+
+// R45-F2: may b join a party of race r? Idle (orderIdle), not walking to work, fed, healthy, and not the leader.
+bool expeditionEligible(const barb& b, int r) {
+    bool wandering = !b.moving || (b.targetx == b.wanderX && b.targety == b.wanderY);
+    return b.race == r && orderIdle(b) && wandering && b.target == targetNone && b.timer == 0 && !b.inMine
+        && !b.shinobi && !isLeader(b) && !isHungry(b) && b.health >= expMinHealth;
+}
+
+// R45-F2: where member k of the party stands at the end of the current leg (hitbox top-left)
+Vector2f expeditionGoal(int k) {
+    int r = clampRace(party.race);
+    Vector2f along(-expMemberGapPx * k, 0.0f);
+    if (party.phase == expeditionParty::Out) return campSpot[r] + campStandOffset + along;
+    if (party.phase == expeditionParty::Delve) return party.delveSpot[k];
+    return storehousePos[r] + storehouseStandOffset + along;
+}
+
+// R45-F2: the one way a party ends. Every member still standing gets the reset and its flag cleared; idx[k] < 0 = gone.
+void endExpedition(vector<barb>& barbs, const int (&idx)[expPartySize]) {
+    for (int k = 0; k < expPartySize; k++) {
+        if (idx[k] < 0 || idx[k] >= (int)barbs.size() || !barbs[idx[k]].onExpedition) continue;
+        expeditionReset(barbs[idx[k]]);
+        barbs[idx[k]].onExpedition = false;
+    }
+    party.active = false;
+    party.race = -1;
+    for (auto& id : party.memberIds) id = -1;
+    party.rations = party.timer = party.woundCooldown = 0;
+    party.relic = false;
+    party.lostName = nullptr;
+    expeditionCooldown = expCooldownTicks;
+}
+
+// R45-F2: tries one race (random start, fair) with a lean-to, a crate, a silent bell, relics under the cap and food for
+// the rations plus expFoodReserve. Members: the nearest eligible barbs to the crate via findNearest, each skipping the
+// ones already picked; delve stones the same way from the camp.
+void tryLaunchExpedition(vector<barb>& barbs, vector<RectangleShape>& squares, const storehouse (&stores)[raceCount]) {
+    if (!hasRuins() || uniform_int_distribution<int>(0, expLaunchOneIn - 1)(gen) != 0) return;
+    int start = uniform_int_distribution<int>(0, raceCount - 1)(gen);
+    int n = min((int)barbs.size(), (int)squares.size());
+    for (int o = 0; o < raceCount; o++) {
+        int r = (start + o) % raceCount;
+        if (!campBuilt(r) || !stores[r].built || raceBell[r] > 0 || raceRelics[r] >= expRelicCap) continue;
+        if (stock[r].food < expRationFood + expFoodReserve) continue;
+        int pick[expPartySize];
+        bool ok = true;
+        for (int k = 0; k < expPartySize && ok; k++) {
+            pick[k] = findNearest(storehousePos[r], expRecruitRadius, n,
+                                  [&](int i) { return squares[i].getPosition(); },
+                                  [&](int i) {
+                                      for (int q = 0; q < k; q++) if (pick[q] == i) return true;
+                                      return !barbAvailable(barbs[i]) || !expeditionEligible(barbs[i], r);
+                                  });
+            ok = pick[k] >= 0;
+        }
+        if (!ok) continue;
+        Vector2f camp = campSpot[r] + campSize / 2.0f;
+        int stone[expPartySize];
+        for (int k = 0; k < expPartySize; k++) {
+            stone[k] = findNearest(camp, worldSize, (int)ruinStones.size(),
+                                   [&](int i) { return ruinStones[i].position + ruinStones[i].size / 2.0f; },
+                                   [&](int i) { for (int q = 0; q < k; q++) if (stone[q] == i) return true; return false; });
+            if (stone[k] < 0) stone[k] = 0;   // fewer stones than members (not with the current layout): share one
+        }
+        party = expeditionParty{};
+        party.active = true;
+        party.race = r;
+        party.phase = expeditionParty::Out;
+        spend(stock[r], 0, 0, expRationFood);
+        party.rations = expRationFood;
+        string names;
+        for (int k = 0; k < expPartySize; k++) {
+            barb& b = barbs[pick[k]];
+            expeditionReset(b);
+            b.onExpedition = true;
+            b.order = needNone;
+            b.orderTicks = 0;
+            party.memberIds[k] = b.id;
+            const FloatRect& s = ruinStones[stone[k]];   // stand at the stone's foot, centred under it
+            party.delveSpot[k] = snapPx(Vector2f(s.position.x + s.size.x / 2.0f - 1.0f, s.position.y + s.size.y));
+            names += string(k ? " and " : "") + b.name;
+        }
+        printf("---EXPEDITION OUT--- %s: %s, %d rations (food %d left)\n", racePlurals[r], names.c_str(), party.rations, stock[r].food);
+        logRaceEvent(string(racePlurals[r]) + " send " + names + " to the ruins", r);
+        return;
+    }
+}
+
+// R45-F2: runs after bellTick() (wolves have moved) and before hungerTick(). Re-resolves every member by id each tick;
+// a missing, dead or released member dissolves the party. Feeds hungry members from the rations, lets wolves on the road
+// wound (never below expWolfMinHp), walks each leg and advances the phase once every member has arrived.
+void expeditionTick(vector<barb>& barbs, vector<RectangleShape>& squares, const vector<wolf>& wolves, const storehouse (&stores)[raceCount]) {
+    if (!party.active) {
+        if (expeditionCooldown > 0) expeditionCooldown--;
+        else tryLaunchExpedition(barbs, squares, stores);
+        return;
+    }
+    int r = clampRace(party.race);
+    int idx[expPartySize];
+    const char* lost = party.lostName;
+    bool broken = false;
+    for (int k = 0; k < expPartySize; k++) {
+        idx[k] = findBarbById(barbs, party.memberIds[k]);
+        bool bad = idx[k] < 0 || idx[k] >= (int)squares.size() || !barbs[idx[k]].onExpedition || barbs[idx[k]].race != r;
+        if (!bad && barbs[idx[k]].health <= 0) { bad = true; if (!lost) lost = barbs[idx[k]].name; }
+        if (bad) { broken = true; if (idx[k] >= (int)squares.size()) idx[k] = -1; }
+    }
+    if (broken) {
+        printf("---EXPEDITION LOST--- %s: %s, party dissolved (%d rations lost)\n", racePlurals[r], lost ? lost : "a member", party.rations);
+        logRaceEvent(string(racePlurals[r]) + "' expedition breaks up: " + (lost ? lost : "a member") + " is lost", r);
+        endExpedition(barbs, idx);
+        return;
+    }
+    if (party.woundCooldown > 0) party.woundCooldown--;
+    for (int k = 0; k < expPartySize; k++) {   // rations: a member eats on the road instead of from the larder
+        barb& b = barbs[idx[k]];
+        if (!isHungry(b) || party.rations <= 0) continue;
+        party.rations--;
+        b.hunger = 0;
+        b.slowTick = 0;
+        b.starveTicks = 0;
+        b.health = min(barbMaxHealth, b.health + eatHealHp);
+        printf("EXPEDITION RATION - %s ate, %d left\n", b.name, party.rations);
+    }
+    if (party.phase != expeditionParty::Delve && party.woundCooldown == 0)   // wolves only meet the party on the road
+        for (int k = 0; k < expPartySize && party.woundCooldown == 0; k++) {
+            barb& b = barbs[idx[k]];
+            Vector2f c = squares[idx[k]].getPosition() + squares[idx[k]].getSize() / 2.0f;
+            for (auto& w : wolves) {
+                Vector2f d = w.shape.getPosition() + wolfSize / 2.0f - c;
+                if (d.x * d.x + d.y * d.y >= expWolfRadius * expWolfRadius) continue;
+                b.health = max(min(b.health, expWolfMinHp), b.health - expWolfWoundHp);   // a wound, never the kill
+                party.woundCooldown = expWolfWoundCooldownTicks;
+                printf("EXPEDITION WOUND - %s (%s) bitten by a wolf, %d hp\n", b.name, racePlurals[r], b.health);
+                logRaceEvent(string(b.name) + " is bitten by a wolf on the road", r);
+                break;
+            }
+        }
+    bool allThere = true;
+    for (int k = 0; k < expPartySize; k++) {
+        barb& b = barbs[idx[k]];
+        auto& sq = squares[idx[k]];
+        Vector2f goal = expeditionGoal(k);
+        b.targetx = (int)goal.x;
+        b.targety = (int)goal.y;
+        Vector2f diff = Vector2f((float)b.targetx, (float)b.targety) - sq.getPosition();
+        if (diff.x * diff.x + diff.y * diff.y < 1.0f) {
+            sq.setPosition(Vector2f((float)b.targetx, (float)b.targety));
+            if (b.moving) { b.moving = false; clearRoute(b); b.stepTimer = 0; }
+        } else {
+            allThere = false;
+            b.moving = true;
+            walkStep(b, sq);
+        }
+    }
+    if (!allThere) return;
+    if (party.phase == expeditionParty::Out) {
+        party.phase = expeditionParty::Delve;
+        party.timer = 0;
+        printf("EXPEDITION AT CAMP - %s, to the stones\n", racePlurals[r]);
+    } else if (party.phase == expeditionParty::Delve) {
+        if (++party.timer < expDelveTicks) return;
+        party.relic = raceRelics[r] < expRelicCap && uniform_real_distribution<float>(0.0f, 1.0f)(gen) < expRelicChance;
+        party.phase = expeditionParty::Back;
+        printf("EXPEDITION DELVED - %s, %s\n", racePlurals[r], party.relic ? "relic found" : "nothing found");
+    } else {
+        stock[r].food += party.rations;   // leftovers back to the larder
+        string outcome;
+        if (party.relic) {
+            raceRelics[r] = min(expRelicCap, raceRelics[r] + 1);
+            stock[r].stone += expRelicStone;
+            outcome = "return with a relic (+" + to_string(expRelicStone) + " stone, " + to_string(raceRelics[r]) + "/" + to_string(expRelicCap) + ")";
+        } else outcome = "return empty-handed";
+        printf("---EXPEDITION HOME--- %s %s, %d rations returned\n", racePlurals[r], outcome.c_str(), party.rations);
+        logRaceEvent(string(racePlurals[r]) + "' expedition " + outcome, r);
+        endExpedition(barbs, idx);
+    }
+}
+
 void barbspawner(vector<RectangleShape>& squares, vector<barb>& barbs, const vector<house>& houses, vector<RectangleShape>& houseshapes, vector<birthRing>& rings) {
     static int deferCooldown = 0;
     if (deferCooldown > 0) deferCooldown--;
@@ -6928,7 +7185,7 @@ void barbmove(vector<RectangleShape>& squares, vector<barb>& barbs) {
     for (int i = 0; i < (int)squares.size(); i++) {
         auto& sq = squares[i];
         auto& b  = barbs[i];
-        if (b.garrisoned || b.chopping || b.timer > 0 || b.movingbspot || b.building || b.carryKind != carryNone || b.tempering) continue;   // R29-F1: haulTick() walks haulers; INBOX-F1: bellTick() walks garrisoned; R41-F2: temperTick() walks temperers
+        if (!barbAvailable(b) || b.chopping || b.timer > 0 || b.movingbspot || b.building || b.carryKind != carryNone || b.tempering) continue;   // R29-F1: haulTick() walks haulers; INBOX-F1: bellTick() walks garrisoned; R41-F2: temperTick() walks temperers; R45-F2: expeditionTick() walks parties
         Vector2f pos = sq.getPosition();
         if (!b.moving) {
             if (wanderChance(gen) != 0) continue;
@@ -6967,7 +7224,7 @@ void buildWorkClaims(const vector<barb>& barbs, const vector<CircleShape>& tris,
     unordered_map<long long, int> treeSpots, rockSpots;
     for (int j = 0; j < (int)barbs.size(); j++) {
         const barb& b = barbs[j];
-        if (b.garrisoned || b.targetx == -1 || b.target == targetBush || b.target == targetLake || b.target == targetField || b.target == targetDepot || b.deertargeting || b.movingbspot || b.building) continue;
+        if (!barbAvailable(b) || b.targetx == -1 || b.target == targetBush || b.target == targetLake || b.target == targetField || b.target == targetDepot || b.deertargeting || b.movingbspot || b.building) continue;
         (b.target == targetRock ? rockSpots : treeSpots).emplace(workSpotKey(b.targetx, b.targety), j); // first claimant kept
     }
     treeClaim.assign(tris.size(), -1);
@@ -7016,7 +7273,7 @@ void memShare(vector<barb>& barbs, const vector<RectangleShape>& squares, int j,
         int k = findNearest(from, memShareRadius, (int)barbs.size(),
                             [&](int i) { return squares[i].getPosition(); },
                             [&](int i) { const barb& o = barbs[i];
-                                         return i == j || o.race != b.race || o.garrisoned || o.health <= 0
+                                         return i == j || o.race != b.race || !barbAvailable(o) || o.health <= 0
                                              || (o.mem[0].kind == kind && o.mem[0].pos == p); });   // already told
         if (k == -1) break;
         memRecord(barbs[k], kind, p);
@@ -7214,7 +7471,7 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
     for (int j = 0; j < (int)squares.size(); j++) {
         auto& sq = squares[j];
         auto& b  = barbs[j];
-        if (b.garrisoned) continue;   // INBOX-F1: no work or tree/rock/bush/shore search while sheltering
+        if (!barbAvailable(b)) continue;   // INBOX-F1: no work or tree/rock/bush/shore search while sheltering; R45-F2: or away
         if (b.toolCharges > 0 && !b.tempering && !forgeActive(fg, b.race)) {   // R41-F2: forge gone: the tempered edge goes with it
             printf("PICK UNTEMPERED - barb %d, forge lost\n", b.id);
             clearTemper(b);
@@ -8279,6 +8536,7 @@ int main() {
                 wolfTick(wolves, deers, deershape, barbs);
                 bellTick(barbs, squares, houses, houseshapes, wolves, stores, smoke, dwarfForge, fields,
                          trees, tris, rocks, octs, bushes);   // INBOX-F1: after the wolves move
+                expeditionTick(barbs, squares, wolves, stores);   // R45-F2: after the wolves and the bell, before hungerTick()
                 clockk();
                 weatherTick();
                 traderTick(activeTrader, barbs, stores);
