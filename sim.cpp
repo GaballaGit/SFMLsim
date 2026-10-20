@@ -14,8 +14,18 @@
 using namespace sf;
 using namespace std;
 
-const int numtrees = 2000;
-const int numrocks = 100;
+// R45-F1a Far Reaches: the map grew from 800 to 1200 px a side. Every count tuned on the old map scales with area so
+// density (and so walk distance between jobs) holds; the window stays 800 px and shows the world 1:1 at zoom 1.
+constexpr float baseWorldSize = 800.0f;     // map side the density tunables were tuned on
+constexpr float worldSize = 1200.0f;        // map side in world px (was 800)
+constexpr float worldAreaScale = (worldSize / baseWorldSize) * (worldSize / baseWorldSize); // 2.25
+constexpr float windowSize = 800.0f;        // window side in px; at zoom 1 the camera spans this many world px
+constexpr float mapEdgeInset = 20.0f;       // edge arrivals (wolves, trader, deer) keep this far from the corners
+constexpr int numtrees = (int)(2000 * worldAreaScale);   // 4500
+constexpr int numrocks = (int)(100 * worldAreaScale);    // 225
+constexpr int treeSpawnOneIn = (int)(100000 / worldAreaScale); // 1-in-N per tick for a new tree: same rate per area as before
+constexpr float deerEntryDepthPx = 80.0f;   // arriving animals walk this far in past mapEdgeInset from their side edge
+constexpr float deerOffMapPx = 20.0f;       // arriving animals start this far outside the side edge
 
 const char* const hudFontPath = "assets/DejaVuSans.ttf";
 const unsigned int hudFontSize = 14;
@@ -30,7 +40,6 @@ const float hudIconGap = 4.0f;              // icon -> number
 const float hudCellGap = 14.0f;             // number -> next icon
 const char* const hudMinNumber = "000";     // each number reserves at least this width so cells don't jump as values grow
 const int maxTicksPerFrame = 20;
-const float worldSize = 800.0f;
 const float minZoom = 1.0f;
 const float maxZoom = 4.0f;
 const float zoomStep = 1.1f;
@@ -223,7 +232,7 @@ const int clearWeatherTicks = 30 * ticksPerMinute; // 30 real min of clear weath
 const int rainWeatherTicks = 10 * ticksPerMinute;  // 10 real min per rain
 const Color rainOverlayColor(70, 90, 120, 70);
 // Falling rain streaks: draw-only, positions hashed from (frame cycle, index) so there is no stored state
-const int rainStreakCount = 150;           // sparse over the 800x800 map
+const int rainStreakCount = (int)(150 * worldAreaScale); // sparse: 150 per 800x800 of map (337 at 1200)
 const int rainStreakPixels = 3;            // 1x3 streak, bottom pixel stepped 1px left for the wind slant
 const int rainStreakLifeFrames = 40;       // frames a streak falls before it respawns at a new hashed spot
 const float rainStreakFallPx = 4.0f;       // px fallen per frame (~240px/s)
@@ -307,7 +316,7 @@ const float ledgerOutlinePx = 1.0f;       // screen px (scaled by zoom), hovered
 const Color ledgerPipColor(226, 220, 204); // neutral pale stone for the shared campfire: belongs to no race
 
 const float trailCellSize = 8.0f;          // world px per trail grid cell
-const int trailGridN = 100;                // cells per side (800 / 8)
+const int trailGridN = (int)(worldSize / trailCellSize); // cells per side (1200 / 8 = 150)
 const int trailDecayIntervalTicks = 120;   // every 2s each cell loses 1 wear, so stray steps fade out
 const int rainErodeMult = 2;               // trails decay this many times faster while raining (4 needed a barb per cell every 4s to hold a road through a shower)
 const int trailMaxWear = 240;             // cap so abandoned roads fade within ~8 min
@@ -322,7 +331,7 @@ const int pathWearClamp = trailRoadThreshold; // wear beyond road tier adds no e
 constexpr float routeWearDiscount = 0.4f;     // a full road costs 0.6 of bare ground
 const float routeDetourCap = 1.3f;         // max route length / straight distance; keeps routes from collapsing onto a few highways
 const int routeExpandCap = 400;            // A* node expansions per plan; past it the barb walks straight
-const int routeMaxCells = 200;             // waypoint buffer per barb (1.3 x the 141-cell diagonal fits)
+const int routeMaxCells = 280;             // waypoint buffer per barb (1.3 x the 212-cell diagonal of the 1200 map fits)
 const int routeLookahead = 3;              // a barb that cuts a corner into a later waypoint cell skips ahead
 const float routeStrayPx = 24.0f;          // farther than this from the next waypoint (pushed/teleported): replan
 static_assert(routeWearDiscount < 1.0f, "a cell must never cost zero or less");
@@ -393,6 +402,7 @@ const int deerFleeCooldown = 600;          // ticks after a flee before the deer
 const float deerFleeEdgeMargin = 4.0f;     // flee targets stay this far inside the map and below the HUD strip
 
 const float barbWorkSearchRadius = 25.0f;  // barbs only notice trees/rocks within this many px (findNearest)
+const float barbWorkFallbackRadius = 160.0f; // R45-F1a: nothing in reach and no shore to fish: one wider look before wandering
 const float noSearchRadius = numeric_limits<float>::infinity(); // findNearest with no distance limit
 const int memSpotCount = 3;                // INBOX-F2: work spots a barb remembers (fixed array, [0] = most recent)
 const float memSpotRadius = 25.0f;         // a remembered spot is live while a free tree/rock/ripe bush of its kind stands within this
@@ -405,7 +415,8 @@ const float treeNeedBoost = 1.0f;          // tree weight rises up to 1 + this a
 const float needWeightMin = 0.5f;          // job weights are clamped to [min, max] so no resource is ever starved
 const float needWeightMax = 2.0f;          // 2x weight = a tree up to 2x farther still wins (distance / weight)
 
-const int numBushClumps = 4;
+const int numBushClumps = (int)(4 * worldAreaScale);   // R45-F1a: 4 per 800x800 of map (9 at 1200)
+const float bushClumpEdgeMargin = 60.0f;   // clump centres stay this far inside the map edges
 const int bushesPerClump = 5;
 const float bushClumpSpread = 14.0f;       // max px from the clump centre on each axis
 const float bushClumpMinCenterDist = 120.0f; // clumps stay clear of the village center (and its tree clearing)
@@ -899,7 +910,7 @@ const Color kShaftFlashColor(222, 198, 150);     // pale sandy highlight
 
 // UI red (UIO-F1/F2/F3): one muted brick red for every "starving" mark in the UI (minimap dots, inspect panel, hunger lens)
 const Color uiStarvingRed = healthBarFillColor;
-// Minimap (UIO-F1): bottom-right 120px map of the whole 800x800 world, drawn after the HUD in the default (UI) view.
+// Minimap (UIO-F1): bottom-right 120px map of the whole worldSize x worldSize world, drawn after the HUD in the default (UI) view.
 // No trees: only barbs, houses and storehouses, plus the camera's viewport. Left-click recentres the camera.
 const float MM_SIZE = 120.0f;                 // outer size in screen px, border included
 const float MM_MARGIN = 8.0f;                 // gap from the window's bottom and right edges
@@ -1006,7 +1017,8 @@ const Color stockEmptyRaceColor(120, 118, 108); // a race with no living members
 // Race quarters (R30-F1): each race's crate sits in its own quarter around the village, at least raceMinSeparation from
 // the others; that race's houses go within quarterHouseRadius of it. Trees/rocks are kept off each quarter like the
 // village clearing, lakes and bush clumps avoid it, and each quarter is topped up at startup if it is short of wood/stone.
-// INBOX-F3 wider quarters, R44-F4b pushed further out: on the 800 map with 3 races the 120 deg split gives crates
+// INBOX-F3 wider quarters, R44-F4b pushed further out (R45-F1a: the village stays at 400,400, so the left/top edges
+// still bind on the 1200 map): with 3 races the 120 deg split gives crates
 // >= 210*sqrt(3) ~ 364 apart (> raceMinSeparation), and at any rotation the quarter clearing (63) reaches at most
 // 250+63 = 313 from the campfire, which fits both the side edges (400) and the HUD (400-24 = 376), and stays >= 210-63
 // = 147 clear of the village clearing (50). So quarterLayoutOk() always passes and the fallback should never fire.
@@ -1041,8 +1053,8 @@ const float homesteadClutterPad = 2.0f;      // grass kept between the slab and 
 // Lakes (R19-F2): static ponds placed once at startup. Static rect + rim only in v1 (no glint/ripples).
 // Only wander paths (barbs, deer) avoid lakes; task paths (chop/mine/build/hunt/flee/wolves) are straight lines and may cross
 // one. Nothing is ever placed in a lake, so those crossings are brief, and an animal that ends up inside can always wander out.
-const int lakeCountMin = 2;
-const int lakeCountMax = 3;
+const int lakeCountMin = (int)(2 * worldAreaScale);   // R45-F1a: 2-3 per 800x800 of map (4-6 at 1200)
+const int lakeCountMax = (int)(3 * worldAreaScale);
 const int lakePlaceTries = 60;             // per lake; fewer lakes are kept if a spot can't be found
 const float lakeVillageMinDist = 150.0f;   // lake centre at least this far from the campfire (clearing is 50, shrines 40)
 const float lakeEdgeMargin = 12.0f;        // from the map edges (and below the HUD strip)
@@ -1246,14 +1258,15 @@ struct speciesDef {
     Color body, head, leg, accent, tail;
 };
 const speciesDef speciesDefs[speciesCount] = {
-    // Deer: 6x3, 2x2 head overhangs the front-top corner, tiny swept-back tine above the back of the head
-    {"Deer", {6.0f, 3.0f}, 100, 2, 10, 101, 0, deerStepInterval, deerFleeStepInterval,
+    // Deer: 6x3, 2x2 head overhangs the front-top corner, tiny swept-back tine above the back of the head.
+    // R45-F1a: both caps scale with map area (10 -> 22 deer, 12 -> 27 rabbits on the 1200 map)
+    {"Deer", {6.0f, 3.0f}, 100, 2, (int)(10 * worldAreaScale), 101, 0, deerStepInterval, deerFleeStepInterval,
      gaitWalk, 6, 4, {0.0f, 1.0f, 4.0f, 5.0f}, 2.0f, 1.0f, 0.0f,
      {5.0f, -1.0f}, {2.0f, 2.0f}, 2, {{5.0f, -2.0f}, {4.0f, -3.0f}}, 0, {0.0f, 0.0f},
      Color(192, 133, 82), Color(176, 120, 74), Color(112, 78, 48), Color(178, 162, 132), Color(0, 0, 0)},
     // Rabbit: 4x2 pale sandy body (much lighter than deer so it pops on dark green), 1x2 ear, white scut.
     // Fragile (3 hits) and only 1 food, but breeds fast up to a larger cap.
-    {"Rabbit", {4.0f, 2.0f}, 15, 1, 12, 1800, 1200, 2, 1,
+    {"Rabbit", {4.0f, 2.0f}, 15, 1, (int)(12 * worldAreaScale), 1800, 1200, 2, 1,
      gaitHop, 8, 2, {0.0f, 3.0f, 0.0f, 0.0f}, 1.0f, 1.0f, 1.0f,
      {3.0f, -1.0f}, {2.0f, 2.0f}, 2, {{3.0f, -2.0f}, {3.0f, -3.0f}}, 1, {-1.0f, 0.0f},
      Color(216, 194, 150), Color(200, 178, 136), Color(138, 112, 80), Color(176, 136, 118), Color(244, 242, 234)},
@@ -1373,12 +1386,12 @@ uniform_int_distribution<int> wanderChance(0, 149);
 uniform_int_distribution<int> wanderDX(-50, 50);
 uniform_int_distribution<int> wanderDY(-50, 50);
 uniform_int_distribution<int> spawnChance(0, 7500);
-uniform_int_distribution<int> treespawnChance(0, 99999);
+uniform_int_distribution<int> treespawnChance(0, treeSpawnOneIn - 1);
 uniform_int_distribution<int> quarterSpotD(-(int)quarterHouseRadius, (int)quarterHouseRadius); // R30-F1: house offset per axis, disc-rejected
-uniform_int_distribution<int> DeerSpawnY(20, 780); 
+uniform_int_distribution<int> DeerSpawnY((int)mapEdgeInset, (int)(worldSize - mapEdgeInset));
 uniform_int_distribution<int> DeerSpawnRL(0, 1);
-uniform_int_distribution<int> DeerSpawnXgotoL(20, 100);
-uniform_int_distribution<int> DeerSpawnXgotoR(700, 780);
+uniform_int_distribution<int> DeerSpawnXgotoL((int)mapEdgeInset, (int)(mapEdgeInset + deerEntryDepthPx));
+uniform_int_distribution<int> DeerSpawnXgotoR((int)(worldSize - mapEdgeInset - deerEntryDepthPx), (int)(worldSize - mapEdgeInset));
 
 // Whole-pixel draw positions so shapes don't shimmer between pixels; only ever applied to copies
 Vector2f snapPx(Vector2f p) { return Vector2f(round(p.x), round(p.y)); }
@@ -2347,7 +2360,7 @@ void wolfTick(vector<wolf>& wolves, vector<deer>& deers, vector<RectangleShape>&
 	if ((int)wolves.size() < maxWolves && deerCount > wolfMinDeer
 	    && uniform_int_distribution<int>(0, wolfSpawnChance - 1)(gen) == 0) {
 		wolf w;
-		float along = (float)clamp(distrib(gen), 20, 780);
+		float along = clamp((float)distrib(gen), mapEdgeInset, worldSize - mapEdgeInset);
 		switch (uniform_int_distribution<int>(0, 3)(gen)) {
 			case 0:  w.exit = Vector2f(-10.0f, along); break;
 			case 1:  w.exit = Vector2f(worldSize + 10.0f, along); break;
@@ -2420,10 +2433,10 @@ void deerspawn(vector<deer>& deers, vector<RectangleShape>& deershape) {
 		d.species = (animalSpecies)s;
 		if (uniform_int_distribution<int>(0, sp.arriveOneIn - 1)(gen) == 0) {
 			if (DeerSpawnRL(gen) == 0) {
-				d.x = -20;
+				d.x = (int)-deerOffMapPx;
 				d.targetx = DeerSpawnXgotoL(gen);
 			} else {
-				d.x = 820;
+				d.x = (int)(worldSize + deerOffMapPx);
 				d.targetx = DeerSpawnXgotoR(gen);
 			}
 			d.y = DeerSpawnY(gen);
@@ -2499,7 +2512,7 @@ void deerwander(vector<RectangleShape>& deershape, vector<deer>& deers, const ve
             if (wanderChance(gen) != 0) continue;
             int tx = (int)pos.x + wanderDX(gen);
             int ty = (int)pos.y + wanderDY(gen);
-            if (tx > 0 && tx < 800 && ty > 0 && ty < 800 && lakeClear(FloatRect(Vector2f(tx, ty), ds.getSize() + Vector2f(0.0f, speciesOf(d).legPx)), &pos)) {
+            if (tx > 0 && tx < worldSize && ty > 0 && ty < worldSize && lakeClear(FloatRect(Vector2f(tx, ty), ds.getSize() + Vector2f(0.0f, speciesOf(d).legPx)), &pos)) {
                 d.targetx = tx;
                 d.targety = ty;
                 d.moving  = true;
@@ -3269,7 +3282,7 @@ void traderTick(optional<trader>& tr, const vector<barb>& barbs, const storehous
         for (int r = 0; r < raceCount; r++) if (raceCooldown[r] > 0) raceCooldown[r]--;
         if (t.race >= 0) raceCooldown[t.race] = traderRaceCooldownVisits;
         t.toStore = t.race >= 0 && stores[t.race].built;
-        float along = (float)clamp(distrib(gen), 20, 780);
+        float along = clamp((float)distrib(gen), mapEdgeInset, worldSize - mapEdgeInset);
         switch (uniform_int_distribution<int>(0, 3)(gen)) {
             case 0:  t.exit = Vector2f(-10.0f, along); break;
             case 1:  t.exit = Vector2f(worldSize + 10.0f, along); break;
@@ -6807,7 +6820,7 @@ void barbmove(vector<RectangleShape>& squares, vector<barb>& barbs) {
             if (wanderChance(gen) != 0) continue;
             int tx = (int)pos.x + wanderDX(gen);
             int ty = (int)pos.y + wanderDY(gen);
-            if (tx > 0 && tx < 800 && ty > 0 && ty < 800 && lakeClear(FloatRect(Vector2f(tx, ty), sq.getSize()), &pos)) {
+            if (tx > 0 && tx < worldSize && ty > 0 && ty < worldSize && lakeClear(FloatRect(Vector2f(tx, ty), sq.getSize()), &pos)) {
                 b.targetx = b.wanderX = tx;
                 b.targety = b.wanderY = ty;
                 b.moving  = true;
@@ -7281,6 +7294,45 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
                     shoreClaim[k] = j;
                 }
             }
+            // R45-F1a: still nothing (no work in reach, no free shore): one wider look with the same weights, so barbs on
+            // the bigger map head for the nearest tree, rock or ripe bush instead of wandering empty ground
+            if (best == -1 && !bestIsBush && !b.moving && !b.deertargeting) {
+                float wTreeDSq, wRockDSq, wBushDSq;
+                int wTree = findNearest(bpos, barbWorkFallbackRadius, (int)trees.size(),
+                                        [&](int i) { return tris[i].getPosition() + treeWorkOffset; },
+                                        [&](int i) { return trees[i].dying || (treeClaim[i] != -1 && treeClaim[i] != j); }, &wTreeDSq);
+                int wRock = findNearest(bpos, barbWorkFallbackRadius, (int)rocks.size(),
+                                        [&](int k) { return octs[k].getPosition() + rockWorkOffset; },
+                                        [&](int k) { return rocks[k].dying || (rockClaim[k] != -1 && rockClaim[k] != j); }, &wRockDSq);
+                int wBush = findNearest(bpos, barbWorkFallbackRadius, (int)bushes.size(),
+                                        [&](int k) { return bushWorkSpot(bushshapes[k]); },
+                                        [&](int k) { return !bushes[k].ripe || bushes[k].picking; }, &wBushDSq);
+                float wTreeScore = wTree != -1 ? wTreeDSq / (treeW * treeW) : notFound;
+                float wRockScore = wRock != -1 ? wRockDSq / (rockW * rockW) : notFound;
+                float wBushScore = wBush != -1 ? wBushDSq / (bushW * bushW) : notFound;
+                if (wBush != -1 && wBushScore < wTreeScore && wBushScore < wRockScore) {
+                    Vector2f wp = bushWorkSpot(bushshapes[wBush]);
+                    b.targetx = (int)wp.x;
+                    b.targety = (int)wp.y;
+                    b.moving = true;
+                    b.target = targetBush;
+                    b.targetBush = wBush;
+                } else if (wRock != -1 && wRockScore < wTreeScore) {
+                    Vector2f rp = octs[wRock].getPosition();
+                    b.targetx = (int)(rp.x + 6);
+                    b.targety = (int)(rp.y + 10);
+                    b.moving = true;
+                    b.target = targetRock;
+                    rockClaim[wRock] = j;
+                } else if (wTree != -1) {
+                    Vector2f tp = tris[wTree].getPosition();
+                    b.targetx = (int)(tp.x + 8);
+                    b.targety = (int)(tp.y + 15);
+                    b.moving = true;
+                    b.target = targetNone;
+                    treeClaim[wTree] = j;
+                }
+            }
         if (b.targetx == -1) continue;
 	}
 	if (b.target == targetLake) {
@@ -7491,7 +7543,7 @@ void treespawn(vector<tree>& trees, vector<CircleShape>& tris, vector<RectangleS
     stumps.push_back(stump);
 }
 
-// 2-3 ponds away from the village, apart from each other. Startup trees (trees/tris/stumps) and rocks (rocks/octs)
+// lakeCountMin-Max ponds (2-3 per 800x800 of map) away from the village, apart from each other. Startup trees (trees/tris/stumps) and rocks (rocks/octs)
 // in or touching a lake are removed together. Fixed village spots (stall, forge) are inside the
 // lakeVillageMinDist ring, and the race smokehouses sit inside the dry quarters, so they never need a lake check. Shore points are cached here for angling.
 void spawnLakes(vector<tree>& trees, vector<CircleShape>& tris, vector<RectangleShape>& stumps, vector<rock>& rocks, vector<CircleShape>& octs) {
@@ -7592,7 +7644,7 @@ bool nearQuarter(Vector2f p, float dist) {
 // A few clumps of bushes, away from the village center. Startup trees overlapping a bush are
 // cleared (trees, tris and stumps together) so the clumps sit in small clearings and stay visible.
 void spawnBushes(vector<bush>& bushes, vector<CircleShape>& bushshapes, vector<tree>& trees, vector<CircleShape>& tris, vector<RectangleShape>& stumps) {
-    uniform_int_distribution<int> centre(60, 740);
+    uniform_int_distribution<int> centre((int)bushClumpEdgeMargin, (int)(worldSize - bushClumpEdgeMargin));
     uniform_real_distribution<float> spread(-bushClumpSpread, bushClumpSpread);
     for (int c = 0; c < numBushClumps; c++) {
         Vector2f cp;
@@ -7701,7 +7753,7 @@ void bushTick(vector<bush>& bushes, vector<CircleShape>& bushshapes) {
 }
 
 int main() {
-    RenderWindow window(VideoMode({800, 800}), "sim");
+    RenderWindow window(VideoMode({(unsigned)windowSize, (unsigned)windowSize}), "sim");
     window.setFramerateLimit(60);
 
     Clock clock;
@@ -7793,7 +7845,7 @@ int main() {
     VertexArray rainVerts(PrimitiveType::Triangles); // scratch buffer for drawRain, rebuilt every frame
     VertexArray minimapVerts(PrimitiveType::Triangles); // UIO-F1: scratch buffer for drawMinimap's dots, rebuilt every frame
 
-    RectangleShape dnc({800, 800});
+    RectangleShape dnc({windowSize, windowSize});   // screen-space overlay, drawn in the default view
 
     Font hudFont;
     bool hudFontOk = hudFont.openFromFile(hudFontPath);
@@ -7803,10 +7855,10 @@ int main() {
     bool paused = false;
     int simSpeed = 1;
     float zoom = minZoom;
-    Vector2f camCenter(worldSize / 2, worldSize / 2);
+    Vector2f camCenter = villageCenter;   // R45-F1a: open on the village; the view spans windowSize / zoom world px
     bool panning = false;
     Vector2i lastMouse;
-    View worldView(FloatRect({0.0f, 0.0f}, {worldSize, worldSize}));
+    View worldView(FloatRect({0.0f, 0.0f}, {windowSize, windowSize}));
     optional<trader> activeTrader;
     FloatRect tickerRect;                 // last frame's ticker strip, used to suppress hover over it
     FloatRect hudRect;                    // last frame's HUD strip, same use
@@ -7843,7 +7895,7 @@ int main() {
             else if (const auto* ms = event->getIf<Event::MouseWheelScrolled>()) {
                 float nz = clamp(zoom * (ms->delta > 0 ? zoomStep : 1.0f / zoomStep), minZoom, maxZoom);
                 Vector2f before = window.mapPixelToCoords(ms->position, worldView);
-                worldView.setSize({worldSize / nz, worldSize / nz});
+                worldView.setSize({windowSize / nz, windowSize / nz});
                 Vector2f after = window.mapPixelToCoords(ms->position, worldView);
                 camCenter = worldView.getCenter() + (before - after);
                 zoom = nz;
@@ -7876,10 +7928,10 @@ int main() {
             }
 
         {
-            float half = worldSize / zoom / 2;
+            float half = windowSize / zoom / 2;
             camCenter.x = clamp(camCenter.x, half, worldSize - half);
             camCenter.y = clamp(camCenter.y, half, worldSize - half);
-            worldView.setSize({worldSize / zoom, worldSize / zoom});
+            worldView.setSize({windowSize / zoom, windowSize / zoom});
             worldView.setCenter(camCenter);
         }
 
@@ -8017,8 +8069,11 @@ int main() {
 	for (auto& w : wolves)
 		drawSnapped(window, w.shape);
 
-        for (int i = 0; i < (int)tris.size(); i++) {
-        	drawSnapped(window, stumps[i]);
+        {
+            // R45-F1a: 4500 stumps on the 1200 map, so only the ones in (or touching) the view are drawn
+            FloatRect viewRect(worldView.getCenter() - worldView.getSize() / 2.0f, worldView.getSize());
+            for (int i = 0; i < (int)tris.size(); i++)
+                if (viewRect.findIntersection(stumps[i].getGlobalBounds())) drawSnapped(window, stumps[i]);
         }
 
         drawBarbs(window, barbs, squares, frameCount, zoom);
