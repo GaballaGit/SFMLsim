@@ -753,7 +753,7 @@ const Vector2f smeltStandOffset(8.0f, 1.0f);         // smelter hitbox top-left 
 constexpr int toolTierCount = 4;
 constexpr int toolTierIngots[toolTierCount] = {0, 2, 5, 9};          // ingots a race needs for each tier
 constexpr float toolTierSpeed[toolTierCount] = {1.0f, 1.1f, 1.2f, 1.3f}; // work-rate multiplier per tier
-constexpr int kIngotCap = toolTierIngots[toolTierCount - 1];         // smelting stops at the top tier
+constexpr int kIngotCap = toolTierIngots[toolTierCount - 1];         // ingots for the top tier (R49-F1: smelting stops at kIngotStockMax)
 constexpr float kToolTierMaxStep = 0.15f;                            // at most +15% per tier
 constexpr bool toolTiersOk() {
     if (toolTierIngots[0] != 0 || toolTierSpeed[0] != 1.0f) return false;   // empty stock = tier 0 = base speed
@@ -770,6 +770,27 @@ const float smeltWispRisePx = 7.0f;                  // how far a puff climbs ab
 const Vector2f smeltWispOrigin(2.0f, -1.0f);         // just above the roof row over the hearth mouth, offset from forgePos
 const Color smeltWispColor(150, 150, 146);           // muted ash grey
 const uint8_t smeltWispMaxAlpha = 120;               // translucent, fades out as it rises
+// R49-F1: blacksmith phase 2, tool wear. Every finished chop or mine (tree, rock, shaft) by a race holding ingots adds one
+// to raceWear; at kWearJobs one ingot is spent (raceIngots floored at 0). Smelting may now stock up to kIngotStockMax, a
+// buffer above kIngotCap (the top-tier threshold), so a race that keeps smelting holds the top tier through wear.
+// Tuning: kWearJobs jobs mine roughly kWearJobs/2 stone, and one ingot back costs kSmeltStoneCost, so a working forge
+// out-smelts the wear with stone to spare; a neglected race slips a tier every few dozen jobs.
+constexpr int kWearJobs = 20;                        // finished chop/mine jobs per ingot worn away
+constexpr int kWearIngots = 1;                       // ingots spent each time the wear count reaches kWearJobs
+constexpr int kIngotStockMax = kIngotCap + 3;        // smelt gate and clamp: three ingots of wear buffer above the top tier
+static_assert(kIngotStockMax > kIngotCap, "ingot stock must allow a buffer above the top-tier threshold");
+const Color toolWearColor(228, 146, 62);             // amber: the tier-drop ticker line and the lost HUD tier bar
+const int tierDropDimFrames = 180;                   // ~3s: HUD tier icon and on-barb steel mark dimmed after a real tier drop
+const float tierDropDimMix = 0.6f;                   // how far the dimmed icon/mark eases toward the panel/ground
+const Color toolTierMarkDimColor(110, 116, 122);     // dimmed 1px steel mark during tierDropDimFrames
+const int kWearSparkCooldownFrames = 45;             // per-race spark rate limit (drawn frames, ~0.75s)
+const int wearSparkFrames = 18;                      // one spark's life, ~0.3s
+const float wearSparkRisePx = 3.0f;                  // climbs this far over its life
+const Vector2f wearSparkOffset(2.0f, -3.0f);         // from the barb's top-left: just above its tool hand
+const Color wearSparkColor(168, 168, 162);           // muted grey 1px chip, apart from the orange forge sparks
+const uint8_t wearSparkMaxAlpha = 210;               // linear fade to 0
+const float tierIconBarW = 2.0f, tierIconBarGap = 1.0f; // HUD stock panel tier icon: toolTierCount-1 rising bars, 8px wide
+const Color tierIconEmptyColor(58, 64, 58);          // an unearned tier bar: dark, just visible on the panel backing
 
 // Race storehouses (R29-F1): one per race at a fixed spot, built by a barb of that race. Chopped wood and mined stone
 // are carried to the hauler's own race's storehouse (the campfire while it isn't standing) and only counted on arrival.
@@ -1799,7 +1820,15 @@ struct forge {bool built = false; bool claimed = false;}; // the one dwarf forge
 bool forgeActive(const forge& fg, int r) { return r == raceDwarf && fg.built; }
 // R47-F7: the smelt gate is separate: every race smelts at the forge once it is built
 bool forgeSmeltOpen(const forge& fg) { return fg.built; }
-int raceIngots[raceCount] = {0, 0, 0};   // R47-F7: per-race ingots, only ever added to (capped at kIngotCap)
+int raceIngots[raceCount] = {0, 0, 0};   // R47-F7: per-race ingots; smelt adds (capped at kIngotStockMax), R49-F1 wear spends (floored at 0)
+int raceWear[raceCount] = {0, 0, 0};             // R49-F1: finished chop/mine jobs since the last ingot was worn away
+int raceTierBest[raceCount] = {0, 0, 0};         // R49-F1: highest tier reached, so a regained tier reads "re-forged"
+int raceTierDimFrames[raceCount] = {0, 0, 0};    // R49-F1: >0 after a real tier drop: HUD icon + steel mark dimmed (drawn frames)
+int raceTierLost[raceCount] = {0, 0, 0};         // R49-F1: the tier just lost, its HUD bar drawn amber while dimmed
+int wearSparkCooldown[raceCount] = {0, 0, 0};    // R49-F1: per-race spark rate-limit timer (drawn frames), no pool
+int wearSparkAge[raceCount] = {wearSparkFrames, wearSparkFrames, wearSparkFrames};   // R49-F1: the race's one spark; >= life = none
+Vector2f wearSparkPos[raceCount];                // R49-F1: where that spark started
+bool toolTierSeen = false;                       // R49-F1: set by the first ingot; the HUD tier column stays shown from then on
 int forgeSmelterId = -1;                 // R47-F7: barb id at the forge smelting (never an index); -1 = free; reset by clearSmelt()
 // R47-F7: the tier lookup. Callers read it once, when a chop or mine starts, into barb.jobTier
 int toolTierOf(int r) {
@@ -3884,7 +3913,7 @@ void drawBarbs(RenderWindow& window, const vector<barb>& barbs, const vector<Rec
             tool.setPosition(Vector2f(side, raised ? bodyTop - barbToolSize.y : bodyTop + 1.0f));
             window.draw(tool);
             if (raised && b.chopping && (b.target == targetNone || b.target == targetRock) && b.jobTier > 0) {   // R47-F7: the one tier mark,
-                dot.setFillColor(toolTierMarkColor);                                                             // 1px steel edge on top of the raised tool
+                dot.setFillColor(raceTierDimFrames[clampRace(b.race)] > 0 ? toolTierMarkDimColor : toolTierMarkColor); // 1px steel edge on top of the raised tool (R49-F1: dim after a tier drop)
                 dot.setPosition(Vector2f(side, bodyTop - barbToolSize.y - 1.0f));
                 window.draw(dot);
             }
@@ -4210,7 +4239,7 @@ string ledgerLine(int target, const vector<barb>& barbs, const storehouse (&stor
     if (target < raceCount) races.push_back(target);
     else for (int r = 0; r < raceCount; r++) if (!stores[r].built) races.push_back(r);
     vector<int> key{target < raceCount ? 0 : campfireWood};
-    for (int r : races) key.insert(key.end(), {r, stock[r].wood, stock[r].stone, stock[r].food, hungry[r], spears[r], raceIngots[r]});
+    for (int r : races) key.insert(key.end(), {r, stock[r].wood, stock[r].stone, stock[r].food, hungry[r], spears[r], raceIngots[r], raceWear[r]});
     if (ledgerCache.target == target && ledgerCache.key == key) return ledgerCache.text;
     string s = target < raceCount ? "" : "Campfire: fire wood " + to_string(campfireWood);
     bool full = races.size() == 1;   // several races at the campfire: stock only, so the single line stays short
@@ -4221,7 +4250,11 @@ string ledgerLine(int target, const vector<barb>& barbs, const storehouse (&stor
         if (full) s += ", " + to_string(hungry[r]) + " hungry, " + to_string(spears[r]) + " "
                        + (spears[r] == 1 ? weaponDefs[raceWeapon[r]].name : weaponDefs[raceWeapon[r]].plural);   // R47-F8: dwarves count axes
         if (full && raceIngots[r] > 0)   // R47-F7: shown from the first ingot
+        {
             s += "\n" + to_string(raceIngots[r]) + (raceIngots[r] == 1 ? " ingot" : " ingots") + ", tool tier " + to_string(toolTierOf(r));
+            int left = max(1, kWearJobs - raceWear[r]);   // R49-F1: read-only, jobs until the next ingot wears away
+            s += ", wear in " + to_string(left) + (left == 1 ? " job" : " jobs");
+        }
     }
     ledgerCache = {target, key, s};
     return s;
@@ -4999,6 +5032,9 @@ FloatRect drawStockPanel(RenderWindow& window, const Font& font, const hudValues
     }
     float cellW = iconSize + stockIconGap + numW;
     float innerW = stockSwatchPx + stockSwatchGap + nameW + needCount * (stockCellGap + cellW);
+    const int tierBars = toolTierCount - 1;   // R49-F1: tool tier icon column, shown once any race has smelted an ingot
+    float tierIconW = tierBars * tierIconBarW + (tierBars - 1) * tierIconBarGap;
+    if (toolTierSeen) innerW += stockCellGap + tierIconW;
     Vector2f size(round(innerW + 2 * stockPad.x), round(raceCount * rowH + (raceCount - 1) * stockRowGap + 2 * stockPad.y));
     Vector2f pos(round(stockMargin), round(hudBarHeight + stockMargin));
     FloatRect box(pos, size);
@@ -5043,6 +5079,26 @@ FloatRect drawStockPanel(RenderWindow& window, const Font& font, const hudValues
             t.setPosition(Vector2f(round(x + iconSize + stockIconGap - t.getLocalBounds().position.x), textY));
             window.draw(t);
             x += cellW;
+        }
+        if (toolTierSeen) {   // R49-F1: rising steel bars, one per tier above 0, bottom-aligned with the stock icons
+            x += stockCellGap;
+            int tier = toolTierOf(r);
+            bool dim = raceTierDimFrames[r] > 0;
+            float iconTop = round(y + (rowH - iconSize) / 2.0f);
+            RectangleShape bar;
+            for (int k = 1; k <= tierBars; k++) {
+                float h = round(iconSize * (k + 1) / (tierBars + 1));   // 4, 6, 8 px for three bars
+                bar.setSize(Vector2f(tierIconBarW, h));
+                bar.setPosition(Vector2f(x + (k - 1) * (tierIconBarW + tierIconBarGap), iconTop + iconSize - h));
+                Color c = tierIconEmptyColor;
+                if (k <= tier) c = empty ? stockEmptyRaceColor : dim ? lerpColor(toolTierMarkColor, tierIconEmptyColor, tierDropDimMix) : toolTierMarkColor;
+                else if (dim && k <= raceTierLost[r]) {   // the tier just lost: amber, fading back to empty over the dim
+                    float f = (float)raceTierDimFrames[r] / tierDropDimFrames;
+                    c = lerpColor(tierIconEmptyColor, toolWearColor, f);
+                }
+                bar.setFillColor(c);
+                window.draw(bar);
+            }
         }
     }
     return box;
@@ -8370,7 +8426,7 @@ void temperTick(barb& b, RectangleShape& sq, const forge& fg) {
 
 // R47-F7: may b smelt after this stone deposit? Forge built and free, its race below the ingot cap, stone above the reserve
 bool smeltWanted(const barb& b, const forge& fg) {
-    return forgeSmeltOpen(fg) && forgeSmelterId < 0 && b.race >= 0 && b.race < raceCount && raceIngots[b.race] < kIngotCap
+    return forgeSmeltOpen(fg) && forgeSmelterId < 0 && b.race >= 0 && b.race < raceCount && raceIngots[b.race] < kIngotStockMax
         && canAfford(stockOf(b), 0, kSmeltStoneCost + kSmeltStoneReserve);
 }
 // R47-F7: started by haulTick() right after a stone deposit; paid here (smeltPaid), refunded by clearSmelt() on any abort
@@ -8421,8 +8477,9 @@ void smeltTick(barb& b, RectangleShape& sq, const forge& fg) {
     if (b.smeltTimer < kSmeltTicks) return;
     int r = clampRace(b.race);
     int before = toolTierOf(r);
-    raceIngots[r] = min(kIngotCap, raceIngots[r] + kSmeltIngots);
+    raceIngots[r] = min(kIngotStockMax, raceIngots[r] + kSmeltIngots);   // R49-F1: buffer above the top tier
     int after = toolTierOf(r);
+    toolTierSeen = true;
     b.smeltPaid = false;   // finishing consumes the stone, so clearSmelt refunds nothing
     clearSmelt(b);
     release();
@@ -8431,8 +8488,57 @@ void smeltTick(barb& b, RectangleShape& sq, const forge& fg) {
     forgeEmberFrames = forgeEmberBoostFrames;
     printf("---INGOT SMELTED--- barb %d, %s ingots %d, tool tier %d\n", b.id, racePlurals[r], raceIngots[r], after);
     if (after > before) {
-        printf("---TOOL TIER %d--- %s (%d ingots, %.0f%% faster work)\n", after, racePlurals[r], raceIngots[r], (toolTierSpeed[after] - 1.0f) * 100.0f);
-        logRaceEvent(string(racePlurals[r]) + " forge tier " + to_string(after) + " tools", r);
+        bool regained = after <= raceTierBest[r];   // R49-F1: a tier lost to wear and smelted back
+        raceTierBest[r] = max(raceTierBest[r], after);
+        raceTierDimFrames[r] = 0;                   // back up: the drop cue ends at once
+        printf("---TOOL TIER %d--- %s (%d ingots, %.0f%% faster work)%s\n", after, racePlurals[r], raceIngots[r],
+               (toolTierSpeed[after] - 1.0f) * 100.0f, regained ? " re-forged" : "");
+        logRaceEvent(string(racePlurals[r]) + (regained ? " re-forge tier " : " forge tier ") + to_string(after) + " tools", r);
+    }
+}
+
+// R49-F1: the one wear path, called once at each chop/mine completion (tree, rock, shaft), never at job start. Only a
+// race holding ingots wears; at kWearJobs it spends kWearIngots (floored at 0). Tier is compared before/after, so the
+// amber ticker line and the HUD/steel-mark dim fire only on a real drop. at = the barb's top-left, for the grey spark.
+void toolWearOnJobDone(const barb& b, Vector2f at) {
+    if (b.race < 0 || b.race >= raceCount) return;
+    int r = b.race;
+    if (raceIngots[r] <= 0) { raceWear[r] = 0; return; }   // plain tools: nothing to wear
+    if (wearSparkCooldown[r] <= 0) {   // one 1px chip, at most once per kWearSparkCooldownFrames per race
+        wearSparkPos[r] = at + wearSparkOffset;
+        wearSparkAge[r] = 0;
+        wearSparkCooldown[r] = kWearSparkCooldownFrames;
+    }
+    if (++raceWear[r] < kWearJobs) return;
+    raceWear[r] = 0;
+    int before = toolTierOf(r);
+    raceIngots[r] = max(0, raceIngots[r] - kWearIngots);
+    int after = toolTierOf(r);
+    printf("TOOL WEAR - %s spent %d ingot after %d jobs (ingots %d, tool tier %d)\n", racePlurals[r], kWearIngots, kWearJobs, raceIngots[r], after);
+    if (after < before) {
+        raceTierDimFrames[r] = tierDropDimFrames;
+        raceTierLost[r] = before;
+        printf("---TOOL TIER DROP--- %s tier %d -> %d (%d ingots)\n", racePlurals[r], before, after, raceIngots[r]);
+        logEvent(string(racePlurals[r]) + "' tools wear down to tier " + to_string(after), toolWearColor);
+    }
+}
+
+// R49-F1: each race's single wear spark: 1px grey, rising and fading; timers aged per drawn frame (not while paused)
+void drawWearSparks(RenderWindow& window, bool paused) {
+    RectangleShape s(Vector2f(1.0f, 1.0f));
+    for (int r = 0; r < raceCount; r++) {
+        if (!paused) {
+            if (wearSparkCooldown[r] > 0) wearSparkCooldown[r]--;
+            if (raceTierDimFrames[r] > 0) raceTierDimFrames[r]--;
+        }
+        if (wearSparkAge[r] >= wearSparkFrames) continue;
+        float t = (float)wearSparkAge[r] / wearSparkFrames;
+        Color c = wearSparkColor;
+        c.a = (uint8_t)(wearSparkMaxAlpha * (1.0f - t));
+        s.setFillColor(c);
+        s.setPosition(snapPx(wearSparkPos[r] - Vector2f(0.0f, wearSparkRisePx * t)));
+        window.draw(s);
+        if (!paused) wearSparkAge[r]++;
     }
 }
 
@@ -8859,6 +8965,7 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
                 ms.seam = max(0, ms.seam - yield);
                 leaveMine(b, true);   // R40-F1: climbs out with the stone; lintel flash
                 practice(techPickwork);
+                toolWearOnJobDone(b, bpos);   // R49-F1
                 if (b.race == raceDwarf) forgeEmberFrames = forgeEmberBoostFrames;   // same flare as a mined rock
                 startHaul(b, carryStone, stores, yield);
                 printf("SHAFT MINED - barb %d hauls %d stone, %s seam %d/%d\n", b.id, yield, racePlurals[b.race], ms.seam, kShaftCapacity);
@@ -8885,6 +8992,7 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
                 if (workTick(b)) b.timer++;
                 if (b.timer >= chopTicks(b)) {
                     practice(techHandAxe);
+                    toolWearOnJobDone(b, bpos);   // R49-F1
                     memRecord(b, memTree, Vector2f((int)tix, (int)tiy));   // INBOX-F2: by position; the tree index dies with the swapRemove
                     swapRemove(trees,  i);
                     swapRemove(tris,   i);
@@ -8915,6 +9023,7 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
 			if (workTick(b)) b.timer++;
 			if (b.timer >= mineTicksFor(b)) {        // dwarves finish rocks faster; R41-F2: a tempered pick faster still
 				practice(techPickwork);
+				toolWearOnJobDone(b, bpos);   // R49-F1
 				if (b.toolCharges > 0) {             // R41-F2: one charge per completed rock, after the scaled check above
 					b.toolCharges--;
 					printf("TEMPERED MINE - barb %d, %d charges left\n", b.id, b.toolCharges);
@@ -9943,6 +10052,7 @@ int main() {
 	drawSmoke(window, smoke, paused);   // INBOX2-F1: per-race puffs, only after own smoked kills
 	drawMillPuffs(window);   // FARM-F2: above the trees, under the overlay
 	drawForgeSparks(window, paused);   // POL-F5b: above barbs and trees so the sparks read, under the overlay
+	drawWearSparks(window, paused);    // R49-F1: one grey tool-wear chip per race; also ages the tier-drop dim
 	drawBirds(window, birds, birdShape, frameCount);
 	if (raining) drawRain(window, rainVerts, frameCount);
 	for (int q = 0; q < (int)squares.size(); ++q) {
