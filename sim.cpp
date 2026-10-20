@@ -1082,6 +1082,7 @@ const Vector2f fieldSize(8.0f, 8.0f);
 const float fieldBorderPx = 1.0f;          // race-tinted frame drawn outside the soil (10x10 overall)
 const int fieldWoodCost = 6;               // cheap: fences and a hoe
 const int fieldMinHouses = 1;              // a race's first home (and its storehouse) comes before its field
+const int popPerPlot = 4;                  // R46-F2a: every popPerPlot living barbs of a race also open one plot (capped)
 const int fieldBuildTicks = 600;           // same work as a house
 const int fieldGrowTicks = 10800;          // ~3 min from sowing to ripe at 1x (3 growing stages of ~1 min each)
 const int fieldGrowStages = 3;
@@ -1789,6 +1790,7 @@ struct mill {
     float sailAngle = 45.0f; // degrees; starts as an X, the classic resting pose
 };
 mill mills[raceCount];
+int plotsOpen[raceCount] = {};   // R46-F2a: high-water mark of plotsUnlocked(); never shrinks
 
 Vector2f millWorkSpot(const mill& m) { return m.pos + millStandOffset; }
 
@@ -3487,6 +3489,7 @@ optional<hoverHit> pickHover(Vector2f p, float radius, const vector<barb>& barbs
         if (fp.claimed) return string("being sown");
         if (k > 0 && !fp.placed && fp.fallback) return string("re-siting");   // R37-F1: slot given up, ring spot pending
         if (k > 0 && mills[r].placed && !fp.placed && !fp.reserved) return string("no room");
+        if (k < plotsOpen[r]) return string("unsown");   // R46-F2a: already unlocked (by homes or population)
         return "unsown (needs " + to_string(fieldMinHouses * k + 1) + (fieldMinHouses * k + 1 == 1 ? " home)" : " homes)");
     };
     auto farmLine = [&](int r) {   // FARM-F2: "mill: built/none, plots n/cap" for race r; R32-F1: then one line per plot
@@ -5118,10 +5121,33 @@ bool placeField(fieldGrid& fields, int r, int kPlot, const vector<barb>& barbs, 
 // barb of that race may claim one (jobField through buildOneOff(), which clears it on completion). All plots share
 // jobField, so only one is being sown at a time. A claim is held only while its own sower (by id, same race) still
 // holds jobField; otherwise it is released so another barb of that race can take it.
+// R46-F2a: the one plot gate. Race r may sow max(home unlock, raceBarbs / popPerPlot) plots, capped at fieldsPerRace
+// so food stays earned. Nothing opens before the race's first home. Kept as a high-water mark in plotsOpen[r], so a
+// shrinking race (or a lost home) never closes a plot; each growth past one plot logs one "Farmstead expanded" line.
+int plotsUnlocked(int r, int raceHouses, int raceBarbs) {
+    if (raceHouses >= fieldMinHouses) {
+        int byHouses = (raceHouses - 1) / fieldMinHouses + 1;   // plot k at fieldMinHouses*k+1 homes (R32-F1)
+        int n = min(fieldsPerRace, max(byHouses, raceBarbs / popPerPlot));
+        if (n > plotsOpen[r]) {
+            if (n > 1) {
+                printf("FARMSTEAD EXPANDED - %s now %d/%d plots (homes %d, barbs %d)\n",
+                       racePlurals[r], n, fieldsPerRace, raceHouses, raceBarbs);
+                logRaceEvent(string(racePlurals[r]) + ": Farmstead expanded (" + to_string(n) + " plots)", r);
+            }
+            plotsOpen[r] = n;
+        }
+    }
+    return plotsOpen[r];
+}
+
 void buildfield(vector<barb>& barbs, vector<RectangleShape>& squares, const vector<house>& houses, const vector<shrine>& shrines,
                 const storehouse (&stores)[raceCount], fieldGrid& fields) {
     int raceHouses[raceCount] = {};
     for (auto& h : houses) if (h.race >= 0 && h.race < raceCount) raceHouses[h.race]++;
+    int raceBarbs[raceCount] = {};   // R46-F2a: counted once per tick
+    for (auto& b : barbs) if (b.race >= 0 && b.race < raceCount) raceBarbs[b.race]++;
+    int unlocked[raceCount];
+    for (int r = 0; r < raceCount; r++) unlocked[r] = plotsUnlocked(r, raceHouses[r], raceBarbs[r]);
     int activeRace = -1, activeK = -1;
     for (int r = 0; r < raceCount; r++)
         for (int k = 0; k < fieldsPerRace; k++) {
@@ -5142,10 +5168,10 @@ void buildfield(vector<barb>& barbs, vector<RectangleShape>& squares, const vect
         for (int k = 0; k < fieldsPerRace; k++) {
             plot& fp = fields[r][k];
             if (fp.built || (activeRace >= 0 && (r != activeRace || k != activeK))) continue;
-            int needHouses = fieldMinHouses * k + 1;   // R32-F1: one more home per extra plot
+            bool plotOpen = k < unlocked[r];   // R46-F2a: plotsUnlocked() is the only plot-count gate
             if (!fp.placed) {
                 // R37-F1: the first gate holding the plot back; the slot gate also covers the wait between retries
-                int gate = !stores[r].built ? 1 : raceHouses[r] < needHouses ? 2 : !canAfford(stock[r], fieldWoodCost, 0) ? 4
+                int gate = !stores[r].built ? 1 : !plotOpen ? 2 : !canAfford(stock[r], fieldWoodCost, 0) ? 4
                          : (k > 0 && !mills[r].placed) ? 8 : 0;   // R32-F1: extra plots sit beside the mill
                 if (gate == 0 && (fp.retryTicks > 0 || !placeField(fields, r, k, barbs, houses, shrines, k == 0 && !mills[r].placed)))
                     gate = 8;
@@ -5153,9 +5179,9 @@ void buildfield(vector<barb>& barbs, vector<RectangleShape>& squares, const vect
                     // logged once per plot and gate; extra plots only, once plot 0 is sown (plot 0's start-up waits are normal)
                     if (k > 0 && fields[r][0].built && !(fp.stallMask & gate)) {
                         fp.stallMask |= gate;
-                        const char* why = gate == 1 ? "store" : gate == 2 ? "houses" : gate == 4 ? "wood" : "slot";
-                        printf("FIELD STALLED - %s plot %d waits on %s (houses %d/%d, wood %d/%d, store %s, slot %s)\n",
-                               racePlurals[r], k + 1, why, raceHouses[r], needHouses, stock[r].wood, fieldWoodCost,
+                        const char* why = gate == 1 ? "store" : gate == 2 ? "homes/pop" : gate == 4 ? "wood" : "slot";
+                        printf("FIELD STALLED - %s plot %d waits on %s (plots open %d/%d, wood %d/%d, store %s, slot %s)\n",
+                               racePlurals[r], k + 1, why, unlocked[r], k + 1, stock[r].wood, fieldWoodCost,
                                stores[r].built ? "built" : "none",
                                fp.fallback ? "re-siting" : fp.reserved ? "reserved" : "none");
                     }
@@ -5164,7 +5190,7 @@ void buildfield(vector<barb>& barbs, vector<RectangleShape>& squares, const vect
             }
             bool done = buildOneOff(barbs, squares, fp.claimed, jobField, fieldWorkSpot(fp), "FIELD",
                 [&](const barb& b) {
-                    if (raceHouses[r] < needHouses || !canAfford(stock[r], fieldWoodCost, 0)) return -1;
+                    if (!plotOpen || !canAfford(stock[r], fieldWoodCost, 0)) return -1;
                     if (b.race != r) return 0;   // only that race sows its plot
                     spend(stock[r], fieldWoodCost, 0);   // RACE-F1: the race's own wood
                     fp.sowerId = b.id;
