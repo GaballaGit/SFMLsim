@@ -1006,11 +1006,14 @@ const Color stockEmptyRaceColor(120, 118, 108); // a race with no living members
 // Race quarters (R30-F1): each race's crate sits in its own quarter around the village, at least raceMinSeparation from
 // the others; that race's houses go within quarterHouseRadius of it. Trees/rocks are kept off each quarter like the
 // village clearing, lakes and bush clumps avoid it, and each quarter is topped up at startup if it is short of wood/stone.
-// INBOX-F3 wider quarters: on the 800 map with 3 races the 120 deg split gives crates >= 165*sqrt(3) ~ 286 apart and
-// quarter edges >= 200+63 from the map edge/HUD, so quarterLayoutOk() always passes and the fallback should never fire.
+// INBOX-F3 wider quarters, R44-F4b pushed further out: on the 800 map with 3 races the 120 deg split gives crates
+// >= 210*sqrt(3) ~ 364 apart (> raceMinSeparation), and at any rotation the quarter clearing (63) reaches at most
+// 250+63 = 313 from the campfire, which fits both the side edges (400) and the HUD (400-24 = 376), and stays >= 210-63
+// = 147 clear of the village clearing (50). So quarterLayoutOk() always passes and the fallback should never fire.
+// Lakes are placed after the quarters and keep quarterClearRadius + lakeMinGap off each one.
 const float raceMinSeparation = 185.0f;      // min distance between two races' crates (startup check)
-const float quarterMinRadius = 165.0f;       // crate centre distance from the campfire
-const float quarterMaxRadius = 200.0f;
+const float quarterMinRadius = 210.0f;       // crate centre distance from the campfire (R44-F4b: was 165)
+const float quarterMaxRadius = 250.0f;       // (R44-F4b: was 200)
 const int quarterPlaceTries = 50;            // random layouts tried before the fixed fallback layout
 const float quarterHouseRadius = 56.0f;      // house spot within this of the crate centre (+25% over R30-F1's 45)
 const float quarterClearMargin = 7.0f;       // clearing reaches past the house disc: 5px slab half + 2
