@@ -245,6 +245,14 @@ const Vector2f villageCenter(400.0f, 400.0f);
 const int traderRaceCooldownVisits = 1;   // a served race sits out this many following visits (1 = no back-to-back)
 const int tradeFoodCost = 3;              // food paid per lot when no race can pay in stone
 const int tradeFoodReserve = startStock.food; // food fallback never takes a race below this
+// R44-F3 Frontier Groves: new trees lean outward. A rolled spot at distance d from villageCenter is kept with
+// probability clamp((d - groveRampStart) / groveRamp, groveMinAccept, 1); after groveMaxRetries rerolls the last
+// roll is kept, so spawn rate (and tree count) is unchanged and the centre still gets some trees.
+// Follow-up (not built yet): deer spawns and bush clumps are meant to share this group.
+const float groveRampStart = 60.0f;       // px from villageCenter where the outward bias starts easing off
+const float groveRamp = 300.0f;           // px over which acceptance rises from groveMinAccept to 1
+const float groveMinAccept = 0.1f;        // floor acceptance near the centre, keeps the clearing wooded
+const int groveMaxRetries = 10;           // rerolls before the last roll is accepted anyway
 
 const int hungerThreshold = 15 * ticksPerMinute; // 15 real min between meals; deer are the only food for now
 const int hungerWorkSlowdown = 2;         // hungry barbs with no food work and walk this many times slower
@@ -7314,6 +7322,14 @@ CircleShape makeTreeTri(int x, int y) {
 void treespawn(vector<tree>& trees, vector<CircleShape>& tris, vector<RectangleShape>& stumps, const fieldGrid& fields) {
     if (treespawnChance(gen) != 0) return;
     tree t{distrib(gen), distrib(gen), false};
+    // R44-F3: reroll toward the frontier; the last roll stands after groveMaxRetries
+    uniform_real_distribution<float> groveRoll(0.0f, 1.0f);
+    for (int i = 0; i < groveMaxRetries; i++) {
+        float d = hypot(t.x - villageCenter.x, t.y - villageCenter.y);
+        float accept = clamp((d - groveRampStart) / groveRamp, groveMinAccept, 1.0f);
+        if (groveRoll(gen) < accept) break;
+        t = tree{distrib(gen), distrib(gen), false};
+    }
     if (!lakeClear(FloatRect(Vector2f(t.x, t.y), Vector2f(treeFootprint, treeFootprint)))) return; // no trees in the water
     if (!fieldsClear(fields, FloatRect(Vector2f(t.x, t.y), Vector2f(treeFootprint, treeFootprint)))) return; // nor on a wheat plot
     if (!towerClear(FloatRect(Vector2f(t.x, t.y), Vector2f(treeFootprint, treeFootprint)))) return;  // R33-F2: nor on a gate tower
