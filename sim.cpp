@@ -645,6 +645,18 @@ const float forgeSparkRiseMin = 0.15f, forgeSparkRiseMax = 0.3f; // px per frame
 const float forgeSparkDriftMax = 0.12f;    // px per frame sideways, either way
 const Color forgeSparkColor(236, 146, 64); // warm orange, a step above forgeEmberHot
 const uint8_t forgeSparkMaxAlpha = 220;    // linear fade to 0
+// R41-F2: forge phase 2b. A dwarf finishing a stone haul while forgeActive, with no charges left, pays kTemperStoneCost and
+// tempers its pick at forgePos + forgeStandOffset for kTemperTicks; its next kTemperCharges rock mines run kTemperMineSpeed
+// times faster. Shaft trips neither use nor spend charges: a shaft mine is kShaftTickMult x as long, so the same speedup
+// there would save more than the stone it cost.
+constexpr int kTemperStoneCost = 1;
+constexpr int kTemperTicks = 2;               // work ticks at the forge, in barb.temperTimer (never barb.timer)
+constexpr int kTemperCharges = 3;
+constexpr float kTemperMineSpeed = 1.25f;     // 25% faster mining rate while charged
+// a rock is 1 stone per mineTicks, so the time saved over all charges, in rocks, must stay below the stone spent
+static_assert(kTemperCharges * (1.0f - 1.0f / kTemperMineSpeed) < (float)kTemperStoneCost, "tempering must not pay for itself");
+const Vector2f temperPipSize(2.0f, 2.0f);     // beside the left foot of a charged dwarf
+const Color temperPipColor(170, 196, 222);    // pale tempered steel blue: reads on the dark green, apart from cap brown and horns
 
 // Race storehouses (R29-F1): one per race at a fixed spot, built by a barb of that race. Chopped wood and mined stone
 // are carried to the hauler's own race's storehouse (the campfire while it isn't standing) and only counted on arrival.
@@ -1894,6 +1906,10 @@ struct barb {
     int orderTicks = 0;          // INBOX-F2b: ticks until the order expires; reset in makeBarb()
     barbRoute route;             // R39-F1: moves with the struct on swapRemove; reset only through clearRoute()
     bool inMine = false;         // R40-F1: down its race's shaft (not drawn); set at the stand spot, cleared only by leaveMine()
+    bool tempering = false;      // R41-F2: exclusive temper state owned by temperTick(); never set with chopping/building; cleared by clearTemper()
+    int temperTimer = 0;         // R41-F2: work ticks at the forge; separate from timer; cleared by clearTemper()
+    bool temperPaid = false;     // R41-F2: kTemperStoneCost already taken; refunded by clearTemper() unless the temper finished
+    int toolCharges = 0;         // R41-F2: tempered rock mines left; set on a finished temper, reset by clearTemper() and makeBarb()
 };
 // R39-F1: the one route reset, called wherever moving/movingbspot is cleared and before a barb is swapRemoved
 void clearRoute(barb& b) {
@@ -1945,6 +1961,20 @@ void dropCarry(barb& b) {
     if (b.target == targetDepot) b.target = targetNone;
 }
 
+// R41-F2: every way out of a temper (finished, interrupted, reassigned, forge gone, sheltering, death) goes through here.
+// Refunds the stone if it is still owed and resets toolCharges; leaves movement alone so a new assignment is not undone
+// (temperTick() clears movement on its own exits). The finish path clears temperPaid first and sets the charges after.
+void clearTemper(barb& b) {
+    if (b.temperPaid) {
+        stockOf(b).stone += kTemperStoneCost;
+        printf("TEMPER REFUNDED - barb %d, %s +%d stone\n", b.id, racePlurals[clampRace(b.race)], kTemperStoneCost);
+    }
+    b.temperPaid = false;
+    b.tempering = false;
+    b.temperTimer = 0;
+    b.toolCharges = 0;
+}
+
 // R34-F1: true if b's work target is its own race's shaft stand spot (the spot is fixed, so this holds in any shaft state)
 bool atShaftTarget(const barb& b) {
     if (b.race < 0 || b.race >= raceCount || b.target != targetRock) return false;
@@ -1952,7 +1982,11 @@ bool atShaftTarget(const barb& b) {
     return b.targetx == (int)s.x && b.targety == (int)s.y;
 }
 // R34-F1: work ticks for the barb's current mining job: doubled at the shaft
-int mineTicksFor(const barb& b) { return atShaftTarget(b) ? kShaftTickMult * mineTicks(b) : mineTicks(b); }
+// R41-F2: a tempered pick (toolCharges > 0) scales rock mining only; this is the one place the charge speedup applies
+int mineTicksFor(const barb& b) {
+    if (atShaftTarget(b)) return kShaftTickMult * mineTicks(b);
+    return b.toolCharges > 0 ? (int)(mineTicks(b) / kTemperMineSpeed) : mineTicks(b);
+}
 // R40-F1: the one miner a shaft serves: the first ungarrisoned own-race barb targeting its stand spot (-1 = none).
 // minematerials() derives its per-tick shaftMiner[] from this, so the tooltip and the work bar agree with the work loop.
 int shaftMinerOf(const vector<barb>& barbs, int r) {
@@ -2132,6 +2166,7 @@ void swapRemove(vector<T>& v, int i) {
 Color barbColor(const barb& b) {
     if (b.deertargeting) return barbHuntColor;
     if (b.building) return barbBuildColor;
+    if (b.tempering) return barbMineColor;   // R41-F2: pick work at the forge; never overlaps chopping/building
     if (b.chopping && b.target == targetBush) return barbPickColor;
     if (b.chopping && b.target == targetField) return barbHarvestColor;
     if (b.chopping && b.target == targetLake) return barbFishColor;
@@ -2145,6 +2180,7 @@ const char* barbTaskName(const barb& b) {
     if (b.garrisoned) return b.garrisonInside ? "sheltering" : "running to shelter";   // INBOX-F1
     if (b.deertargeting) return b.hasSpear ? "hunting (spear)" : "hunting";
     if (b.building) return "building";
+    if (b.tempering) return "tempering pick";   // R41-F2
     if (b.chopping && b.target == targetBush) return "picking";
     if (b.chopping && b.target == targetField) return "harvesting";
     if (b.chopping && b.target == targetLake) return "fishing";
@@ -2196,7 +2232,7 @@ void deerkilling(vector<deer>& deers, vector<RectangleShape>& deershape, vector<
 		for (int j = 0; j < (int)barbs.size(); ++j) {
 			auto& b = barbs[j];
 			auto& sq = squares[j];
-			if (b.garrisoned || b.building || b.movingbspot || b.chopping || b.timer > 0 || b.carryKind != carryNone) continue;   // R29-F1: haulers finish the trip
+			if (b.garrisoned || b.building || b.movingbspot || b.chopping || b.timer > 0 || b.carryKind != carryNone || b.tempering) continue;   // R29-F1: haulers finish the trip; R41-F2: so do temperers
 			if (!b.deertargeting) {
 				Vector2f bpos = sq.getPosition();
 				float dx = deerpos.x - bpos.x, dy = deerpos.y - bpos.y;
@@ -3006,6 +3042,12 @@ void drawBarbs(RenderWindow& window, const vector<barb>& barbs, const vector<Rec
             tool.setFillColor(spearTipColor);
             tool.setPosition(Vector2f(side, raised ? bodyTop + 1.0f : bodyTop + 2.0f));
             window.draw(tool);
+        }
+        if (b.toolCharges > 0) {   // R41-F2: tempered pick: 2x2 steel pip beside the left foot, one column clear of the trait dot
+            stripe.setSize(temperPipSize);
+            stripe.setFillColor(temperPipColor);
+            stripe.setPosition(Vector2f(base.x - 1.0f - temperPipSize.x, bodyTop + bodyH - temperPipSize.y));   // bobs with the body
+            window.draw(stripe);
         }
         if (b.hasSpear && !b.chopping && !b.building) {   // R20-F3: spear carried upright-ish; stowed while working
             tool.setFillColor(spearShaftColor);
@@ -5253,6 +5295,9 @@ void makeBarb(Vector2i pos, vector<barb>& barbs, vector<RectangleShape>& squares
     b.spearTimer = 0;
     b.spearPaid = false;  // POL-F3
     b.spearAtForge = false;   // POL-F5a
+    b.tempering = b.temperPaid = false;   // R41-F2: no temper in progress, an untempered pick
+    b.temperTimer = 0;
+    b.toolCharges = 0;
     for (auto& m : b.mem) m = workMem{};   // INBOX-F2: a newborn remembers no spots
     b.memReturn = b.memShared = false;
     b.order = needNone;   // INBOX-F2b: a newborn holds no order
@@ -6004,6 +6049,7 @@ void releaseBarbWork(barb& b, smokehouseSet& sh, forge& fg, storehouse (&stores)
     b.reservedwood = false;
     b.reservedstone = 0;
     refundSpear(b);                              // POL-F3: paid spear craft goes back to its race before the swapRemove
+    clearTemper(b);                              // R41-F2: mid-temper stone refunded, charges reset (death and sheltering)
     switch (b.jobKind) {                         // claims paid at claim time stay spent; the next builder pays again
         case jobSmoke: if (b.race >= 0 && b.race < raceCount && !sh[b.race].built) sh[b.race].claimed = false; break;   // INBOX2-F1: own race's hut
         case jobForge: if (!fg.built) fg.claimed = false; break;
@@ -6302,7 +6348,7 @@ void rankRaceNeed(const vector<barb>& barbs, int r) {
 
 // INBOX-F2b: idle = no work, build, hunt, haul or job claim. Garrisoned barbs are never idle, so an order never touches shelter
 bool orderIdle(const barb& b) {
-    return !b.garrisoned && !b.chopping && !b.building && !b.movingbspot && !b.deertargeting && b.jobKind == jobNone && b.carryKind == carryNone;
+    return !b.garrisoned && !b.chopping && !b.building && !b.movingbspot && !b.deertargeting && b.jobKind == jobNone && b.carryKind == carryNone && !b.tempering;
 }
 
 // INBOX-F2b: right after the leader names its need, it hands that need as an individual order to idle members (not
@@ -6446,7 +6492,7 @@ void barbmove(vector<RectangleShape>& squares, vector<barb>& barbs) {
     for (int i = 0; i < (int)squares.size(); i++) {
         auto& sq = squares[i];
         auto& b  = barbs[i];
-        if (b.garrisoned || b.chopping || b.timer > 0 || b.movingbspot || b.building || b.carryKind != carryNone) continue;   // R29-F1: haulTick() walks haulers; INBOX-F1: bellTick() walks garrisoned
+        if (b.garrisoned || b.chopping || b.timer > 0 || b.movingbspot || b.building || b.carryKind != carryNone || b.tempering) continue;   // R29-F1: haulTick() walks haulers; INBOX-F1: bellTick() walks garrisoned; R41-F2: temperTick() walks temperers
         Vector2f pos = sq.getPosition();
         if (!b.moving) {
             if (wanderChance(gen) != 0) continue;
@@ -6592,6 +6638,58 @@ void startHaul(barb& b, carryLoad load, const storehouse (&stores)[raceCount], i
     b.stepTimer = 0;
 }
 
+// R41-F2: started by haulTick() right after a dwarf's stone deposit; the stone is paid here (temperPaid) and refunded by
+// clearTemper() on any abort
+void startTemper(barb& b) {
+    spend(stockOf(b), 0, kTemperStoneCost);
+    b.temperPaid = true;
+    b.tempering = true;
+    b.temperTimer = 0;
+    Vector2f spot = forgePos + forgeStandOffset;
+    b.targetx = (int)spot.x;
+    b.targety = (int)spot.y;
+    b.moving = true;
+    b.stepTimer = 0;
+    printf("TEMPER STARTED - barb %d, %s -%d stone (stone: %d)\n", b.id, racePlurals[clampRace(b.race)], kTemperStoneCost, stockOf(b).stone);
+}
+
+// R41-F2: one temper step: walk to the forge stand spot, then kTemperTicks work ticks with a spark burst on each.
+// The forge going away (forgeActive false) refunds via clearTemper() and frees the barb.
+void temperTick(barb& b, RectangleShape& sq, const forge& fg) {
+    auto release = [&]() {
+        b.moving = false; clearRoute(b);
+        b.stepTimer = 0;
+        b.targetx = b.targety = -1;
+    };
+    if (!forgeActive(fg, b.race)) {
+        printf("TEMPER ABORTED - barb %d, forge lost\n", b.id);
+        clearTemper(b);
+        release();
+        return;
+    }
+    Vector2f spot = forgePos + forgeStandOffset;
+    b.targetx = (int)spot.x;
+    b.targety = (int)spot.y;
+    Vector2f diff = spot - sq.getPosition();
+    if (diff.x * diff.x + diff.y * diff.y >= 1.0f) {
+        b.moving = true;
+        walkStep(b, sq);   // R39-F1
+        return;
+    }
+    b.moving = false; clearRoute(b);   // standing at the anvil
+    if (!workTick(b)) return;
+    b.temperTimer++;
+    spawnForgeSparks();
+    if (b.temperTimer < kTemperTicks) return;
+    b.temperPaid = false;   // finishing consumes the stone, so clearTemper refunds nothing
+    clearTemper(b);
+    b.toolCharges = kTemperCharges;
+    release();
+    memEndTrip(b);   // INBOX-F2: head back to the remembered rock
+    printf("---PICK TEMPERED--- barb %d, %s, %d charges\n", b.id, racePlurals[clampRace(b.race)], kTemperCharges);
+    logRaceEvent(string(b.name) + " tempered pick (" + to_string(kTemperCharges) + ")", b.race);
+}
+
 // R29-F1: one hauler step. The depot is re-resolved every tick, so a storehouse that is gone sends the load to the
 // campfire. On arrival the load is added to the stock, the storehouse flashes, and the barb is idle again.
 void haulTick(barb& b, RectangleShape& sq, storehouse (&stores)[raceCount], const forge& fg) {
@@ -6642,6 +6740,9 @@ void haulTick(barb& b, RectangleShape& sq, storehouse (&stores)[raceCount], cons
                st ? "storehouse" : "campfire", tithe ? " (campfire tithe)" : "", forged ? " (+forge bonus)" : "",
                racePlurals[clampRace(b.race)], rs.wood, rs.stone, campfireWood);
     }
+    // R41-F2: a dwarf's stone haul ends at the forge to temper an untempered pick, if the stone is there to pay for it
+    bool temper = b.carryKind == carryStone && forgeActive(fg, b.race) && b.toolCharges == 0
+                  && canAfford(stockOf(b), 0, kTemperStoneCost);
     b.carryKind = carryNone;
     b.carryAmount = 1;   // R34-F1
     b.target = targetNone;
@@ -6649,6 +6750,7 @@ void haulTick(barb& b, RectangleShape& sq, storehouse (&stores)[raceCount], cons
     b.stepTimer = 0;
     b.targetx = b.targety = -1;
     memEndTrip(b);   // INBOX-F2
+    if (temper) startTemper(b);
 }
 
 void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<CircleShape>& tris, vector<RectangleShape>& stumps, vector<tree>& trees, vector<CircleShape>& octs, vector<rock>& rocks,
@@ -6677,6 +6779,16 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
         auto& sq = squares[j];
         auto& b  = barbs[j];
         if (b.garrisoned) continue;   // INBOX-F1: no work or tree/rock/bush/shore search while sheltering
+        if (b.toolCharges > 0 && !b.tempering && !forgeActive(fg, b.race)) {   // R41-F2: forge gone: the tempered edge goes with it
+            printf("PICK UNTEMPERED - barb %d, forge lost\n", b.id);
+            clearTemper(b);
+        }
+        if (b.tempering) {   // R41-F2: any other state taken over the temper refunds it; temperTick() handles the forge going
+            if (b.movingbspot || b.building || b.deertargeting || b.chopping || b.jobKind != jobNone || b.carryKind != carryNone) {
+                printf("TEMPER INTERRUPTED - barb %d\n", b.id);
+                clearTemper(b);
+            } else { temperTick(b, sq, fg); continue; }
+        }
         if (b.carryKind != carryNone) {   // R29-F1: any other state taken over the haul drops the load
             if (b.target != targetDepot || b.movingbspot || b.building || b.deertargeting || b.chopping || b.jobKind != jobNone) dropCarry(b);
             else { haulTick(b, sq, stores, fg); continue; }
@@ -7005,8 +7117,12 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
 			b.chopping = true;
 			rocks[i].dying = true;
 			if (workTick(b)) b.timer++;
-			if (b.timer >= mineTicks(b)) {           // dwarves finish rocks faster
+			if (b.timer >= mineTicksFor(b)) {        // dwarves finish rocks faster; R41-F2: a tempered pick faster still
 				practice(techPickwork);
+				if (b.toolCharges > 0) {             // R41-F2: one charge per completed rock, after the scaled check above
+					b.toolCharges--;
+					printf("TEMPERED MINE - barb %d, %d charges left\n", b.id, b.toolCharges);
+				}
 				if (b.race == raceDwarf) forgeEmberFrames = forgeEmberBoostFrames; // forge ember flares (drawn only once built)
 				memRecord(b, memRock, Vector2f((int)rix, (int)riy));   // INBOX-F2
 				swapRemove(rocks, i);
@@ -7602,7 +7718,7 @@ int main() {
                 drawBar(window, shaftPos(b.race) + Vector2f(shaftSize.x / 2 - barSize.x / 2,
                         -shaftSeamGap - shaftSeamH - 2.0f - barFramePx - barSize.y), (float)b.timer / mineTicksFor(b), pal.barMine);
 	    } else if (b.chopping && b.timer > 0 && b.target == targetRock)
-                drawBar(window, Vector2f(b.targetx - 10, b.targety - 16), (float)b.timer / mineTicks(b), pal.barMine);
+                drawBar(window, Vector2f(b.targetx - 10, b.targety - 16), (float)b.timer / mineTicksFor(b), pal.barMine);   // R41-F2: tempered scale
 	}
 	drawBirthRings(window, birthRings);
 	drawCatchRings(window, catchRings);
