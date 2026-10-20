@@ -339,6 +339,23 @@ const float graveSpreadPx = 4.0f;                 // a stone landing on another 
 // that much slower (a rest tick every 1/term ticks), so 4 stones = 4% longer between meals at most.
 const float graveMoralePerStone = 0.01f;
 const float graveMoraleMax = 0.04f;
+// R50-F1a The Veil (phase 1, hidden, no visuals): a coarse ether grid per race over the whole map. Every death
+// (removeBarb) deposits a soul where the barb fell; every veilStepTicks the grids diffuse to their 4 neighbours (no-flux
+// edges, double-buffered) and decay a little. Births read the souls of every race around the birth spot: a mild rate
+// factor between veilBirthFloor and 1, never a full gate. While the whole veil is empty the granary rule alone decides.
+constexpr float veilCellPx = 40.0f;               // coarse: 60x60 cells on the 2400px map
+constexpr int veilGridN = (int)(worldSize / veilCellPx);
+static_assert(veilGridN * veilCellPx >= worldSize, "veil grid must cover the map");
+const float veilSoulPerDeath = 1.0f;              // ether one death leaves in its cell
+const int veilStepTicks = 10;                     // diffusion/decay runs once per this many sim ticks
+const float veilDiffusion = 0.02f;                // share of the gap to the neighbour mean closed per step
+const float veilDecay = 0.0001f;                  // per step: half-life ~6900 steps = ~19 min at 1x
+const float veilZeroBelow = 1e-5f;                // a cell this faint is cleared (keeps the grid free of denormals)
+const float veilEmptyEpsilon = 0.01f;             // total ether below this = pools empty: births use the granary rule only
+const float veilFullLocal = 0.5f;                 // ether in the 3x3 cells round a birth spot for the full (x1) rate
+constexpr float veilBirthFloor = 0.7f;               // the slowest birth rate the veil allows (x0.7): mild, never a gate
+static_assert(veilBirthFloor > 0.0f && veilBirthFloor <= 1.0f, "the veil must never fully gate births");
+const float veilBirthDraw = 0.25f;                // ether a birth draws from the 3x3 cells round its spot
 
 const int eventMaxLines = 5;              // ticker shows (and stores) at most this many events
 const int eventFadeTicks = 300;           // frames an event stays on screen (~5s at 60fps)
@@ -3770,6 +3787,112 @@ vector<grave> graves;                       // oldest first, at most graveMax
 float graveMorale[raceCount] = {};          // the one morale term per race, recomputed by graveTick() every tick
 float graveRestAcc[raceCount] = {};         // carries the fractional rest ticks between ticks
 bool graveHungerRest[raceCount] = {};       // this tick, race r's hunger does not grow (read in hungerTick)
+
+// R50-F1a The Veil: hidden soul-ether. Holds only values (race, cell amounts), never a barb index or id.
+struct veilState {
+    float ether[2][raceCount][veilGridN * veilGridN] = {};   // double buffer: [front] is live, the other is the scratch
+    int front = 0;
+    float pool[raceCount] = {};   // per-race total, kept by deposits/draws and recomputed each diffusion step
+    int stepTimer = 0;
+    int slowedBirths = 0;         // births the veil held back (for phase 2 omens)
+    int lastSlowedRace = -1;      // house race of the last held-back birth
+    int lastDrawnRace = -1;       // race of the soul the last birth drew, -1 if none (phase 2 ring tint)
+};
+veilState veil;
+
+int veilCell(int cx, int cy) { return clamp(cy, 0, veilGridN - 1) * veilGridN + clamp(cx, 0, veilGridN - 1); }
+int veilCellX(Vector2f p) { return clamp((int)(p.x / veilCellPx), 0, veilGridN - 1); }
+int veilCellY(Vector2f p) { return clamp((int)(p.y / veilCellPx), 0, veilGridN - 1); }
+
+float veilTotal() {
+    float t = 0.0f;
+    for (int r = 0; r < raceCount; r++) t += veil.pool[r];
+    return t;
+}
+
+// Called from removeBarb() only, with the race and spot copied out before the swapRemove
+void veilDeposit(int race, Vector2f p, float amount) {
+    int r = clampRace(race);
+    veil.ether[veil.front][r][veilCell(veilCellX(p), veilCellY(p))] += amount;
+    veil.pool[r] += amount;
+    printf("VEIL - %s soul settles at %d,%d (pool %.2f)\n", racePlurals[r], (int)p.x, (int)p.y, veil.pool[r]);
+}
+
+// Ether of one race (or every race when race < 0) in the 3x3 cells round p
+float veilLocal(int race, Vector2f p) {
+    int cx = veilCellX(p), cy = veilCellY(p);
+    float s = 0.0f;
+    for (int r = 0; r < raceCount; r++) {
+        if (race >= 0 && r != race) continue;
+        for (int dy = -1; dy <= 1; dy++)
+            for (int dx = -1; dx <= 1; dx++) {
+                int x = cx + dx, y = cy + dy;
+                if (x < 0 || y < 0 || x >= veilGridN || y >= veilGridN) continue;
+                s += veil.ether[veil.front][r][y * veilGridN + x];
+            }
+    }
+    return s;
+}
+
+// Birth rate factor at p: 1 while the veil is empty (granary rule only), else veilBirthFloor..1 by the nearby souls
+float veilBirthFactor(Vector2f p) {
+    if (veilTotal() < veilEmptyEpsilon) return 1.0f;
+    float fill = min(1.0f, veilLocal(-1, p) / veilFullLocal);
+    return veilBirthFloor + (1.0f - veilBirthFloor) * fill;
+}
+
+// A birth at p draws up to amount from one race's souls nearby, picked weighted by what each race has there.
+// Drains that race's 3x3 cells in proportion; returns the race drawn, or -1 if nothing was near.
+int veilDraw(Vector2f p, float amount) {
+    float local[raceCount], all = 0.0f;
+    for (int r = 0; r < raceCount; r++) { local[r] = veilLocal(r, p); all += local[r]; }
+    if (all <= 0.0f) return -1;
+    uniform_real_distribution<float> pick(0.0f, all);
+    float roll = pick(gen);
+    int r = raceCount - 1;
+    for (int k = 0; k < raceCount; k++) {
+        if (roll < local[k]) { r = k; break; }
+        roll -= local[k];
+    }
+    if (local[r] <= 0.0f) return -1;
+    float take = min(amount, local[r]), keep = 1.0f - take / local[r];
+    int cx = veilCellX(p), cy = veilCellY(p);
+    for (int dy = -1; dy <= 1; dy++)
+        for (int dx = -1; dx <= 1; dx++) {
+            int x = cx + dx, y = cy + dy;
+            if (x < 0 || y < 0 || x >= veilGridN || y >= veilGridN) continue;
+            veil.ether[veil.front][r][y * veilGridN + x] *= keep;
+        }
+    veil.pool[r] = max(0.0f, veil.pool[r] - take);
+    return r;
+}
+
+// Every veilStepTicks: diffuse (no-flux edges, so diffusion alone keeps the total) and decay each race's grid from
+// the front buffer into the back one, then flip. Recomputes the per-race pools.
+void veilTick() {
+    if (++veil.stepTimer < veilStepTicks) return;
+    veil.stepTimer = 0;
+    if (veilTotal() <= 0.0f) return;   // nothing in the veil: skip the sweep
+    const int src = veil.front, dst = 1 - veil.front;
+    for (int r = 0; r < raceCount; r++) {
+        const float* cur = veil.ether[src][r];
+        float* nxt = veil.ether[dst][r];
+        float total = 0.0f;
+        for (int y = 0; y < veilGridN; y++)
+            for (int x = 0; x < veilGridN; x++) {
+                int i = y * veilGridN + x;
+                float c = cur[i];
+                float n = (x > 0 ? cur[i - 1] : c) + (x < veilGridN - 1 ? cur[i + 1] : c)
+                        + (y > 0 ? cur[i - veilGridN] : c) + (y < veilGridN - 1 ? cur[i + veilGridN] : c);
+                float v = (c + veilDiffusion * (n * 0.25f - c)) * (1.0f - veilDecay);
+                if (v < veilZeroBelow) v = 0.0f;
+                nxt[i] = v;
+                total += v;
+            }
+        veil.pool[r] = total;
+    }
+    veil.front = dst;
+}
 
 // Called from removeBarb() only. The stone stands where the barb's feet were, nudged off any stone already there.
 void addGrave(const barb& b, const RectangleShape& sq) {
@@ -7651,6 +7774,7 @@ void removeBarb(vector<barb>& barbs, vector<RectangleShape>& squares, int i,
     printf("BARB DIED - %s the %s (%s, %s), id %d - %d left\n", b.name, traitOf(b).name, raceOf(b).name,
            isGentry(b) ? "Gentry" : "Commoner", b.id, (int)barbs.size() - 1);
     addGrave(b, squares[i]);   // R47-F9: copied out by value; nothing in graves points back at barbs
+    veilDeposit(b.race, squares[i].getPosition() + squares[i].getSize() / 2.0f, veilSoulPerDeath);   // R50-F1a: by value
     b.homeHouse = -1;
     clearRoute(b);   // R39-F1: the route lives in the struct; the swapped-in barb keeps its own route
     swapRemove(barbs, i);
@@ -8524,10 +8648,23 @@ void barbspawner(vector<RectangleShape>& squares, vector<barb>& barbs, const vec
             }
             continue;
         }
+        Vector2f pos = houseshapes[i].getPosition();
+        Vector2f birthSpot(pos.x + 4, pos.y + 13);
+        // R50-F1a: the veil's mild factor (veilBirthFloor..1) after the granary rule; exactly 1 while the veil is empty
+        float veilFactor = veilBirthFactor(birthSpot);
+        if (veilFactor < 1.0f) {
+            uniform_real_distribution<float> veilRoll(0.0f, 1.0f);
+            if (veilRoll(gen) >= veilFactor) {
+                veil.slowedBirths++;
+                veil.lastSlowedRace = r;
+                printf("VEIL - %s birth held back (factor %.2f, %d held)\n", racePlurals[r], veilFactor, veil.slowedBirths);
+                continue;   // nothing paid: the next roll may succeed
+            }
+        }
         int paid = min(rs.food, birthFoodCost);
         spend(rs, 0, 0, birthFoodCost);
-        Vector2f pos = houseshapes[i].getPosition();
-        makeBarb(Vector2i((int)(pos.x + 4), (int)(pos.y + 13)), barbs, squares, rings, houses[i].id, houses[i].race);   // R28-F1: born into the house's clan
+        makeBarb(Vector2i((int)birthSpot.x, (int)birthSpot.y), barbs, squares, rings, houses[i].id, houses[i].race);   // R28-F1: born into the house's clan
+        veil.lastDrawnRace = veilDraw(birthSpot, veilBirthDraw);   // R50-F1a: -1 if no soul was near
         logEvent(string(barbs.back().name) + " the " + traitOf(barbs.back()).name + " is born (pop " + to_string(barbs.size()) + ")" +
                  (paid > 0 ? " -" + to_string(paid) + " food" : ""));
         if (paid > 0) foodFlashFrames = birthFlashFrames;
@@ -10399,6 +10536,7 @@ int main() {
                 weatherTick();
                 traderTick(activeTrader, barbs, stores);
                 graveTick(barbs, squares);   // R47-F9: morale term per race, before hungerTick() reads it
+                veilTick();   // R50-F1a: throttled diffusion/decay of the hidden soul-ether
                 hungerTick(barbs);
                 trailTick();
                 birdTick(birds, birdHeading, squares, barbs);
