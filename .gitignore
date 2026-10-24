@@ -13,3 +13,6 @@ feature-reports/board-progress.json
 feature-reports/.progress-seen.json
 feature-reports/usage.json
 feature-reports/.requeue-counts.json
+
+# brainstormer: last commit reviewed
+feature-reports/.brainstorm-last
