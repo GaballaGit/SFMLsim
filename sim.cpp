@@ -606,6 +606,40 @@ const Color watchTorchGlowColor(255, 150, 60, 40);   // faint 3x3 halo behind th
 const int watchTorchFlickerFrames = 7;
 const Color watchRingColor(235, 160, 80, 55);        // faint 1px patrol ring, only while a watchman is hovered/selected
 const int watchRingPoints = 72;
+// R52-F1 Spear Marches, phase 1: a cold pair (relCold), once its per-pair cooldown has run out, sends one 3-barb column of
+// armed barbs (1px red pennant on the spear) to the rival crate. A pulsing red marker sits on the target crate, the rival
+// bell rings through bellTick() (raidThreat[]), and raidTick() owns every raider's and defender's movement and runs its own
+// fight resolver. Damage never takes a barb below kRaidHealthFloor, so a raid costs health only. The win/loss ticker line
+// is the only outcome: no loot, no grudge, no relation change. raidParty holds stable barb ids, re-resolved every tick.
+const int kRaidPartySize = 3;                 // raiders in the column
+const int kRaidMinMembers = 2;                // fewer live (or unbeaten, in the fight) raiders than this ends the raid
+const int kRaidDefenderMax = 3;               // defenders called out at once
+const int kRaidPairCooldownTicks = 24 * ticksPerGameHour;   // one game day per pair between raids (also before the first)
+const int kRaidCheckTicks = 600;              // launch scan throttle (~10s at 1x)
+const float kRaidRecruitRadius = 140.0f;      // raiders come from within this of their own crate centre
+const int kRaidMinHealth = 60;                // a raider must be at least this hale (and not hungry)
+const int kRaidDefendMinHealth = 40;          // a defender must be at least this hale (beaten ones are never recalled)
+const float kRaidAlarmPx = 90.0f;             // a raider within this of the rival crate centre rings the bell and starts the fight
+const float kRaidDefendRadius = 140.0f;       // defenders come from within this of their crate centre
+const int kRaidDefendScanTicks = 60;          // defender call-up throttle during the fight
+const float kRaidEngagePx = 40.0f;            // a raider turns on a defender within this (centre to centre)
+const float kRaidStrikeRangePx = 4.0f;        // centre distance to strike
+const int kRaidStrikeCooldownTicks = 90;      // ticks between strikes (~1.5s at 1x)
+const int kRaidHealthFloor = 30;              // raid blows stop here: the barb is beaten and leaves the fight, never killed
+const int kRaidHoldTicks = 180;               // an unopposed raider must hold the crate this long (~3s) to win
+const int kRaidFightMaxTicks = 45 * 60;       // the fight gives out after ~45s: the raiders are driven off
+const int kRaidMaxTicks = 10 * ticksPerMinute;   // backstop on the whole raid (march, fight and walk home)
+const float kRaidColumnGapPx = 5.0f;          // follower stands this far behind the barb ahead in the column
+const float kRaidColumnStretchPx = 16.0f;     // the column head waits while its tail is farther back than this
+const int kRaidFlashFrames = 2;               // white hit flash on the struck barb, counted in drawn frames
+const Color kRaidFlashColor(255, 255, 255);   // body and a 1px rim: reads over the off-white body
+const Color kRaidPennantColor(226, 50, 44);   // 1px pennant beside the spear tip, raiders only
+const Vector2f kRaidMarkerSize(3.0f, 3.0f);   // above the target crate's top-left corner (the bell marker sits top-right)
+const Vector2f kRaidMarkerOffset(0.0f, -kRaidMarkerSize.y - 1.0f);
+const Color kRaidMarkerColor(222, 54, 46);    // alpha pulses between kRaidMarkerAlphaMin and 255
+const int kRaidMarkerAlphaMin = 90;
+const float kRaidMarkerPulseRate = 0.12f;     // radians per drawn frame (~0.9s period at 60fps)
+const Color kRaidTickerTint(222, 120, 104);   // launch and outcome ticker lines
 
 // Skittish deer: bolt away from a nearby barb for a short, capped time, then a cooldown so hunts can still land
 const int deerStepInterval = 3;            // ticks per 1px step while wandering (deer row of speciesDefs)
@@ -2647,8 +2681,10 @@ struct barbRoute {
     int lastCell = -1;           // cell the barb last added wear to (wear once per cell entered)
 };
 
+enum raidRole { raidNone, raidAttacker, raidDefender };   // R52-F1
+
 struct barb {
-    int id = -1;                // stable, unique; assigned only by makeBarb()
+    int id = -1;              // stable, unique; assigned only by makeBarb()
     int x, y;
     bool moving = false;
     int targetx = -1, targety = -1;
@@ -2711,6 +2747,12 @@ struct barb {
     int watchStop = 0;           // R51-F1: patrol waypoint index round the ring
     int watchPreyId = -1;        // R51-F1: prowler.id being fought (stable id, re-resolved every tick); -1 = patrolling
     int watchCooldown = 0;       // R51-F1: ticks until the next strike
+    raidRole raidSide = raidNone; // R52-F1: exclusive raid state owned by raidTick(); set only by joinRaid(), cleared only by clearRaid()
+    int raidPreyId = -1;         // R52-F1: barb.id of the foe being fought (re-resolved every tick); -1 = none
+    int raidCooldown = 0;        // R52-F1: ticks until the next strike
+    bool raidBeaten = false;     // R52-F1: knocked down to kRaidHealthFloor; out of the fight
+    int raidFlash = 0;           // R52-F1: hit flash, drawn frames left (counted down in main after drawBarbs())
+    bool kneeling = false;       // R52-F3 reserves this flag (the Rite); read here only, so a kneeler is never recruited for a raid
 };
 // R39-F1: the one route reset, called wherever moving/movingbspot is cleared and before a barb is swapRemoved
 void clearRoute(barb& b) {
@@ -2720,7 +2762,7 @@ void clearRoute(barb& b) {
 }
 bool barbHidden(const barb& b) { return b.garrisoned && b.garrisonInside; }   // INBOX-F1
 // R45-F2: the one eligibility gate every job selector checks: false while bellTick() (garrison) or expeditionTick() owns the barb
-bool barbAvailable(const barb& b) { return !b.garrisoned && !b.onExpedition; }
+bool barbAvailable(const barb& b) { return !b.garrisoned && !b.onExpedition && b.raidSide == raidNone; }   // R52-F1: or raidTick()
 // R47-F7: busy at the forge (temperTick() or smeltTick() walks and works the barb); wander, hunts and orders skip it
 bool atForgeTask(const barb& b) { return b.tempering || b.smelting; }
 
@@ -2794,6 +2836,40 @@ void expeditionMemberLost(const barb& b) {
 // R45-F2: the relic carrier on the walk home, for drawBarbs(); -1 = nobody
 int relicCarrierId() {
     return party.active && party.relic && party.phase == expeditionParty::Back ? party.memberIds[0] : -1;
+}
+
+// R52-F1: the one raid. Raiders and defenders are held by barb id (never an index) and re-resolved by raidTick() every
+// tick; a missing id is dropped there, and removeBarb() invalidates a dying member's id through raidMemberLost().
+struct raidParty {
+    enum Phase {March, Fight, Home} phase = March;
+    bool active = false;
+    int att = -1, def = -1;                 // aggressor and target race
+    int raiderIds[kRaidPartySize] = {-1, -1, -1};
+    int defenderIds[kRaidDefenderMax] = {-1, -1, -1};
+    int ticks = 0;                          // since launch (kRaidMaxTicks backstop)
+    int fightTicks = 0, holdTicks = 0, scanTimer = 0;
+    int defendersBeaten = 0;
+    bool won = false;                       // outcome, for the walk home
+};
+raidParty raid;
+bool raidThreat[raceCount] = {};            // R52-F1: set by raidTick() (runs first), read by bellTick() like a wolf at the crate
+int raidPairCooldown[raceCount][raceCount] = {
+    {kRaidPairCooldownTicks, kRaidPairCooldownTicks, kRaidPairCooldownTicks},
+    {kRaidPairCooldownTicks, kRaidPairCooldownTicks, kRaidPairCooldownTicks},
+    {kRaidPairCooldownTicks, kRaidPairCooldownTicks, kRaidPairCooldownTicks}};   // kept symmetric
+static_assert(raceCount == 3, "raidPairCooldown initialiser is written for three races");
+
+// R52-F1: the one way out of the raid state, on every exit (outcome, abort, beaten defender, removeBarb, backstop)
+void clearRaid(barb& b) {
+    b.raidSide = raidNone;
+    b.raidPreyId = -1;
+    b.raidCooldown = 0;
+    b.raidBeaten = false;
+}
+void raidMemberLost(const barb& b) {
+    if (!raid.active || b.raidSide == raidNone) return;
+    for (auto& id : raid.raiderIds) if (id == b.id) id = -1;
+    for (auto& id : raid.defenderIds) if (id == b.id) id = -1;
 }
 
 const raceDef& raceOf(const barb& b) { return raceDefs[b.race]; }
@@ -3335,6 +3411,12 @@ const char* barbTaskName(const barb& b) {
         return party.phase == expeditionParty::Out ? "expedition: setting out"
              : party.phase == expeditionParty::Delve ? (party.hollow ? "expedition: below the Hollow" : "expedition: delving")   // R47-F5
              : "expedition: heading home";
+    if (b.raidSide == raidDefender) return b.raidPreyId >= 0 ? "defending the crate: fighting" : "defending the crate";   // R52-F1
+    if (b.raidSide == raidAttacker)
+        return raid.phase == raidParty::Home ? "raiding: heading home"
+             : b.raidBeaten ? "raiding: beaten"
+             : raid.phase == raidParty::Fight ? (b.raidPreyId >= 0 ? "raiding: fighting" : "raiding: at the crate")
+             : "raiding: on the march";
     if (b.deertargeting) return b.hasSpear ? weaponOf(b).huntLabel : "hunting";   // R47-F8: "hunting (axe)" for dwarves
     if (b.building) return "building";
     if (b.tempering) return "tempering pick";   // R41-F2
@@ -4407,9 +4489,16 @@ void drawBarbs(RenderWindow& window, const vector<barb>& barbs, const vector<Rec
             body.setPosition(Vector2f(base.x - 1.0f, bodyTop - 1.0f));
             window.draw(body);
         }
+        bool raidHit = b.raidFlash > 0;   // R52-F1: 2-frame hit flash, body plus a 1px rim so it reads over the off-white body
+        if (raidHit) {
+            body.setSize(Vector2f(bodySize.x + 2.0f, bodyH + 2.0f));
+            body.setFillColor(kRaidFlashColor);
+            body.setPosition(Vector2f(base.x - 1.0f, bodyTop - 1.0f));
+            window.draw(body);
+        }
         Color bodyColor = b.shinobi ? shinobiBodyColor : barbBodyColor;
         body.setSize(Vector2f(bodySize.x, bodyH));
-        body.setFillColor(hungry ? hungryTint(bodyColor) : bodyColor);
+        body.setFillColor(raidHit ? kRaidFlashColor : hungry ? hungryTint(bodyColor) : bodyColor);
         body.setPosition(Vector2f(base.x, bodyTop));
         window.draw(body);
         if (showTraits) {   // R25-F1: 1px badge on the left shoulder, off the body so it never blends with stripe or sash
@@ -4536,6 +4625,11 @@ void drawBarbs(RenderWindow& window, const vector<barb>& barbs, const vector<Rec
             tool.setPosition(top - Vector2f(0.0f, spearTipSize.y));   // top edge = bodyTop - 2
             window.draw(tool);
             tool.setSize(barbToolSize);
+            if (b.raidSide == raidAttacker) {   // R52-F1: 1px red pennant right of the shaft's top pixel, under the tip
+                dot.setFillColor(kRaidPennantColor);
+                dot.setPosition(top + Vector2f(1.0f, 0.0f));
+                window.draw(dot);
+            }
         }
         if (b.watching)   // R51-F1: torch held out left at head height, clear of horns, ears and the trait dot; drawn after the overlay
             watchTorchPts.push_back(Vector2f(base.x - 2.0f, bodyTop - 1.0f));
@@ -8251,6 +8345,8 @@ void removeBarb(vector<barb>& barbs, vector<RectangleShape>& squares, int i,
     expeditionMemberLost(b);                      // R45-F2: invalidates its party id; expeditionTick() dissolves the party
     setWeapon(b, weaponDrop);                     // R47-F8: the unequip half of the helper (craft already refunded above)
     clearWatch(b);                                // R51-F1: explicit, though releaseBarbWork()'s clearTraining() already did it
+    raidMemberLost(b);                            // R52-F1: drops its raid id; raidTick() aborts under kRaidMinMembers raiders
+    clearRaid(b);
     if (isLeader(b)) loseLeader(b.race);
     printf("BARB DIED - %s the %s (%s, %s), id %d - %d left\n", b.name, traitOf(b).name, raceOf(b).name,
            isGentry(b) ? "Gentry" : "Commoner", b.id, (int)barbs.size() - 1);
@@ -8458,6 +8554,7 @@ bool watchStopOk(Vector2f centre, Vector2f size) {
 // walk) or drilling (the watch outranks the dummy).
 bool watchEligible(const barb& b) {
     if (b.watching || !b.hasSpear || b.drillCount < kDrillPipCount || b.health < watchMinHealth) return false;
+    if (b.raidSide != raidNone) return false;   // R52-F1: raiders and defenders belong to raidTick()
     if (!barbAvailable(b) || barbHidden(b) || barbUnderground(b) || b.inMine) return false;
     if (b.chopping || b.building || b.movingbspot || b.deertargeting || b.jobKind != jobNone || b.carryKind != carryNone
         || atForgeTask(b) || b.timer > 0 || b.target != targetNone || b.order != needNone) return false;
@@ -8715,6 +8812,8 @@ void bellTick(vector<barb>& barbs, vector<RectangleShape>& squares, const vector
             Vector2f d = w.shape.getPosition() + wolfSize / 2.0f - qc;
             if (d.x * d.x + d.y * d.y < bellWolfRadius * bellWolfRadius) wolfNear = true;
         }
+        bool raidNear = raidThreat[r];            // R52-F1: raiders at the crate ring the same bell
+        wolfNear = wolfNear || raidNear;
         if (!stores[r].built) wolfNear = false;   // no crate, no bell
         if (raceBell[r] > 0) {
             raceBellAge[r]++;
@@ -8732,8 +8831,9 @@ void bellTick(vector<barb>& barbs, vector<RectangleShape>& squares, const vector
         } else if (wolfNear && raceBellCooldown[r] == 0) {
             raceBell[r] = bellQuietTicks;
             raceBellAge[r] = 0;
-            printf("BELL RUNG - %s, wolf within %.0fpx of the crate\n", racePlurals[r], bellWolfRadius);
-            logRaceEvent(string(racePlurals[r]) + " ring the bell: wolf at the crate!", r);
+            printf("BELL RUNG - %s, %s within %.0fpx of the crate\n", racePlurals[r], raidNear ? "raiders" : "wolf",
+                   raidNear ? kRaidAlarmPx : bellWolfRadius);
+            logRaceEvent(string(racePlurals[r]) + (raidNear ? " ring the bell: raiders at the crate!" : " ring the bell: wolf at the crate!"), r);
         }
     }
     for (int r = 0; r < raceCount; r++) {   // R31-F3: every slot must name a live barb of race r garrisoned in this keep
@@ -9339,6 +9439,391 @@ void expeditionTick(vector<barb>& barbs, vector<RectangleShape>& squares, const 
         logRaceEvent(string(racePlurals[r]) + "' expedition " + outcome, r);
         endExpedition(barbs, idx);
     }
+}
+
+// R52-F1: free to be called up for a raid: available (not sheltering, away or already in the raid), on the surface, no
+// job, haul, hunt, forge task or claim, not on watch, not kneeling, and standing, wandering or drilling
+bool raidIdle(const barb& b) {
+    if (!barbAvailable(b) || barbHidden(b) || barbUnderground(b) || b.inMine || b.kneeling || b.watching) return false;
+    if (b.chopping || b.building || b.movingbspot || b.deertargeting || b.jobKind != jobNone || b.carryKind != carryNone
+        || atForgeTask(b) || b.timer > 0 || b.target != targetNone) return false;
+    bool wandering = !b.moving || (b.targetx == b.wanderX && b.targety == b.wanderY);
+    return wandering || b.training;
+}
+bool raidRaiderOk(const barb& b, int r) {
+    return b.race == r && b.hasSpear && raidIdle(b) && b.health >= kRaidMinHealth && !isHungry(b) && !isLeader(b) && !b.shinobi;
+}
+bool raidDefenderOk(const barb& b, int r) {
+    return b.race == r && b.hasSpear && raidIdle(b) && b.health >= kRaidDefendMinHealth;
+}
+
+// R52-F1: the only place the raid state is set. The shared walk/work reset ends any drill or wander first.
+void joinRaid(barb& b, raidRole side) {
+    expeditionReset(b);
+    clearRaid(b);
+    b.raidSide = side;
+    if (side == raidAttacker) { b.order = needNone; b.orderTicks = 0; }
+}
+// R52-F1: hand a barb back to the other systems, standing where it is (every exit goes through here)
+void releaseRaidBarb(barb& b) {
+    if (b.raidSide == raidNone) return;
+    expeditionReset(b);
+    clearRaid(b);
+}
+
+// R52-F1: the one way a raid ends: every member still in the raid is released, the bell threat drops
+void endRaid(vector<barb>& barbs) {
+    for (int id : raid.raiderIds) { int i = findBarbById(barbs, id); if (i >= 0) releaseRaidBarb(barbs[i]); }
+    for (int id : raid.defenderIds) { int i = findBarbById(barbs, id); if (i >= 0) releaseRaidBarb(barbs[i]); }
+    raid = raidParty{};
+    for (auto& t : raidThreat) t = false;
+}
+
+Vector2f raidCentre(const RectangleShape& sq) { return sq.getPosition() + sq.getSize() / 2.0f; }
+
+// R52-F1: raider k's stand spot at race r's crate (hitbox top-left): in a row left of the crate, like the expedition
+Vector2f raidCrateSpot(int r, int k) { return storehousePos[clampRace(r)] + storehouseStandOffset + Vector2f(-kRaidColumnGapPx * k, 0.0f); }
+
+// R52-F1: a cold pair whose cooldown has run out, by daylight, both crates built. The aggressor is the side with more
+// eligible armed barbs (at least kRaidPartySize, its bell silent); ties are rolled. The column is the nearest eligible
+// barbs to its crate. The pair's cooldown restarts at launch, so a broken-up raid still costs the pair a day.
+void tryLaunchRaid(vector<barb>& barbs, vector<RectangleShape>& squares, const storehouse (&stores)[raceCount]) {
+    if (isNightHour(game_time)) return;
+    int n = min((int)barbs.size(), (int)squares.size());
+    int start = uniform_int_distribution<int>(0, raceCount - 1)(gen);
+    for (int o = 0; o < raceCount; o++) {
+        int a = (start + o) % raceCount, b = (a + 1) % raceCount;   // each pair once: (0,1) (1,2) (2,0)
+        if (raidPairCooldown[a][b] > 0 || relationTierOf(raceRelation[a][b]) != relCold) continue;
+        if (!stores[a].built || !stores[b].built) continue;
+        int ready[2] = {0, 0}, side[2] = {a, b};
+        for (int s = 0; s < 2; s++) {
+            if (raceBell[side[s]] > 0) continue;
+            for (int i = 0; i < n; i++) {
+                Vector2f d = raidCentre(squares[i]) - quarterCentre(side[s]);
+                if (d.x * d.x + d.y * d.y < kRaidRecruitRadius * kRaidRecruitRadius && raidRaiderOk(barbs[i], side[s])) ready[s]++;
+            }
+        }
+        if (ready[0] < kRaidPartySize && ready[1] < kRaidPartySize) continue;
+        int s = ready[0] == ready[1] ? uniform_int_distribution<int>(0, 1)(gen) : ready[1] > ready[0] ? 1 : 0;
+        int att = side[s], def = side[1 - s];
+        int pick[kRaidPartySize];
+        bool ok = true;
+        for (int k = 0; k < kRaidPartySize && ok; k++) {
+            pick[k] = findNearest(quarterCentre(att), kRaidRecruitRadius, n,
+                                  [&](int i) { return raidCentre(squares[i]); },
+                                  [&](int i) {
+                                      for (int q = 0; q < k; q++) if (pick[q] == i) return true;
+                                      return !raidRaiderOk(barbs[i], att);
+                                  });
+            ok = pick[k] >= 0;
+        }
+        if (!ok) continue;
+        raid = raidParty{};
+        raid.active = true;
+        raid.att = att;
+        raid.def = def;
+        raid.phase = raidParty::March;
+        raidPairCooldown[att][def] = raidPairCooldown[def][att] = kRaidPairCooldownTicks;
+        string names;
+        for (int k = 0; k < kRaidPartySize; k++) {
+            barb& m = barbs[pick[k]];
+            joinRaid(m, raidAttacker);
+            raid.raiderIds[k] = m.id;
+            names += string(k == 0 ? "" : k == kRaidPartySize - 1 ? " and " : ", ") + m.name;
+        }
+        printf("---RAID OUT--- %s march on the %s (%s), relation %.2f\n", racePlurals[att], racePlurals[def], names.c_str(),
+               raceRelation[att][def]);
+        logEvent(string(racePlurals[att]) + " march on the " + racePlurals[def] + ": " + names, kRaidTickerTint);
+        return;
+    }
+}
+
+// R52-F1: the column walk. The head routes to goal and waits while any gap in the column is wider than
+// kRaidColumnStretchPx; each follower walks straight to a spot kRaidColumnGapPx behind the barb ahead.
+// Returns true once the head stands on goal and the column is closed up.
+bool raidColumnStep(vector<barb>& barbs, vector<RectangleShape>& squares, const int (&ri)[kRaidPartySize], Vector2f goal) {
+    bool stretched = false;
+    int prev = -1;
+    for (int k = 0; k < kRaidPartySize; k++) {
+        if (ri[k] < 0) continue;
+        if (prev >= 0) {
+            Vector2f d = squares[ri[k]].getPosition() - squares[prev].getPosition();
+            if (d.x * d.x + d.y * d.y > kRaidColumnStretchPx * kRaidColumnStretchPx) stretched = true;
+        }
+        prev = ri[k];
+    }
+    bool headThere = false;
+    prev = -1;
+    for (int k = 0; k < kRaidPartySize; k++) {
+        int i = ri[k];
+        if (i < 0) continue;
+        barb& b = barbs[i];
+        auto& sq = squares[i];
+        Vector2f target = goal;
+        bool straight = false;
+        if (prev >= 0) {
+            Vector2f d = squares[prev].getPosition() - sq.getPosition();
+            float len = sqrt(d.x * d.x + d.y * d.y);
+            prev = i;
+            if (len <= kRaidColumnGapPx) {   // close enough behind: stand
+                if (b.moving) { b.moving = false; clearRoute(b); b.stepTimer = 0; }
+                continue;
+            }
+            target = sq.getPosition() + d - d / len * kRaidColumnGapPx;   // on the line to the barb ahead, gap short of it
+            straight = true;
+        } else prev = i;
+        b.targetx = (int)target.x;
+        b.targety = (int)target.y;
+        Vector2f diff = Vector2f((float)b.targetx, (float)b.targety) - sq.getPosition();
+        if (diff.x * diff.x + diff.y * diff.y < 1.0f) {
+            if (!straight) { sq.setPosition(Vector2f((float)b.targetx, (float)b.targety)); headThere = true; }
+            if (b.moving) { b.moving = false; clearRoute(b); b.stepTimer = 0; }
+        } else if (!straight && stretched) {
+            b.stepTimer = 0;   // the head waits for its tail (route kept)
+        } else {
+            b.moving = true;
+            walkStep(b, sq, straight);
+        }
+    }
+    return headThere && !stretched;
+}
+
+// R52-F1: one fighter's tick. Keeps its foe (re-resolved by id among foes[], unbeaten only) or takes the nearest within
+// engagePx, closes in straight and strikes on cooldown. A blow never takes the foe below kRaidHealthFloor: at the floor
+// it is beaten. Returns false when there is no foe to fight.
+bool raidFightStep(vector<barb>& barbs, vector<RectangleShape>& squares, int i, const int* foes, int nFoes, float engagePx) {
+    barb& b = barbs[i];
+    auto& sq = squares[i];
+    if (b.raidCooldown > 0) b.raidCooldown--;
+    Vector2f c = raidCentre(sq);
+    int fi = -1;
+    for (int k = 0; k < nFoes; k++)
+        if (foes[k] >= 0 && barbs[foes[k]].id == b.raidPreyId && !barbs[foes[k]].raidBeaten) fi = foes[k];
+    if (fi < 0) {
+        b.raidPreyId = -1;
+        float best = engagePx * engagePx;
+        for (int k = 0; k < nFoes; k++) {
+            int j = foes[k];
+            if (j < 0 || barbs[j].raidBeaten) continue;
+            Vector2f d = raidCentre(squares[j]) - c;
+            float dSq = d.x * d.x + d.y * d.y;
+            if (dSq < best) { best = dSq; fi = j; }
+        }
+        if (fi < 0) return false;
+        b.raidPreyId = barbs[fi].id;
+        printf("RAID ENGAGES - %s (id %d) -> %s (id %d)\n", b.name, b.id, barbs[fi].name, barbs[fi].id);
+    }
+    barb& f = barbs[fi];
+    Vector2f d = raidCentre(squares[fi]) - c;
+    if (d.x * d.x + d.y * d.y <= kRaidStrikeRangePx * kRaidStrikeRangePx) {
+        if (b.moving) { b.moving = false; clearRoute(b); b.stepTimer = 0; }
+        if (b.raidCooldown == 0) {
+            b.raidCooldown = kRaidStrikeCooldownTicks;
+            int dmg = weaponDamage(b);
+            f.health = max(min(f.health, kRaidHealthFloor), f.health - dmg);   // a wound, never the kill
+            f.raidFlash = kRaidFlashFrames;
+            printf("RAID HIT - %s (id %d) hits %s (id %d) for %d, %d hp left\n", b.name, b.id, f.name, f.id, dmg, f.health);
+            if (f.health <= kRaidHealthFloor) {
+                f.raidBeaten = true;
+                f.raidPreyId = -1;
+                b.raidPreyId = -1;
+                printf("RAID BEATEN - %s (id %d, %s)\n", f.name, f.id, racePlurals[clampRace(f.race)]);
+            }
+        }
+    } else {
+        Vector2f goal = raidCentre(squares[fi]) - sq.getSize() / 2.0f;
+        b.targetx = (int)goal.x;
+        b.targety = (int)goal.y;
+        b.moving = true;
+        walkStep(b, sq, true);
+    }
+    return true;
+}
+
+// R52-F1: runs after watchTick() and before bellTick() (which reads raidThreat[]). Owns every raider's and defender's
+// movement. Re-resolves every id each tick and drops a missing or dead member (its flags restored if it is still
+// there); under kRaidMinMembers raiders the raid breaks up. March: the column walks to the rival crate. Fight: inside
+// kRaidAlarmPx the rival bell rings, armed defenders are called up and the resolver runs; fewer than kRaidMinMembers
+// unbeaten raiders (or the fight running out) is a loss, holding the crate unopposed for kRaidHoldTicks is a win.
+// Home: the column walks back and is released at its crate. The outcome is one ticker line and nothing else.
+void raidTick(vector<barb>& barbs, vector<RectangleShape>& squares, const storehouse (&stores)[raceCount]) {
+    static int checkTimer = 0;
+    for (auto& t : raidThreat) t = false;
+    for (int a = 0; a < raceCount; a++)
+        for (int b = a + 1; b < raceCount; b++)
+            if (raidPairCooldown[a][b] > 0) raidPairCooldown[a][b] = --raidPairCooldown[b][a];
+    int n = min((int)barbs.size(), (int)squares.size());
+
+    for (int i = 0; i < n; i++) {   // backstop: a raid flag with no raid entry behind it is cleared
+        barb& b = barbs[i];
+        if (b.raidSide == raidNone) continue;
+        bool listed = false;
+        if (raid.active) {
+            if (b.raidSide == raidAttacker) for (int id : raid.raiderIds) listed = listed || id == b.id;
+            if (b.raidSide == raidDefender) for (int id : raid.defenderIds) listed = listed || id == b.id;
+        }
+        if (!listed) { printf("RAID FLAG CLEARED - barb %d (no raid entry)\n", b.id); releaseRaidBarb(b); }
+    }
+
+    if (!raid.active) {
+        if (--checkTimer <= 0) { checkTimer = kRaidCheckTicks; tryLaunchRaid(barbs, squares, stores); }
+        return;
+    }
+    int att = clampRace(raid.att), def = clampRace(raid.def);
+    raid.ticks++;
+
+    int ri[kRaidPartySize], di[kRaidDefenderMax];
+    int alive = 0, standing = 0;
+    for (int k = 0; k < kRaidPartySize; k++) {
+        ri[k] = findBarbById(barbs, raid.raiderIds[k]);
+        bool bad = ri[k] < 0 || ri[k] >= n || barbs[ri[k]].raidSide != raidAttacker || barbs[ri[k]].race != att || barbs[ri[k]].health <= 0;
+        if (bad) {
+            if (raid.raiderIds[k] >= 0) printf("RAIDER DROPPED - barb %d\n", raid.raiderIds[k]);
+            if (ri[k] >= 0 && ri[k] < n && barbs[ri[k]].raidSide == raidAttacker) releaseRaidBarb(barbs[ri[k]]);
+            raid.raiderIds[k] = ri[k] = -1;
+            continue;
+        }
+        alive++;
+        if (!barbs[ri[k]].raidBeaten) standing++;
+    }
+    for (int k = 0; k < kRaidDefenderMax; k++) {
+        di[k] = findBarbById(barbs, raid.defenderIds[k]);
+        bool bad = di[k] < 0 || di[k] >= n || barbs[di[k]].raidSide != raidDefender || barbs[di[k]].race != def || barbs[di[k]].health <= 0;
+        if (bad) {
+            if (raid.defenderIds[k] >= 0) printf("DEFENDER DROPPED - barb %d\n", raid.defenderIds[k]);
+            if (di[k] >= 0 && di[k] < n && barbs[di[k]].raidSide == raidDefender) releaseRaidBarb(barbs[di[k]]);
+            raid.defenderIds[k] = di[k] = -1;
+        }
+    }
+    string pairText = string(racePlurals[att]) + "' march on the " + racePlurals[def];
+    if (alive < kRaidMinMembers) {
+        printf("---RAID BROKEN--- %s: %d raider(s) left\n", pairText.c_str(), alive);
+        logEvent(pairText + " breaks up", kRaidTickerTint);
+        endRaid(barbs);
+        return;
+    }
+    if (raid.ticks > kRaidMaxTicks || !stores[att].built || (raid.phase != raidParty::Home && !stores[def].built)) {
+        printf("---RAID ABANDONED--- %s (%s)\n", pairText.c_str(), raid.ticks > kRaidMaxTicks ? "timeout" : "crate gone");
+        logEvent(pairText + " is abandoned", kRaidTickerTint);
+        endRaid(barbs);
+        return;
+    }
+
+    if (raid.phase == raidParty::March) {
+        raidColumnStep(barbs, squares, ri, raidCrateSpot(def, 0));
+        for (int k = 0; k < kRaidPartySize; k++) {
+            if (ri[k] < 0) continue;
+            Vector2f d = raidCentre(squares[ri[k]]) - quarterCentre(def);
+            if (d.x * d.x + d.y * d.y < kRaidAlarmPx * kRaidAlarmPx) {
+                raid.phase = raidParty::Fight;
+                raid.fightTicks = raid.holdTicks = raid.scanTimer = 0;
+                printf("RAID AT THE GATES - %s reach the %s crate\n", racePlurals[att], racePlurals[def]);
+                break;
+            }
+        }
+        if (raid.phase == raidParty::March) return;
+    }
+
+    if (raid.phase == raidParty::Fight) {
+        raidThreat[def] = true;
+        raid.fightTicks++;
+        if (--raid.scanTimer <= 0) {   // call up armed defenders into empty slots, nearest to the crate first
+            raid.scanTimer = kRaidDefendScanTicks;
+            for (int k = 0; k < kRaidDefenderMax; k++) {
+                if (di[k] >= 0) continue;
+                int j = findNearest(quarterCentre(def), kRaidDefendRadius, n,
+                                    [&](int i) { return raidCentre(squares[i]); },
+                                    [&](int i) { return !raidDefenderOk(barbs[i], def); });
+                if (j < 0) break;
+                joinRaid(barbs[j], raidDefender);
+                raid.defenderIds[k] = barbs[j].id;
+                di[k] = j;
+                printf("DEFENDER CALLED - %s (id %d, %s), %d hp\n", barbs[j].name, barbs[j].id, racePlurals[def], barbs[j].health);
+            }
+        }
+        for (int k = 0; k < kRaidPartySize; k++) {   // raiders: fight a defender in reach, else make for the crate
+            int i = ri[k];
+            if (i < 0) continue;
+            barb& b = barbs[i];
+            if (b.raidBeaten) { if (b.moving) { b.moving = false; clearRoute(b); b.stepTimer = 0; } continue; }
+            if (raidFightStep(barbs, squares, i, di, kRaidDefenderMax, kRaidEngagePx)) continue;
+            Vector2f spot = raidCrateSpot(def, k);
+            b.targetx = (int)spot.x;
+            b.targety = (int)spot.y;
+            Vector2f diff = spot - squares[i].getPosition();
+            if (diff.x * diff.x + diff.y * diff.y < 1.0f) {
+                squares[i].setPosition(spot);
+                if (b.moving) { b.moving = false; clearRoute(b); b.stepTimer = 0; }
+            } else { b.moving = true; walkStep(b, squares[i]); }
+        }
+        for (int k = 0; k < kRaidDefenderMax; k++) {   // defenders: go for the nearest unbeaten raider, else stand
+            int i = di[k];
+            if (i < 0) continue;
+            if (!raidFightStep(barbs, squares, i, ri, kRaidPartySize, 2.0f * worldSize)) {
+                barb& b = barbs[i];
+                if (b.moving) { b.moving = false; clearRoute(b); b.stepTimer = 0; }
+            }
+        }
+        standing = 0;
+        int defenders = 0;
+        bool atCrate = false;
+        for (int k = 0; k < kRaidDefenderMax; k++) {   // a beaten defender leaves the fight at once (the bell may shelter it)
+            int i = di[k];
+            if (i < 0) continue;
+            if (barbs[i].raidBeaten) {
+                raid.defendersBeaten++;
+                releaseRaidBarb(barbs[i]);
+                raid.defenderIds[k] = di[k] = -1;
+            } else defenders++;
+        }
+        for (int k = 0; k < kRaidPartySize; k++) {
+            int i = ri[k];
+            if (i < 0 || barbs[i].raidBeaten) continue;
+            standing++;
+            Vector2f diff = raidCrateSpot(def, k) - squares[i].getPosition();
+            if (diff.x * diff.x + diff.y * diff.y < 4.0f) atCrate = true;
+        }
+        raid.holdTicks = defenders == 0 && atCrate ? raid.holdTicks + 1 : 0;
+        bool lost = standing < kRaidMinMembers || raid.fightTicks > kRaidFightMaxTicks;
+        bool won = !lost && raid.holdTicks >= kRaidHoldTicks;
+        if (!lost && !won) return;
+        raid.won = won;
+        raid.phase = raidParty::Home;
+        raidThreat[def] = false;
+        for (int k = 0; k < kRaidDefenderMax; k++) {
+            if (di[k] >= 0) releaseRaidBarb(barbs[di[k]]);
+            raid.defenderIds[k] = -1;
+        }
+        for (int k = 0; k < kRaidPartySize; k++) if (ri[k] >= 0) { barbs[ri[k]].raidPreyId = -1; barbs[ri[k]].raidCooldown = 0; }
+        string line;
+        if (won) line = string(racePlurals[att]) + " win their raid on the " + racePlurals[def]
+                      + (raid.defendersBeaten > 0 ? " (" + to_string(raid.defendersBeaten) + " defender" + (raid.defendersBeaten == 1 ? "" : "s") + " beaten)"
+                                                  : " (unopposed)");
+        else line = string(racePlurals[def]) + " drive off the " + racePlurals[att] + "' raid"
+                  + (standing < kRaidMinMembers ? " (" + to_string(alive - standing) + " raider" + (alive - standing == 1 ? "" : "s") + " beaten)"
+                                                : " (the raiders tire)");
+        printf("---RAID %s--- %s after %d fight ticks\n", won ? "WON" : "LOST", line.c_str(), raid.fightTicks);
+        logEvent(line, kRaidTickerTint);
+        return;
+    }
+
+    // Home: beaten raiders walk too; released on reaching their own crate
+    if (raidColumnStep(barbs, squares, ri, raidCrateSpot(att, 0))) {
+        printf("RAID HOME - %s back at their crate (%s)\n", racePlurals[att], raid.won ? "won" : "lost");
+        endRaid(barbs);
+    }
+}
+
+// R52-F1: world layer, beside the bell marker: a pulsing red marker on the target crate while a raid marches or fights
+void drawRaidMarker(RenderWindow& window, int frame) {
+    if (!raid.active || raid.phase == raidParty::Home || raid.def < 0 || raid.def >= raceCount) return;
+    float pulse = 0.5f + 0.5f * sin(frame * kRaidMarkerPulseRate);
+    Color c = kRaidMarkerColor;
+    c.a = (uint8_t)(kRaidMarkerAlphaMin + (255 - kRaidMarkerAlphaMin) * pulse);
+    RectangleShape m(kRaidMarkerSize);
+    m.setFillColor(c);
+    m.setPosition(snapPx(storehousePos[raid.def]) + kRaidMarkerOffset);
+    window.draw(m);
 }
 
 void barbspawner(vector<RectangleShape>& squares, vector<barb>& barbs, const vector<house>& houses, vector<RectangleShape>& houseshapes, vector<birthRing>& rings) {
@@ -11322,6 +11807,7 @@ int main() {
                 wolfTick(wolves, deers, deershape, barbs);
                 prowlerTick(prowlers, barbs, squares, houses, houseshapes, fire);   // R48-F1: bites land before starveDeathTick()
                 watchTick(barbs, squares, prowlers);   // R51-F1: watchmen patrol and fight; slain prowlers fade, prowlerTick() removes them
+                raidTick(barbs, squares, stores);   // R52-F1: raid march and fight; sets raidThreat[] for bellTick() just below
                 bellTick(barbs, squares, houses, houseshapes, wolves, stores, smoke, dwarfForge, fields,
                          trees, tris, rocks, octs, bushes);   // INBOX-F1: after the wolves move
                 expeditionTick(barbs, squares, wolves, stores);   // R45-F2: after the wolves and the bell, before hungerTick()
@@ -11434,6 +11920,7 @@ int main() {
 	drawMineShafts(window, barbs, squares);   // R34-F1: beside the crates, under barbs
 	drawBarracks(window);   // R47-F6: hall + straw dummy, left of the crates, under barbs
 	drawGarrison(window, barbs, houses, houseshapes, stores);   // INBOX-F1: bell marker, sheltering roof tint + pips
+	drawRaidMarker(window, frameCount);   // R52-F1: pulsing red marker on the raided crate, opposite corner to the bell
 	for (auto& st : stores) if (st.flashFrames > 0 && !paused) st.flashFrames--;
 	for (int r = 0; r < raceCount; r++)
 	    for (auto& fp : fields[r]) drawField(window, fp, r, frameCount);
@@ -11457,6 +11944,7 @@ int main() {
         }
 
         drawBarbs(window, barbs, squares, frameCount, zoom);
+        for (auto& b : barbs) if (b.raidFlash > 0 && !paused) b.raidFlash--;   // R52-F1: the hit flash lasts 2 drawn frames
 	if (activeTrader) drawSnapped(window, activeTrader->shape);
 	drawTrees(window, tris, treeVerts, camRect);
 	drawSmoke(window, smoke, paused);   // INBOX2-F1: per-race puffs, only after own smoked kills
