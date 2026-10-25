@@ -272,6 +272,17 @@ const int daysPerSeason = 2;
 const int yearDays = daysPerSeason * seasonCount;   // 8-day year
 const int seasonBlendHours = 12;                    // ground tint cross-fades toward the next season over its last 12h
 const float winterHungerMult = 1.15f;               // hunger grows this much faster in winter (hungerTick only)
+// The Lean Season (R52-F2): in winter bare bushes do not regrow, reaped/new plots lie fallow until spring, and ripe
+// unpicked berries shrivel at the first frost. Survival: hunting, fishing, autumn crops still ripening and the larder
+// carry the colony; as the guarantee, winter starvation never takes a barb below leanStarveFloorHp (no winter
+// starvation deaths), and spring (bushes ~2 min to ripen, fields resown) lands with 40hp = ~15 min of starving to spare.
+const int leanStarveFloorHp = 40;                   // winter starvation damage stops at this health
+const int larderRefreshTicks = 60;                  // larder bar values are recomputed and cached once a second at 1x
+const float larderBarH = 2.0f;                      // 2px bar under each race row of the stock panel
+const float larderBarGap = 1.0f;                    // row -> bar
+const Color larderTrackColor(56, 62, 54);           // dim slate-green track: the bar's full width reads on the backing
+const Color larderOkColor(118, 156, 96);            // muted green: food covers the days to spring
+const Color larderShortColor(196, 150, 76);         // muted amber: it does not
 struct seasonDef {
     const char* name;
     const char* arrivalLine;   // ticker line on the first midnight of the season
@@ -294,6 +305,12 @@ int game_day = 0;   // day 0 = spring, day 1 of year 1
 int seasonOf(int day) { return (day % yearDays) / daysPerSeason; }
 int dayInSeason(int day) { return day % daysPerSeason; }
 bool isWinter() { return seasonOf(game_day) == seasonWinter; }
+// R52-F2: whole game hours left in winter (to spring's midnight); 0 outside winter
+int leanHoursLeft() { return isWinter() ? (daysPerSeason - 1 - dayInSeason(game_day)) * 24 + (24 - game_time) : 0; }
+// R52-F2: the larder bar's target in days: the rest of this winter, or the whole coming winter before it starts
+float leanDaysToSpring() { return isWinter() ? leanHoursLeft() / 24.0f : (float)daysPerSeason; }
+float larderFill[raceCount] = {};      // R52-F2: cached by leanSeasonTick: days of food / days to spring, clamped 0..1
+bool larderCovered[raceCount] = {};    // R52-F2: days of food >= days to spring
 // Ground (clear) colour: the season's own, smoothstepped toward the next one over the season's last seasonBlendHours,
 // reaching it exactly at the midnight the season turns
 Color seasonGroundColor(int day, int hour) {
@@ -2420,7 +2437,7 @@ int fieldStage(const plot& fp) { return fieldRipe(fp) ? fieldGrowStages : fp.gro
 // so the race's plots show different stages. Ripe siblings are skipped: they restart (and re-stagger) once reaped.
 void replantField(plot (&row)[fieldsPerRace], int k) {
     int step = wheatGrowTicks() * fieldStaggerStages / fieldGrowStages;
-    int delay = 0;
+    int delay = leanHoursLeft() * ticksPerGameHour;   // R52-F2: no resowing in winter; bare soil until spring, then staggered
     for (int pass = 0; pass < fieldsPerRace; pass++)
         for (int j = 0; j < fieldsPerRace; j++) {
             if (j == k || !row[j].built || fieldRipe(row[j])) continue;
@@ -4303,7 +4320,8 @@ void hungerTick(vector<barb>& barbs) {
         if (!isHungry(b) || b.health <= 0) continue;
         b.starveTicks++;
         int over = b.starveTicks - starveGraceTicks;
-        if (over > 0 && over % starveDamageTicks == 0) {
+        bool leanFloor = isWinter() && b.health <= leanStarveFloorHp;   // R52-F2: no starvation deaths in winter
+        if (over > 0 && over % starveDamageTicks == 0 && !leanFloor) {
             b.health--;
             if (b.health % 25 == 0) printf("STARVING - %s %d hp\n", b.name, b.health);
         }
@@ -5655,7 +5673,8 @@ FloatRect drawStockPanel(RenderWindow& window, const Font& font, const hudValues
     float tierIconW = tierBars * tierIconBarW + (tierBars - 1) * tierIconBarGap;
     if (toolTierSeen) innerW += stockCellGap + tierIconW;
     if (veil.faithSeen) innerW += stockCellGap + faithTickW;   // R51-F2: faith tick, last in the row
-    Vector2f size(round(innerW + 2 * stockPad.x), round(raceCount * rowH + (raceCount - 1) * stockRowGap + 2 * stockPad.y));
+    float barRowH = rowH + larderBarGap + larderBarH;   // R52-F2: each race row carries its 2px larder bar underneath
+    Vector2f size(round(innerW + 2 * stockPad.x), round(raceCount * barRowH + (raceCount - 1) * stockRowGap + 2 * stockPad.y));
     Vector2f pos(round(stockMargin), round(hudBarHeight + stockMargin));
     FloatRect box(pos, size);
     auto near = [&](const FloatRect& o) {
@@ -5677,10 +5696,22 @@ FloatRect drawStockPanel(RenderWindow& window, const Font& font, const hudValues
     sw.setOutlineThickness(-1.0f);
     sw.setOutlineColor(lensSwatchRim);
     for (int r = 0; r < raceCount; r++) {
-        float y = pos.y + stockPad.y + r * (rowH + stockRowGap);
+        float y = pos.y + stockPad.y + r * (barRowH + stockRowGap);
         float textY = round(y + (rowH - rb.size.y) / 2.0f - rb.position.y);
         bool empty = v.members[r] <= 0;
         float x = pos.x + stockPad.x;
+        {   // R52-F2: larder bar across the row's full inner width: dim track, fill = days of food / days to spring
+            RectangleShape bar(Vector2f(round(innerW), larderBarH));
+            bar.setPosition(Vector2f(x, round(y + rowH + larderBarGap)));
+            bar.setFillColor(larderTrackColor);
+            window.draw(bar);
+            float fillW = empty ? 0.0f : round(innerW * larderFill[r]);
+            if (fillW > 0.0f) {
+                bar.setSize(Vector2f(fillW, larderBarH));
+                bar.setFillColor(larderCovered[r] ? larderOkColor : larderShortColor);
+                window.draw(bar);
+            }
+        }
         sw.setFillColor(stockSwatchColors[r]);
         sw.setPosition(Vector2f(x, round(y + (rowH - stockSwatchPx) / 2.0f)));
         window.draw(sw);
@@ -11007,6 +11038,7 @@ void drawPoiGlow(RenderWindow& window, const View& worldView, const FloatRect& c
 
 // Bare bushes ripen again after bushRegrowTicks (rainRegrowMult times faster in rain)
 void bushTick(vector<bush>& bushes, vector<CircleShape>& bushshapes) {
+    if (isWinter()) return;   // R52-F2: the lean season: bare bushes wait for spring (regrow counters hold)
     for (int i = 0; i < (int)bushes.size(); i++) {
         if (bushes[i].ripe) continue;
         bushes[i].regrow += raining ? rainRegrowMult : 1;
@@ -11014,6 +11046,40 @@ void bushTick(vector<bush>& bushes, vector<CircleShape>& bushshapes) {
         bushes[i].ripe = true;
         bushes[i].regrow = 0;
         bushshapes[i].setFillColor(bushRipeColor);
+    }
+}
+
+// R52-F2: first frost (the tick winter begins) shrivels every ripe bush nobody is picking, with one ticker line; and
+// once every larderRefreshTicks the larder bar values are cached per race. Bushes are never removed, so the shrivel
+// pass edits bushes[i] and bushshapes[i] in place at the same index (no swaps, both vectors stay in step).
+void leanSeasonTick(const vector<barb>& barbs, vector<bush>& bushes, vector<CircleShape>& bushshapes) {
+    static bool wasWinter = isWinter();
+    bool winter = isWinter();
+    if (winter && !wasWinter) {
+        int withered = 0;
+        for (int i = 0; i < (int)bushes.size() && i < (int)bushshapes.size(); i++) {
+            if (!bushes[i].ripe || bushes[i].picking) continue;   // a picker already on it finishes the pick
+            bushes[i].ripe = false;
+            bushes[i].regrow = 0;
+            bushshapes[i].setFillColor(bushBareColor);
+            withered++;
+        }
+        printf("LEAN SEASON - frost withers %d ripe bushes\n", withered);
+        logEvent("Frost withers " + to_string(withered) + " berry bushes - no regrowth till spring", seasonDefs[seasonWinter].ticker);
+    }
+    wasWinter = winter;
+
+    static int refresh = 0;
+    if (refresh > 0) { refresh--; return; }
+    refresh = larderRefreshTicks - 1;
+    int eaters[raceCount] = {};
+    for (auto& b : barbs) if (!b.onExpedition) eaters[clampRace(b.race)]++;   // away members eat rations, not the larder
+    float mealsPerDay = 24.0f * ticksPerGameHour / hungerThreshold * winterHungerMult;   // winter rate: it is the lean days we count
+    float need = leanDaysToSpring();
+    for (int r = 0; r < raceCount; r++) {
+        float days = eaters[r] > 0 ? stock[r].food / (eaters[r] * mealsPerDay) : 0.0f;
+        larderCovered[r] = eaters[r] > 0 && days >= need;
+        larderFill[r] = need > 0.0f ? clamp(days / need, 0.0f, 1.0f) : 1.0f;
     }
 }
 
@@ -11272,6 +11338,7 @@ int main() {
                 trailTick();
                 birdTick(birds, birdHeading, squares, barbs);
                 bushTick(bushes, bushshapes);
+                leanSeasonTick(barbs, bushes, bushshapes);   // R52-F2: first-frost shrivel + cached larder bars
                 fieldTick(fields);
                 campfireTick(fire);
                 eraTick(barbs, houses);
