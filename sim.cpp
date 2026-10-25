@@ -378,6 +378,26 @@ const float healthBarW = 4.0f;                    // 1px tall bar, centred under
 const float healthBarGap = 1.0f;                  // px of grass between the feet and the bar
 const Color healthBarFillColor(196, 72, 58);      // muted brick red, same family as the hunt stripe but dimmer
 const Color healthBarBackColor(70, 60, 56, 200);  // dull grey-brown for the missing part, readable on dark green
+// R52-F4 The Winter Cough, phase 1: a barb's `sick` timer counts down to a natural recovery (all races), then a brief
+// immunity. Spread is rolled inside house buckets (kin of one house; founders bucket by race), rebuilt every tick by
+// sickTick(); winter multiplies every roll. A new outbreak seeds only while nobody is sick, so one ticker line each.
+const int sickSeedOneIn = 4 * 60 * ticksPerMinute;     // outbreak seed: 1-in-N per tick while nobody is sick (~4 real h)
+const float sickWinterMult = 4.0f;                     // seed and spread chances x this in winter (seed ~1 real h)
+const float sickSpreadPerKin = 1.0f / (8.0f * ticksPerMinute); // per tick per sick housemate: ~8 real min of shared roof
+const int sickCrowdSize = 6;                           // a bucket this big counts as a crowded house...
+const float sickCrowdMult = 1.5f;                      // ...and spreads this much faster
+const int sickMinTicks = 12 * ticksPerMinute;          // illness length, rolled per case
+const int sickMaxTicks = 20 * ticksPerMinute;
+const int sickImmuneTicks = 15 * ticksPerMinute;       // brief immunity after recovering
+const int sickDamageTicks = 15 * 60;                   // -1hp every this many sick ticks (~-60hp over a long case)
+const float sickSpeedMult = 0.7f;                      // walking speed multiplier while sick (folds into stepLimit())
+const int sickDeathCap = 2;                            // at most this many cough deaths...
+const int sickDeathWindowTicks = 30 * ticksPerMinute;  // ...per this rolling window
+const int sickColonyFloor = 12;                        // no cough death while the colony is at or under this many
+const int sickRaceFloor = 4;                           // ...or the barb's race is at or under this many
+static_assert(sickColonyFloor > 0 && sickRaceFloor > 0, "the cough must never wipe out the colony or a race");
+const Color sickDotColor(172, 184, 88);                // sallow olive-yellow face pixel: greener than the sash/fleck golds,
+                                                       // duller than chop green, far from the red raid pennant
 // R47-F9 Ancestor Stones: every death (removeBarb) leaves a 3x4 headstone where the barb stood. The graves vector is
 // its own list (no barb index or id kept), capped at graveMax with the oldest evicted first.
 const int graveMax = 12;                          // stones on the map at once; a new one evicts the oldest
@@ -2753,6 +2773,9 @@ struct barb {
     bool raidBeaten = false;     // R52-F1: knocked down to kRaidHealthFloor; out of the fight
     int raidFlash = 0;           // R52-F1: hit flash, drawn frames left (counted down in main after drawBarbs())
     bool kneeling = false;       // R52-F3 reserves this flag (the Rite); read here only, so a kneeler is never recruited for a raid
+    int sick = 0;                // R52-F4: ticks of cough left (0 = well); set only by catchCough(), cleared by clearSick()
+    int sickImmune = 0;          // R52-F4: ticks of immunity left after a recovery
+    int cure = 0;                // R52-F4: reserved for phase 2 (herb hut remedy); unused in phase 1
 };
 // R39-F1: the one route reset, called wherever moving/movingbspot is cleared and before a barb is swapRemoved
 void clearRoute(barb& b) {
@@ -2865,6 +2888,17 @@ void clearRaid(barb& b) {
     b.raidPreyId = -1;
     b.raidCooldown = 0;
     b.raidBeaten = false;
+}
+// R52-F4: the add/remove pair for the cough. catchCough() is the only place `sick` is set; clearSick() wipes the whole
+// state (removeBarb() calls it, so nothing outlives the barb)
+void catchCough(barb& b) {
+    b.sick = uniform_int_distribution<int>(sickMinTicks, sickMaxTicks)(gen);
+    b.sickImmune = 0;
+}
+void clearSick(barb& b) {
+    b.sick = 0;
+    b.sickImmune = 0;
+    b.cure = 0;
 }
 void raidMemberLost(const barb& b) {
     if (!raid.active || b.raidSide == raidNone) return;
@@ -3758,7 +3792,8 @@ bool isHungry(const barb& b) { return b.hunger >= hungerThresholdOf(b); }
 int stepLimit(const barb& b) {
     int lim = stepLimit() * (isHungry(b) ? hungerWorkSlowdown : 1);
     float speed = (b.trait == traitSwift ? swiftStepSpeed : 1.0f) * (b.shinobi ? shinobiStepSpeed : 1.0f); // R25-F1, R25-F2
-    return speed > 1.0f ? max(1, (int)(lim / speed)) : lim;
+    if (b.sick > 0) speed *= sickSpeedMult;   // R52-F4: the cough slows the walk through the same multiplier
+    return speed != 1.0f ? max(1, (int)(lim / speed)) : lim;
 }
 
 // Worn trails: per-cell wear from barb steps, decaying over time. Tiers: 0 none, 1 path, 2 road.
@@ -4412,6 +4447,77 @@ void hungerTick(vector<barb>& barbs) {
 
 bool isStarving(const barb& b) { return isHungry(b) && b.starveTicks >= starveGraceTicks; }
 
+// R52-F4: the cough. Runs after hungerTick() (so a meal's heal lands first) and before starveDeathTick(), which removes
+// a barb the cough brought to 0 hp. Buckets are rebuilt from scratch every tick, so they never hold a stale index.
+void sickTick(vector<barb>& barbs) {
+    static unordered_map<int, vector<int>> buckets;   // house id (founders: -1 - race) -> barb indices, this tick only
+    static deque<int> deathTicks;                     // sim ticks of recent cough deaths, for the rolling cap
+    static int tickNow = 0;
+    static uniform_real_distribution<float> roll(0.0f, 1.0f);
+    tickNow++;
+    while (!deathTicks.empty() && tickNow - deathTicks.front() >= sickDeathWindowTicks) deathTicks.pop_front();
+    float winter = isWinter() ? sickWinterMult : 1.0f;
+
+    for (auto& kv : buckets) kv.second.clear();
+    int anySick = 0, raceAlive[raceCount] = {};
+    for (int i = 0; i < (int)barbs.size(); i++) {
+        const barb& b = barbs[i];
+        raceAlive[clampRace(b.race)]++;
+        if (b.sick > 0) anySick++;
+        if (b.onExpedition) continue;   // away from home: neither catches nor spreads it
+        buckets[b.homeHouse >= 0 ? b.homeHouse : -1 - clampRace(b.race)].push_back(i);
+    }
+
+    // Seed: a new outbreak only once the last one has burnt out, so each outbreak gets exactly one ticker line
+    if (anySick == 0 && !barbs.empty() && roll(gen) * sickSeedOneIn < winter) {
+        vector<int> open;
+        for (auto& kv : buckets) for (int i : kv.second) if (barbs[i].sickImmune <= 0 && barbs[i].health > 0) open.push_back(i);
+        if (!open.empty()) {
+            barb& p = barbs[open[uniform_int_distribution<int>(0, (int)open.size() - 1)(gen)]];
+            catchCough(p);
+            int r = clampRace(p.race);
+            printf("COUGH OUTBREAK - %s (%s), %s\n", p.name, raceDefs[r].name, isWinter() ? "winter" : "out of season");
+            logRaceEvent(string(isWinter() ? "Winter cough" : "A cough") + " in the " + raceDefs[r].name + " quarter - " + p.name + " is sick", r);
+        }
+    }
+
+    // Spread: each well, non-immune barb rolls once per sick housemate's worth of chance; crowded houses spread faster
+    for (auto& kv : buckets) {
+        const vector<int>& m = kv.second;
+        int sickHere = 0;
+        for (int i : m) if (barbs[i].sick > 0) sickHere++;
+        if (sickHere == 0 || sickHere == (int)m.size()) continue;
+        float chance = sickSpreadPerKin * sickHere * winter * ((int)m.size() >= sickCrowdSize ? sickCrowdMult : 1.0f);
+        for (int i : m) {
+            barb& b = barbs[i];
+            if (b.sick > 0 || b.sickImmune > 0 || b.health <= 0) continue;
+            if (roll(gen) < chance) { catchCough(b); printf("COUGH SPREADS - %s (house %d)\n", b.name, kv.first); }
+        }
+    }
+
+    // Course: slow health loss, the death cap and the floors, then natural recovery with a brief immunity
+    int colony = (int)barbs.size();
+    for (auto& b : barbs) {
+        if (b.sickImmune > 0) b.sickImmune--;
+        if (b.sick <= 0 || b.health <= 0) continue;
+        if (b.sick % sickDamageTicks == 0) {
+            int r = clampRace(b.race);
+            bool mayDie = (int)deathTicks.size() < sickDeathCap && colony > sickColonyFloor && raceAlive[r] > sickRaceFloor;
+            if (b.health > 1) b.health--;
+            else if (mayDie) {
+                b.health = 0;   // removed by starveDeathTick() at the end of this tick
+                deathTicks.push_back(tickNow);
+                colony--; raceAlive[r]--;
+                printf("COUGH DEATH - %s (%s)\n", b.name, raceDefs[r].name);
+            }
+        }
+        if (--b.sick == 0) {
+            b.sickImmune = sickImmuneTicks;
+            printf("COUGH RECOVERED - %s, %d hp\n", b.name, b.health);
+        }
+    }
+}
+
 Color hungryTint(Color c) {
     auto mix = [](uint8_t a, uint8_t t) { return (uint8_t)(a + (t - a) * hungryTintAmount); };
     return Color(mix(c.r, hungryTintColor.r), mix(c.g, hungryTintColor.g), mix(c.b, hungryTintColor.b));
@@ -4524,6 +4630,11 @@ void drawBarbs(RenderWindow& window, const vector<barb>& barbs, const vector<Rec
             stripe.setFillColor(shinobiBandColor);
             stripe.setPosition(Vector2f(base.x, bodyTop));
             window.draw(stripe);
+        }
+        if (b.sick > 0) {   // R52-F4: sallow 1px face pixel, top-left body cell (row 0: above the task stripe and the sash,
+            dot.setFillColor(sickDotColor);   // clear of the dwarf beard at x=1); drawn over the shinobi band, at every zoom
+            dot.setPosition(Vector2f(base.x, bodyTop));
+            window.draw(dot);
         }
         if (zoom >= drillPipMinZoom && b.drillCount >= kDrillPipCount) {   // R47-F6: 1px dark-red pip, bottom-right body pixel,
             float row = bodyH - 1.0f;                                      // only on a row below the task stripe and off the sash
@@ -4982,6 +5093,7 @@ optional<hoverHit> pickHover(Vector2f p, float radius, const vector<barb>& barbs
                 for (auto& o : barbs) if (o.id != b.id && o.homeHouse == b.homeHouse) kin++;
                 label += ", of house " + to_string(b.homeHouse + 1) + ", " + to_string(kin) + " kin";
             }
+            if (b.sick > 0) label += ", coughing";   // R52-F4
             if (isLeader(b) && raceNeed[b.race] != needNone) label += string("\nNeeds: ") + leaderNeedNames[raceNeed[b.race]];   // R30-F2
             if (b.order != needNone)   // INBOX-F2b: hours rounded up so a live order never reads 0h
                 label += string("\nOrder: ") + leaderNeedNames[b.order] + " (" +
@@ -8347,6 +8459,7 @@ void removeBarb(vector<barb>& barbs, vector<RectangleShape>& squares, int i,
     clearWatch(b);                                // R51-F1: explicit, though releaseBarbWork()'s clearTraining() already did it
     raidMemberLost(b);                            // R52-F1: drops its raid id; raidTick() aborts under kRaidMinMembers raiders
     clearRaid(b);
+    clearSick(b);                                 // R52-F4
     if (isLeader(b)) loseLeader(b.race);
     printf("BARB DIED - %s the %s (%s, %s), id %d - %d left\n", b.name, traitOf(b).name, raceOf(b).name,
            isGentry(b) ? "Gentry" : "Commoner", b.id, (int)barbs.size() - 1);
@@ -8371,7 +8484,7 @@ void starveDeathTick(vector<barb>& barbs, vector<RectangleShape>& squares,
     sort(dead.begin(), dead.end(), [](int a, int b) { return a > b; });
     for (int i : dead) {
         if (i >= (int)barbs.size() || i >= (int)squares.size()) continue;
-        printf("STARVED - ");
+        printf(barbs[i].sick > 0 ? "COUGHED - " : "STARVED - ");   // R52-F4
         removeBarb(barbs, squares, i, sh, fg, stores, fields);
     }
 }
@@ -11821,6 +11934,7 @@ int main() {
                 veilOmenTick();   // R50-F1b: death-site motes and the omen cooldown
                 faithShrineTick(shrines);   // R51-F2: shrine motes at a faith-scaled rate (faith itself eases in veilTick)
                 hungerTick(barbs);
+                sickTick(barbs);   // R52-F4: after meals heal, before starveDeathTick() removes the fallen
                 trailTick();
                 birdTick(birds, birdHeading, squares, barbs);
                 bushTick(bushes, bushshapes);
