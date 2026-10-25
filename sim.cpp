@@ -264,6 +264,47 @@ const int middayStartHour = 12;            // morning tint -> midday tint
 const int eveningStartHour = 18;           // midday tint -> evening tint
 const Color duskEventColor(140, 160, 215); // muted moonlight blue for the dusk ticker line; readable on the black strip
 bool isNightHour(int h) { return h >= nightStartHour || h < nightEndHour; }
+// The Turning Year (R51-F3): the season is a pure function of game_day (counted up by clockk at midnight).
+// Day-based timer audit for the 8-day year: the only other day timer is orderDays, counted in ticks (no day modulo),
+// so it is unaffected by the year length.
+enum season { seasonSpring, seasonSummer, seasonAutumn, seasonWinter, seasonCount };
+const int daysPerSeason = 2;
+const int yearDays = daysPerSeason * seasonCount;   // 8-day year
+const int seasonBlendHours = 12;                    // ground tint cross-fades toward the next season over its last 12h
+const float winterHungerMult = 1.15f;               // hunger grows this much faster in winter (hungerTick only)
+struct seasonDef {
+    const char* name;
+    const char* arrivalLine;   // ticker line on the first midnight of the season
+    Color ground;              // window clear colour (base grass was 4,20,14); zone tint and everything else sit on top
+    Color ticker;              // ticker line tint, readable on the black strip
+    Color iconKey[4];          // HUD leaf icon: a = leaf, b = vein/stem
+};
+const seasonDef seasonDefs[seasonCount] = {
+    {"Spring", "Spring arrives - the year turns", Color(5, 22, 14), Color(150, 205, 120),
+     {Color(130, 190, 90), Color(80, 130, 55), Color::Transparent, Color::Transparent}},
+    {"Summer", "Summer comes - long warm days",   Color(6, 21, 12), Color(215, 195, 100),
+     {Color(175, 180, 70), Color(115, 120, 45), Color::Transparent, Color::Transparent}},
+    {"Autumn", "Autumn turns the leaves",         Color(12, 18, 10), Color(215, 150, 80),
+     {Color(205, 120, 50), Color(140, 75, 35), Color::Transparent, Color::Transparent}},
+    {"Winter", "Winter sets in - hunger bites harder", Color(11, 18, 22), Color(180, 200, 225),
+     {Color(195, 210, 230), Color(130, 150, 180), Color::Transparent, Color::Transparent}},
+};
+const char* const frostLine = "Frost is coming";   // dawn of autumn's last day
+int game_day = 0;   // day 0 = spring, day 1 of year 1
+int seasonOf(int day) { return (day % yearDays) / daysPerSeason; }
+int dayInSeason(int day) { return day % daysPerSeason; }
+bool isWinter() { return seasonOf(game_day) == seasonWinter; }
+// Ground (clear) colour: the season's own, smoothstepped toward the next one over the season's last seasonBlendHours,
+// reaching it exactly at the midnight the season turns
+Color seasonGroundColor(int day, int hour) {
+    int s = seasonOf(day), next = (s + 1) % seasonCount;
+    int h = dayInSeason(day) * 24 + hour;
+    float t = clamp((float)(h - (daysPerSeason * 24 - seasonBlendHours) + 1) / seasonBlendHours, 0.0f, 1.0f);
+    t = t * t * (3.0f - 2.0f * t);
+    Color a = seasonDefs[s].ground, b = seasonDefs[next].ground;
+    auto mix = [t](uint8_t x, uint8_t y) { return (uint8_t)round(x + (y - x) * t); };
+    return Color(mix(a.r, b.r), mix(a.g, b.g), mix(a.b, b.b));
+}
 
 const int stepInterval = 10;
 const int rainStepInterval = 16;          // slower barb stepping in rain (~0.6x speed)
@@ -1756,7 +1797,7 @@ const Vector2f barSize(20.0f, 3.0f);        // inner fill area of a progress bar
 const float barFramePx = 1.0f;
 
 // HUD icon table: 8x8 patterns, '.' = empty, 'a'..'d' = the icon's colour key
-enum hudIconId { iconWood, iconStone, iconFood, iconPeople, iconHouse, iconSun, iconMoon, iconSpeed, iconPause, iconRain, iconCount };
+enum hudIconId { iconWood, iconStone, iconFood, iconPeople, iconHouse, iconSun, iconMoon, iconSpeed, iconPause, iconRain, iconSeason, iconCount };
 struct iconDef {
     const char* rows[hudIconGrid];
     Color key[4];
@@ -1792,6 +1833,9 @@ const iconDef hudIcons[iconCount] = {
     // rain: grey cloud with falling drops
     {{"........", "..aaa...", ".aaaaaa.", "aaaaaaaa", ".aaaaaa.", "........", ".b..b..b", "b..b..b."},
      {Color(150, 158, 172), Color(100, 150, 220), Color::Transparent, Color::Transparent}},
+    // season (R51-F3): a leaf on a diagonal stem; drawn with the season's own key (seasonDefs[].iconKey)
+    {{"......aa", "....aaaa", "...aaaba", "..aaabaa", ".aaabaa.", ".aabaa..", ".baa....", "b......."},
+     {seasonDefs[seasonSpring].iconKey[0], seasonDefs[seasonSpring].iconKey[1], Color::Transparent, Color::Transparent}},
 };
 
 mt19937 gen(random_device{}());
@@ -3435,6 +3479,17 @@ int clockk() {
         game_time = (game_time + 1) % 24;   // 0..23: midnight follows 23:00
         printf("The time is now: %d:00\n", game_time);
         timer = 0;
+        if (game_time == 0) {   // R51-F3: a new day; announce a new season on its first midnight
+            int was = seasonOf(game_day);
+            game_day++;
+            int now = seasonOf(game_day);
+            if (now != was) {
+                printf("SEASON - %s (day %d, year %d)\n", seasonDefs[now].name, game_day + 1, game_day / yearDays + 1);
+                logEvent(seasonDefs[now].arrivalLine, seasonDefs[now].ticker);
+            }
+        }
+        if (game_time == nightEndHour && seasonOf(game_day) == seasonAutumn && dayInSeason(game_day) == daysPerSeason - 1)
+            logEvent(frostLine, seasonDefs[seasonWinter].ticker);   // R51-F3: once, at dawn of autumn's last day
         // R26-F1: only inside this hour-change edge, so each fires once per day
         if (game_time == nightStartHour) logEvent("Dusk falls - " + to_string(game_time) + ":00", duskEventColor);
         if (game_time == nightEndHour)   logEvent("Dawn breaks - " + to_string(game_time) + ":00");
@@ -4025,9 +4080,16 @@ void hungerTick(vector<barb>& barbs) {
     if (hungryLogCooldown > 0) hungryLogCooldown--;
     // Pass 1: hunger grows (once per barb per tick); the "no food" line is logged at most once per tick
     int hungryCommoners[raceCount] = {};   // RACE-F1: each race eats from its own larder, so the reserve is per race
+    // R51-F3: in winter, every 1/(winterHungerMult-1) ticks hunger grows one extra step (1.15 -> ~1 extra per 6.7 ticks)
+    static float winterHungerCarry = 0.0f;
+    int growth = 1;
+    if (isWinter()) {
+        winterHungerCarry += winterHungerMult - 1.0f;
+        if (winterHungerCarry >= 1.0f) { winterHungerCarry -= 1.0f; growth++; }
+    } else winterHungerCarry = 0.0f;
     for (auto& b : barbs) {
         if (!isHungry(b)) {
-            if (!graveHungerRest[clampRace(b.race)]) b.hunger++;   // R47-F9: ancestor stones' morale rest tick
+            if (!graveHungerRest[clampRace(b.race)]) b.hunger += growth;   // R47-F9: ancestor stones' morale rest tick
             if (isHungry(b) && stockOf(b).food <= 0 && hungryLogCooldown == 0) {
                 logRaceEvent(string(b.name) + " is hungry - no food (" + racePlurals[clampRace(b.race)] + ")", b.race);
                 hungryLogCooldown = eventHungryCooldownTicks;
@@ -5055,18 +5117,21 @@ struct hudValues {
     int pulse[techCount];    // frames of white pulse left per pip
     int gold;                // R46-F1a: global nuggets
     bool goldFound;          // R46-F1a: gold cell hidden until the first nugget
+    int day;                 // R51-F3: game_day; the season comes from seasonOf()
 };
 
 // Draws one table icon at pos (top-left, screen px), one quad per filled cell
-void drawIcon(RenderWindow& window, hudIconId id, Vector2f pos, float px = hudIconPx) {   // px: screen px per icon cell
+void drawIcon(RenderWindow& window, hudIconId id, Vector2f pos, float px = hudIconPx,   // px: screen px per icon cell
+              const Color* keyOverride = nullptr) {   // R51-F3: 4 colours replacing the table key (season icon)
     const iconDef& d = hudIcons[id];
+    const Color* key = keyOverride ? keyOverride : d.key;
     VertexArray va(PrimitiveType::Triangles);
     pos = snapPx(pos);
     for (int y = 0; y < hudIconGrid; y++)
         for (int x = 0; x < hudIconGrid && d.rows[y][x]; x++) {
             char ch = d.rows[y][x];
             if (ch < 'a' || ch > 'd') continue;
-            pushQuad(va, pos + Vector2f(x * px, y * px), Vector2f(px, px), d.key[ch - 'a']);
+            pushQuad(va, pos + Vector2f(x * px, y * px), Vector2f(px, px), key[ch - 'a']);
         }
     window.draw(va);
 }
@@ -5082,6 +5147,9 @@ string hudDetailText(const hudValues& v) {
              v.era, v.hungry, v.people, v.gentry, v.commoners, v.houses, v.hour, v.night ? "Night" : "Day", v.speed, v.paused ? " PAUSED" : "",
              v.raining ? "Rain" : "Clear", v.trader, v.tradeLine[0] ? "\n" : "", v.tradeLine);
     string s = buf;
+    s += string("\nSeason: ") + seasonDefs[seasonOf(v.day)].name + " (day " + to_string(dayInSeason(v.day) + 1) + " of "
+         + to_string(daysPerSeason) + ", year " + to_string(v.day / yearDays + 1) + ")"
+         + (seasonOf(v.day) == seasonWinter ? " - hunger grows faster" : "");   // R51-F3
     s += "\nStockpiles (wood/stone/food):";   // RACE-F1
     for (int r = 0; r < raceCount; r++)
         s += string("\n  ") + racePlurals[r] + ": " + to_string(v.stock[r].wood) + " / " + to_string(v.stock[r].stone) + " / " + to_string(v.stock[r].food);
@@ -5109,11 +5177,16 @@ FloatRect drawHud(RenderWindow& window, const Font& font, const hudValues& v) {
     char hour[8], speed[8];
     snprintf(hour, sizeof(hour), "%02d:00", v.hour);
     snprintf(speed, sizeof(speed), "%dx", v.speed);
-    struct cell { hudIconId icon; string text; Color color; };
+    // R51-F3: key = icon colour override; minW = reserved text width (the season cell reserves its widest name)
+    struct cell { hudIconId icon; string text; Color color; const Color* key = nullptr; float minW = 0.0f; };
+    const seasonDef& sd = seasonDefs[seasonOf(v.day)];
+    float seasonW = 0.0f;
+    for (int k = 0; k < seasonCount; k++) seasonW = max(seasonW, Text(font, seasonDefs[k].name, hudFontSize).getLocalBounds().size.x);
     vector<cell> cells = {   // RACE-F1: wood/stone/food moved to the per-race stock panel under the strip
         {iconPeople, to_string(v.people), pal.hudText},
         {iconHouse,  to_string(v.houses), pal.hudText},
         {v.night ? iconMoon : iconSun, hour, pal.hudText},
+        {iconSeason, sd.name, pal.hudText, sd.iconKey, seasonW},   // R51-F3: leaf icon in the season's colours
         {v.paused ? iconPause : iconSpeed, v.paused ? string("Paused") : string(speed), v.paused ? pal.hudAlert : pal.hudText},
     };
     if (v.goldFound) cells.push_back({iconCount, "gold " + to_string(v.gold), hudGoldColor}); // R46-F1a: text only (iconCount = no icon)
@@ -5128,7 +5201,7 @@ FloatRect drawHud(RenderWindow& window, const Font& font, const hudValues& v) {
     float x = hudPadX;
     for (auto& c : cells) {
         if (c.icon != iconCount) {
-            drawIcon(window, c.icon, {x, iconY});
+            drawIcon(window, c.icon, {x, iconY}, hudIconPx, c.key);
             x += hudIconSize + hudIconGap;
         }
         Text t(font, c.text, hudFontSize);
@@ -5136,7 +5209,7 @@ FloatRect drawHud(RenderWindow& window, const Font& font, const hudValues& v) {
         t.setFillColor(c.color);
         t.setPosition({round(x - tb.position.x), textY});
         window.draw(t);
-        x += max(tb.size.x, rb.size.x) + hudCellGap;
+        x += max(max(tb.size.x, rb.size.x), c.minW) + hudCellGap;
     }
 
     // Settlement rank as plain text, right-aligned on the shared baseline; skipped if the cells ever reach that far
@@ -10686,7 +10759,7 @@ int main() {
             }
         }
 
-        window.clear(Color(4, 20, 14)); //bg color
+        window.clear(seasonGroundColor(game_day, game_time)); //bg color, R51-F3: subtle per-season ground
         window.setView(worldView);
         FloatRect camRect(worldView.getCenter() - worldView.getSize() / 2.0f, worldView.getSize());   // R47-F1: view culling
         drawZoneTint(window, camRect);   // R47-F1: faint band wash, first on the ground
@@ -10869,6 +10942,7 @@ int main() {
             hv.era = eraNames[currentEra];
             hv.gold = gold;              // R46-F1a
             hv.goldFound = goldFound;
+            hv.day = game_day;           // R51-F3
             for (int k = 0; k < techCount; k++) { hv.learned[k] = know.learned[k]; hv.pulse[k] = know.pulseFrames[k]; }
             hudRect = drawHud(window, hudFont, hv);
             tickerRect = drawEvents(window, hudFont);
