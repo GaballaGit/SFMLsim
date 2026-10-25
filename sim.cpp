@@ -1324,7 +1324,7 @@ const bool quarterForceFallback = false;     // R47-F3 test switch: true skips t
 const float frontierRadius = raceMinSeparation / 2.0f;   // 130 = houseSpreadFar at step 0 (R47-F10 steps may reach past it)
 const float frontierMinimapDotGap = 3.0f;    // minimap px between border dots (1px each)
 const uint8_t frontierMinimapAlpha = 80;     // faint: under the house/crate/barb dots on the dark backing
-// R51-F4 Race Relations, phase 1: relation[a][b] is SYMMETRIC (setRelation writes both halves; the diagonal stays 0),
+// R51-F4 Race Relations, phase 1: raceRelation[a][b] is SYMMETRIC (setRelation writes both halves; the diagonal stays 0),
 // clamped to [kRelationMin, kRelationMax]. It drops when barbs of two races claim work next to each other inside a
 // frontier, drifts back to neutral (0) slowly, and a cold pair makes the trader charge the served race more.
 // Phase 1 has no warming source; caravans (deferred) must track barbs by stable id with abort + refund, never index pairs.
@@ -2977,7 +2977,7 @@ void logRaceEvent(const string& text, int r) { pushEvent(text, raceEventColors[c
 string eventText(const gameEvent& e) { return e.count > 1 ? e.text + " x" + to_string(e.count) : e.text; }
 
 // R51-F4: symmetric relations matrix; written only through setRelation(), so [a][b] == [b][a] always
-float relation[raceCount][raceCount] = {};
+float raceRelation[raceCount][raceCount] = {};
 int relationClashCooldown[raceCount][raceCount] = {};   // ticks until the pair's next clash counts (kept symmetric too)
 enum relationTier { relNeutral, relUneasy, relCold };
 relationTier relationTierOf(float v) { return v <= kRelationCold ? relCold : v <= kRelationUneasy ? relUneasy : relNeutral; }
@@ -2985,9 +2985,9 @@ relationTier relationTierOf(float v) { return v <= kRelationCold ? relCold : v <
 // clamps, writes both halves, and logs one ticker line when the pair changes tier
 void setRelation(int a, int b, float v) {
     if (a < 0 || a >= raceCount || b < 0 || b >= raceCount || a == b) return;
-    relationTier before = relationTierOf(relation[a][b]);
+    relationTier before = relationTierOf(raceRelation[a][b]);
     v = clamp(v, kRelationMin, kRelationMax);
-    relation[a][b] = relation[b][a] = v;
+    raceRelation[a][b] = raceRelation[b][a] = v;
     relationTier after = relationTierOf(v);
     if (after == before) return;
     string pair = string(racePlurals[a]) + " and " + racePlurals[b];
@@ -3006,7 +3006,7 @@ void relationClash(int a, int b, int owner) {
     if (relationClashCooldown[a][b] > 0) return;
     relationClashCooldown[a][b] = relationClashCooldown[b][a] = kRelationClashCooldownTicks;
     printf("CLAIM CLASH - %s vs %s inside the %s frontier\n", racePlurals[a], racePlurals[b], racePlurals[clampRace(owner)]);
-    setRelation(a, b, relation[a][b] - kRelationClashDelta);
+    setRelation(a, b, raceRelation[a][b] - kRelationClashDelta);
 }
 
 // slow drift of every pair toward neutral, and the clash cooldowns; once per tick
@@ -3014,7 +3014,7 @@ void relationTick() {
     for (int a = 0; a < raceCount; a++)
         for (int b = a + 1; b < raceCount; b++) {
             if (relationClashCooldown[a][b] > 0) relationClashCooldown[a][b] = --relationClashCooldown[b][a];
-            float v = relation[a][b];
+            float v = raceRelation[a][b];
             if (v != 0.0f) setRelation(a, b, v > 0.0f ? max(0.0f, v - kRelationDriftPerTick) : min(0.0f, v + kRelationDriftPerTick));
         }
 }
@@ -3022,7 +3022,7 @@ void relationTick() {
 // race r's coldest standing with any other race (0 if none below neutral)
 float coldestRelationOf(int r) {
     float v = 0.0f;
-    for (int o = 0; r >= 0 && r < raceCount && o < raceCount; o++) if (o != r) v = min(v, relation[r][o]);
+    for (int o = 0; r >= 0 && r < raceCount && o < raceCount; o++) if (o != r) v = min(v, raceRelation[r][o]);
     return v;
 }
 
@@ -5513,7 +5513,7 @@ void drawMinimap(RenderWindow& window, VertexArray& va, const View& worldView,
             float len = sqrt(d.x * d.x + d.y * d.y);
             if (len < 1.0f) continue;
             Vector2f across(-d.y / len, d.x / len), mid = (ca + cb) / 2.0f;
-            float t = clamp(-relation[a][b] / -kRelationMin, 0.0f, 1.0f);   // 0 neutral (or better) .. 1 at the floor
+            float t = clamp(-raceRelation[a][b] / -kRelationMin, 0.0f, 1.0f);   // 0 neutral (or better) .. 1 at the floor
             auto mix = [t](uint8_t x, uint8_t y) { return (uint8_t)round(x + (y - x) * t); };
             Color col(mix(kRelationNeutralColor.r, kRelationColdColor.r), mix(kRelationNeutralColor.g, kRelationColdColor.g),
                       mix(kRelationNeutralColor.b, kRelationColdColor.b), mix(kRelationNeutralColor.a, kRelationColdColor.a));
