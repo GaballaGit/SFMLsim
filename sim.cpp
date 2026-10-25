@@ -415,6 +415,26 @@ const float veilRingTint = 0.35f;                 // share of raceEventColors in
 const int veilOmenCooldownTicks = 4 * ticksPerMinute;   // at most one omen line per 4 min at 1x
 const int veilOmenOneIn = 3;                      // an eligible omen fires only 1 in this many times
 const Color veilOmenColor(176, 196, 204);         // pale ash-blue: greyer than dusk blue, apart from prowler/race tints
+// R51-F2 Faith of the Veil, phase 1: per-race faith, derived only from veil.pool[r] (never written back into it) and
+// smoothed in veilTick. Shown as a small tick on the race's stock-panel row; motes rise over the race's shrine at a
+// rate that grows with faith; ticker lines when a race reaches high faith or falls back to low.
+const float faithFullPool = 3.0f;                 // a race's pool at this much ether (about 3 recent deaths) = faith 1
+const float faithSmoothing = 0.004f;              // share of the gap to the target closed per veil step (~40s lag at 1x)
+const float faithHigh = 0.6f;                     // reaching this: "feel the Veil close" line
+const float faithLow = 0.2f;                      // falling under this (after rising above it): "faith grows thin" line
+const float faithTierHysteresis = 0.05f;          // a tier is left only this far past its threshold, so lines never chatter
+const float faithSeenAbove = 0.02f;               // the HUD faith tick column appears once any race passes this
+const float faithMoteChanceMax = 1.0f / 30.0f;    // per tick per race at faith 1 (~2 motes/s); scales with faith^2,
+                                                  // so faith 0.2 is ~1 mote per 12s and faith 0.6 ~1 per 1.4s
+const int faithMoteMax = 18;                      // shrine motes alive at once (6 per race at full faith)
+const int faithMoteTicks = 200;                   // a little longer than a death-site mote
+const float faithMoteRisePx = 10.0f;              // rises higher than a death-site mote: a thin column over the cap
+const float faithMoteScatterPx = 2.0f;            // spawn offset across the 4px slab
+const uint8_t faithMoteMaxAlpha = 110;            // a touch brighter than death-site motes; still a hint, not a marker
+const float faithTickW = 2.0f;                    // HUD tick: 2px wide, 2..8px tall (bottom-aligned with the stock icons)
+const float faithTickMinH = 2.0f;
+const Color faithTickLowColor(92, 100, 104);      // dim slate: just visible on the panel backing at faith 0
+const Color faithTickHighColor(214, 226, 232);    // pale silver at faith 1 (the mote colour, a little lifted)
 
 const int eventMaxLines = 5;              // ticker shows (and stores) at most this many events
 const int eventFadeTicks = 300;           // frames an event stays on screen (~5s at 60fps)
@@ -3996,13 +4016,19 @@ struct veilState {
     int lastDrawnRace = -1;       // race of the soul the last birth drew, -1 if none (phase 2 ring tint)
     int omenCooldown = 0;         // R50-F1b: ticks until the next omen line may show
     int moteTimer = 0;            // R50-F1b: mote spawn pass runs once per veilStepTicks
+    float faith[raceCount] = {};  // R51-F2: 0..1, derived from pool[r] and smoothed in veilTick (read-only toward pool)
+    int faithTier[raceCount] = {};   // R51-F2: 0 low, 1 middling, 2 high (ticker lines on reaching 2 and falling to 0)
+    bool faithSeen = false;       // R51-F2: HUD faith tick column shown from the first stir of faith on
+    int faithShrineId[raceCount] = {-1, -1, -1};   // R51-F2: shrine (by id) each race's motes rise over, -1 = none yet
 };
+static_assert(raceCount == 3, "faithShrineId initialiser lists one -1 per race");
 veilState veil;
 // R50-F1b: own vectors, values only (the name points into the static name table, never at a barb)
 struct veilSite {Vector2f pos; int race = 0; const char* name = ""; bool shimmered = false;};
-struct veilMote {Vector2f pos; int race = 0; int age = 0; float phase = 0.0f;};
+struct veilMote {Vector2f pos; int race = 0; int age = 0; float phase = 0.0f; int shrineId = -1;};   // R51-F2: shrineId for faith motes
 vector<veilSite> veilSites;
 vector<veilMote> veilMotes;
+vector<veilMote> faithMotes;   // R51-F2: shrine motes, own cap (faithMoteMax); each re-finds its shrine by id every tick
 
 int veilCell(int cx, int cy) { return clamp(cy, 0, veilGridN - 1) * veilGridN + clamp(cx, 0, veilGridN - 1); }
 int veilCellX(Vector2f p) { return clamp((int)(p.x / veilCellPx), 0, veilGridN - 1); }
@@ -4071,12 +4097,41 @@ int veilDraw(Vector2f p, float amount) {
     return r;
 }
 
+// R51-F2: once per veil step, ease each race's faith toward its pool (read only) and log the high/low tier changes
+void veilFaithStep() {
+    for (int r = 0; r < raceCount; r++) {
+        float target = min(1.0f, max(0.0f, veil.pool[r]) / faithFullPool);
+        float& f = veil.faith[r];
+        f += (target - f) * faithSmoothing;
+        if (f < veilZeroBelow) f = 0.0f;
+        if (f > faithSeenAbove) veil.faithSeen = true;
+        int& tier = veil.faithTier[r];
+        if (tier < 2 && f >= faithHigh) {
+            tier = 2;
+            string line = string("The ") + racePlurals[r] + " feel the Veil close";
+            printf("FAITH - %s (faith %.2f, pool %.2f)\n", line.c_str(), f, veil.pool[r]);
+            logEvent(line, veilOmenColor);
+        } else if (tier == 2 && f < faithHigh - faithTierHysteresis) {
+            tier = 1;
+            printf("FAITH - %s ease from high faith (%.2f)\n", racePlurals[r], f);
+        } else if (tier == 0 && f >= faithLow + faithTierHysteresis) {
+            tier = 1;
+            printf("FAITH - %s faith stirs (%.2f)\n", racePlurals[r], f);
+        } else if (tier >= 1 && f < faithLow) {
+            tier = 0;
+            string line = string("The ") + racePlurals[r] + "' faith grows thin";   // every plural ends in s
+            printf("FAITH - %s (faith %.2f)\n", line.c_str(), f);
+            logEvent(line, veilOmenColor);
+        }
+    }
+}
+
 // Every veilStepTicks: diffuse (no-flux edges, so diffusion alone keeps the total) and decay each race's grid from
 // the front buffer into the back one, then flip. Recomputes the per-race pools.
 void veilTick() {
     if (++veil.stepTimer < veilStepTicks) return;
     veil.stepTimer = 0;
-    if (veilTotal() <= 0.0f) return;   // nothing in the veil: skip the sweep
+    if (veilTotal() <= 0.0f) { veilFaithStep(); return; }   // nothing in the veil: skip the sweep (faith still eases down)
     const int src = veil.front, dst = 1 - veil.front;
     for (int r = 0; r < raceCount; r++) {
         const float* cur = veil.ether[src][r];
@@ -4096,6 +4151,7 @@ void veilTick() {
         veil.pool[r] = total;
     }
     veil.front = dst;
+    veilFaithStep();   // R51-F2: after the pools are recomputed
 }
 
 // R50-F1b: a rare omen line. Every omen shares one cooldown and fires only 1 in veilOmenOneIn eligible times.
@@ -5289,6 +5345,12 @@ string hudDetailText(const hudValues& v) {
     for (int r = 0; r < raceCount; r++)
         s += string("\n  ") + racePlurals[r] + ": " + to_string(v.stock[r].wood) + " / " + to_string(v.stock[r].stone) + " / " + to_string(v.stock[r].food);
     s += "\n  Campfire wood: " + to_string(v.campfireWood);
+    if (veil.faithSeen) {   // R51-F2: the stock panel's faith tick, in words
+        s += "\nFaith of the Veil:";
+        for (int r = 0; r < raceCount; r++)
+            s += string("\n  ") + racePlurals[r] + ": " + to_string((int)round(veil.faith[r] * 100.0f)) + "%"
+                 + (veil.faithTier[r] == 2 ? " (high)" : veil.faithTier[r] == 0 ? " (low)" : "");
+    }
     s += "\nKnow-how:";
     for (int t = 0; t < techCount; t++)   // learned techs, or progress toward each
         s += string("\n  ") + techDefs[t].name + ": " + (v.learned[t] ? "learned"
@@ -5592,6 +5654,7 @@ FloatRect drawStockPanel(RenderWindow& window, const Font& font, const hudValues
     const int tierBars = toolTierCount - 1;   // R49-F1: tool tier icon column, shown once any race has smelted an ingot
     float tierIconW = tierBars * tierIconBarW + (tierBars - 1) * tierIconBarGap;
     if (toolTierSeen) innerW += stockCellGap + tierIconW;
+    if (veil.faithSeen) innerW += stockCellGap + faithTickW;   // R51-F2: faith tick, last in the row
     Vector2f size(round(innerW + 2 * stockPad.x), round(raceCount * rowH + (raceCount - 1) * stockRowGap + 2 * stockPad.y));
     Vector2f pos(round(stockMargin), round(hudBarHeight + stockMargin));
     FloatRect box(pos, size);
@@ -5656,6 +5719,17 @@ FloatRect drawStockPanel(RenderWindow& window, const Font& font, const hudValues
                 bar.setFillColor(c);
                 window.draw(bar);
             }
+            x += tierIconW;
+        }
+        if (veil.faithSeen) {   // R51-F2: one 2px tick, taller and paler with faith, bottom-aligned with the stock icons
+            x += stockCellGap;
+            float f = clamp(veil.faith[r], 0.0f, 1.0f);
+            float h = round(faithTickMinH + (iconSize - faithTickMinH) * f);
+            float iconTop = round(y + (rowH - iconSize) / 2.0f);
+            RectangleShape tick(Vector2f(faithTickW, h));
+            tick.setPosition(Vector2f(x, iconTop + iconSize - h));
+            tick.setFillColor(empty ? stockEmptyRaceColor : lerpColor(faithTickLowColor, faithTickHighColor, f));
+            window.draw(tick);
         }
     }
     return box;
@@ -6042,6 +6116,53 @@ int findShrineById(const vector<shrine>& shrines, int id) {
     for (int i = 0; i < (int)shrines.size(); ++i)
         if (shrines[i].id == id) return i;
     return -1;
+}
+
+// R51-F2: just above the middle of a shrine's gold cap, where its faith motes start
+Vector2f faithMoteOrigin(const shrine& s) {
+    return Vector2f((float)s.x + shrineSlabSize.x / 2.0f, (float)s.y - shrineCapH - 1.0f);
+}
+
+// R51-F2: every tick, ages shrine motes (dropping any whose shrine id no longer resolves), re-finds each race's shrine
+// by id (picking a fresh one, nearest its quarter and not held by another race if possible, when it is missing), and
+// rolls a mote over it with chance faithMoteChanceMax * faith^2. Reads veil.faith only; never touches veil.pool.
+void faithShrineTick(const vector<shrine>& shrines) {
+    for (auto& m : faithMotes) m.age++;
+    for (int i = (int)faithMotes.size() - 1; i >= 0; i--)
+        if (faithMotes[i].age >= faithMoteTicks || findShrineById(shrines, faithMotes[i].shrineId) < 0) swapRemove(faithMotes, i);
+    static uniform_real_distribution<float> roll(0.0f, 1.0f);
+    static uniform_real_distribution<float> scatter(-faithMoteScatterPx, faithMoteScatterPx);
+    for (int r = 0; r < raceCount; r++) {
+        int si = findShrineById(shrines, veil.faithShrineId[r]);
+        if (si < 0) {   // not found (none yet, or gone): choose again
+            veil.faithShrineId[r] = -1;
+            Vector2f home = quarterCentre(r);
+            int best = -1;
+            bool bestFree = false;
+            float bestD = 0.0f;
+            for (int k = 0; k < (int)shrines.size(); k++) {
+                bool free = true;
+                for (int o = 0; o < raceCount; o++)
+                    if (o != r && veil.faithShrineId[o] == shrines[k].id && findShrineById(shrines, veil.faithShrineId[o]) >= 0) free = false;
+                Vector2f d = faithMoteOrigin(shrines[k]) - home;
+                float dd = d.x * d.x + d.y * d.y;
+                if (best < 0 || (free && !bestFree) || (free == bestFree && dd < bestD)) { best = k; bestFree = free; bestD = dd; }
+            }
+            if (best < 0) continue;   // no shrine standing: faith still counts, there is just nowhere to show it
+            si = best;
+            veil.faithShrineId[r] = shrines[si].id;
+            printf("FAITH - %s motes will rise over shrine %d\n", racePlurals[r], shrines[si].id);
+        }
+        float f = veil.faith[r];
+        if (f <= 0.0f || (int)faithMotes.size() >= faithMoteMax) continue;
+        if (roll(gen) >= faithMoteChanceMax * f * f) continue;
+        veilMote m;
+        m.pos = faithMoteOrigin(shrines[si]) + Vector2f(scatter(gen), 0.0f);
+        m.race = r;
+        m.phase = roll(gen) * 6.2832f;
+        m.shrineId = shrines[si].id;
+        faithMotes.push_back(m);
+    }
 }
 
 // Runs after buildhouse(), so a barb free for a house this tick takes the house first.
@@ -7275,19 +7396,24 @@ void drawBirthRings(RenderWindow& window, const vector<birthRing>& rings) {
 
 // R50-F1b: veil motes, world layer under the day/night overlay. One batched draw; 1px, low alpha, a sin fade in/out
 // with a soft shimmer, rising and swaying a little. Aged in veilOmenTick (sim ticks), so they hold still while paused.
+// R51-F2: shrine faith motes share the same look and batch, rising higher (faithMoteRisePx) and a little brighter.
 void drawVeilMotes(RenderWindow& window, const FloatRect& camRect) {
-    if (veilMotes.empty()) return;
+    if (veilMotes.empty() && faithMotes.empty()) return;
     static VertexArray va(PrimitiveType::Triangles);
     va.clear();
-    for (auto& m : veilMotes) {
-        float t = (float)m.age / veilMoteTicks;
-        Vector2f p = m.pos + Vector2f(veilMoteSwayPx * sin(m.phase + m.age * 0.05f), -veilMoteRisePx * t);
-        if (!camRect.contains(p)) continue;
-        float shimmer = 0.65f + 0.35f * sin(m.phase + m.age * 0.3f);
-        Color c = lerpColor(veilMoteColor, raceEventColors[clampRace(m.race)], veilMoteRaceTint);
-        c.a = (uint8_t)(veilMoteMaxAlpha * sin(3.14159f * t) * shimmer);
-        pushQuad(va, snapPx(p), veilMoteSize, c);
-    }
+    auto add = [&](const vector<veilMote>& motes, int life, float rise, uint8_t maxAlpha) {
+        for (auto& m : motes) {
+            float t = (float)m.age / life;
+            Vector2f p = m.pos + Vector2f(veilMoteSwayPx * sin(m.phase + m.age * 0.05f), -rise * t);
+            if (!camRect.contains(p)) continue;
+            float shimmer = 0.65f + 0.35f * sin(m.phase + m.age * 0.3f);
+            Color c = lerpColor(veilMoteColor, raceEventColors[clampRace(m.race)], veilMoteRaceTint);
+            c.a = (uint8_t)(maxAlpha * sin(3.14159f * t) * shimmer);
+            pushQuad(va, snapPx(p), veilMoteSize, c);
+        }
+    };
+    add(veilMotes, veilMoteTicks, veilMoteRisePx, veilMoteMaxAlpha);
+    add(faithMotes, faithMoteTicks, faithMoteRisePx, faithMoteMaxAlpha);
     if (va.getVertexCount() > 0) window.draw(va);
 }
 
@@ -11141,6 +11267,7 @@ int main() {
                 graveTick(barbs, squares);   // R47-F9: morale term per race, before hungerTick() reads it
                 veilTick();   // R50-F1a: throttled diffusion/decay of the hidden soul-ether
                 veilOmenTick();   // R50-F1b: death-site motes and the omen cooldown
+                faithShrineTick(shrines);   // R51-F2: shrine motes at a faith-scaled rate (faith itself eases in veilTick)
                 hungerTick(barbs);
                 trailTick();
                 birdTick(birds, birdHeading, squares, barbs);
