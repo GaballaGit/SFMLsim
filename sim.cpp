@@ -2093,6 +2093,47 @@ RectangleShape bushDrawShape(const CircleShape& bs) {
     return s;
 }
 
+// Rocks (+ gold flecks), bushes and stumps batched into one vertex array each, culled to the view. Same shapes and
+// order as rockDrawShape()/bushDrawShape()/drawSnapped(), but one draw call per layer instead of one per object.
+void drawRocks(RenderWindow& window, const vector<CircleShape>& octs, const vector<char>& rockGold, VertexArray& va, const FloatRect& view) {
+    va.clear();
+    for (int i = 0; i < (int)octs.size(); i++) {
+        float r = octs[i].getRadius();
+        Vector2f p = snapPx(octs[i].getPosition());
+        if (!view.findIntersection(FloatRect(p, Vector2f(2 * r, 2 * r)))) continue;
+        bool isGold = i < (int)rockGold.size() && rockGold[i];
+        Color c = isGold ? goldRockColor : pal.rock;
+        Vector2f pt[rockPointCount];   // CircleShape's point formula: point k at angle k*2pi/n - pi/2 around (r, r)
+        for (int k = 0; k < rockPointCount; k++) {
+            float a = k * 2 * 3.14159265f / rockPointCount - 3.14159265f / 2;
+            pt[k] = p + Vector2f(r + cos(a) * r, r + sin(a) * r);
+        }
+        for (int k = 1; k + 1 < rockPointCount; k++)
+            for (Vector2f v : {pt[0], pt[k], pt[k + 1]}) va.append(Vertex{v, c});
+        if (isGold) pushQuad(va, p + goldFleckOffset, Vector2f(1, 1), goldFleckColor);
+    }
+    if (va.getVertexCount() > 0) window.draw(va);
+}
+
+void drawBushes(RenderWindow& window, const vector<CircleShape>& bushshapes, VertexArray& va, const FloatRect& view) {
+    va.clear();
+    for (auto& bs : bushshapes) {
+        float d = 2 * bs.getRadius();
+        Vector2f p = snapPx(bs.getPosition());
+        if (view.findIntersection(FloatRect(p, Vector2f(d, d)))) pushQuad(va, p, Vector2f(d, d), bs.getFillColor());
+    }
+    if (va.getVertexCount() > 0) window.draw(va);
+}
+
+void drawStumps(RenderWindow& window, const vector<RectangleShape>& stumps, VertexArray& va, const FloatRect& view) {
+    va.clear();
+    for (auto& s : stumps) {
+        Vector2f p = snapPx(s.getPosition());
+        if (view.findIntersection(FloatRect(p, s.getSize()))) pushQuad(va, p, s.getSize(), s.getFillColor());
+    }
+    if (va.getVertexCount() > 0) window.draw(va);
+}
+
 struct house {int x, y; bool hasFoundation = false; int id = -1; barbRace race = raceHuman;}; // id: stable, from nextHouseId; race: builder's, picks the roof style
 int nextHouseId = 0;   // assigned only in buildhouse(); never reused, so ids survive any swapRemove
 struct shrine {int x, y; int id = -1;};  // x,y = slab top-left; id: stable, from nextShrineId (refer to shrines by id, never index)
@@ -12008,6 +12049,7 @@ int main() {
     }
 
     VertexArray treeVerts(PrimitiveType::Triangles);
+    VertexArray rockVerts(PrimitiveType::Triangles), bushVerts(PrimitiveType::Triangles), stumpVerts(PrimitiveType::Triangles);   // rebuilt every frame
     VertexArray rainVerts(PrimitiveType::Triangles); // scratch buffer for drawRain, rebuilt every frame
     VertexArray minimapVerts(PrimitiveType::Triangles); // UIO-F1: scratch buffer for drawMinimap's dots, rebuilt every frame
 
@@ -12216,20 +12258,8 @@ int main() {
         drawLakes(window);
         drawLens(window, lensVerts, worldView, lens, barbs, squares, houses, houseshapes, stores);   // UIO-F3: under rocks, buildings and barbs
 
-	{
-		RectangleShape fleck({1.0f, 1.0f});   // R46-F1a: one pale-gold pixel on each gold rock
-		fleck.setFillColor(goldFleckColor);
-		for (int i = 0; i < (int)octs.size(); i++) {
-			CircleShape d = rockDrawShape(octs[i]);
-			bool isGold = i < (int)rockGold.size() && rockGold[i];
-			if (isGold) d.setFillColor(goldRockColor);
-			window.draw(d);
-			if (isGold) { fleck.setPosition(d.getPosition() + goldFleckOffset); window.draw(fleck); }
-		}
-	}
-
-	for (auto& bs : bushshapes)
-		window.draw(bushDrawShape(bs));
+	drawRocks(window, octs, rockGold, rockVerts, camRect);   // R46-F1a: gold rocks get one pale-gold fleck pixel
+	drawBushes(window, bushshapes, bushVerts, camRect);
 	drawGraves(window, camRect);   // R47-F9: ancestor stones, on the ground under the buildings
 
 	{
@@ -12274,12 +12304,7 @@ int main() {
 	drawProwlers(window, prowlers);   // R48-F1: bodies under the night overlay; eyes after it
 	for (auto& p : prowlers) if (p.flashFrames > 0 && !paused) p.flashFrames--;   // R51-F1: the hit flash lasts 2 drawn frames
 
-        {
-            // R45-F1a: thousands of stumps (R47-F1: ~12k on the 2400 map), so only the ones in (or touching) the view are drawn
-            FloatRect viewRect(worldView.getCenter() - worldView.getSize() / 2.0f, worldView.getSize());
-            for (int i = 0; i < (int)tris.size(); i++)
-                if (viewRect.findIntersection(stumps[i].getGlobalBounds())) drawSnapped(window, stumps[i]);
-        }
+        drawStumps(window, stumps, stumpVerts, camRect);   // R45-F1a: ~12k stumps (R47-F1), only those touching the view
 
         drawRiteRings(window, shrines);   // R52-F3: faint ring round each rite shrine, under the kneelers
         drawBarbs(window, barbs, squares, frameCount, zoom);
