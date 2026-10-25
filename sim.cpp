@@ -1304,6 +1304,25 @@ const bool quarterForceFallback = false;     // R47-F3 test switch: true skips t
 const float frontierRadius = raceMinSeparation / 2.0f;   // 130 = houseSpreadFar at step 0 (R47-F10 steps may reach past it)
 const float frontierMinimapDotGap = 3.0f;    // minimap px between border dots (1px each)
 const uint8_t frontierMinimapAlpha = 80;     // faint: under the house/crate/barb dots on the dark backing
+// R51-F4 Race Relations, phase 1: relation[a][b] is SYMMETRIC (setRelation writes both halves; the diagonal stays 0),
+// clamped to [kRelationMin, kRelationMax]. It drops when barbs of two races claim work next to each other inside a
+// frontier, drifts back to neutral (0) slowly, and a cold pair makes the trader charge the served race more.
+// Phase 1 has no warming source; caravans (deferred) must track barbs by stable id with abort + refund, never index pairs.
+const float kRelationMin = -1.0f;
+const float kRelationMax = 1.0f;
+const float kRelationClashDelta = 0.1f;      // drop per counted clash
+const int kRelationClashCooldownTicks = ticksPerGameHour / 4;   // per pair: at most 4 counted clashes a game hour
+const float kRelationClashRadius = 40.0f;    // a foreign-claimed tree/rock this close to a new claim is a clash
+const float kRelationDriftPerTick = 1.0f / (12.0f * ticksPerGameHour);   // full -1 -> 0 recovery in 12 game hours
+const float kRelationUneasy = -0.2f;         // at or below: "uneasy" tier (ticker line)
+const float kRelationCold = -0.5f;           // at or below: "cold" tier (ticker line, trade toll)
+const float kTradePriceMultMax = 1.5f;       // cap on the cold-border trade price multiplier (reached at kRelationMin)
+const float kTradePriceMultCold = 1.25f;     // multiplier right at kRelationCold, rising linearly to the cap
+const float kRelationMinimapLenPx = 6.0f;    // minimap px: border segment length, across the line between two crates
+const float kRelationMinimapPx = 2.0f;       // minimap px: segment thickness (frontier dots are 1px, so it reads over them)
+const Color kRelationNeutralColor(150, 168, 196, 230);   // pale slate blue: apart from the tan/grey/sage race tints
+const Color kRelationColdColor(206, 84, 70, 240);        // muted brick red
+const Color kRelationTickerColdTint(222, 140, 120);      // ticker tint for a pair getting worse
 const float quarterMinRadius = 210.0f;       // crate centre distance from the campfire (R44-F4b: was 165)
 const float quarterMaxRadius = 250.0f;       // (R44-F4b: was 200)
 const float traderGapRadius = quarterMaxRadius;   // R47-F3: trader's waypoint on a gap's bisector, this far from the campfire
@@ -2937,6 +2956,70 @@ void logRaceEvent(const string& text, int r) { pushEvent(text, raceEventColors[c
 
 string eventText(const gameEvent& e) { return e.count > 1 ? e.text + " x" + to_string(e.count) : e.text; }
 
+// R51-F4: symmetric relations matrix; written only through setRelation(), so [a][b] == [b][a] always
+float relation[raceCount][raceCount] = {};
+int relationClashCooldown[raceCount][raceCount] = {};   // ticks until the pair's next clash counts (kept symmetric too)
+enum relationTier { relNeutral, relUneasy, relCold };
+relationTier relationTierOf(float v) { return v <= kRelationCold ? relCold : v <= kRelationUneasy ? relUneasy : relNeutral; }
+
+// clamps, writes both halves, and logs one ticker line when the pair changes tier
+void setRelation(int a, int b, float v) {
+    if (a < 0 || a >= raceCount || b < 0 || b >= raceCount || a == b) return;
+    relationTier before = relationTierOf(relation[a][b]);
+    v = clamp(v, kRelationMin, kRelationMax);
+    relation[a][b] = relation[b][a] = v;
+    relationTier after = relationTierOf(v);
+    if (after == before) return;
+    string pair = string(racePlurals[a]) + " and " + racePlurals[b];
+    string line;
+    if (after > before)
+        line = after == relCold ? pair + " turn cold: the trader charges more" : pair + " are uneasy over the border woods";
+    else
+        line = after == relUneasy ? pair + " thaw, but stay wary" : pair + " are at peace again";
+    printf("RELATION - %s %s (%.2f)\n", pair.c_str(), after > before ? "worse" : "better", v);
+    logEvent(line, after > before ? kRelationTickerColdTint : Color::Transparent);
+}
+
+// a claim clash between races a and b inside owner's frontier; counted at most once per pair per cooldown
+void relationClash(int a, int b, int owner) {
+    if (a < 0 || a >= raceCount || b < 0 || b >= raceCount || a == b) return;
+    if (relationClashCooldown[a][b] > 0) return;
+    relationClashCooldown[a][b] = relationClashCooldown[b][a] = kRelationClashCooldownTicks;
+    printf("CLAIM CLASH - %s vs %s inside the %s frontier\n", racePlurals[a], racePlurals[b], racePlurals[clampRace(owner)]);
+    setRelation(a, b, relation[a][b] - kRelationClashDelta);
+}
+
+// slow drift of every pair toward neutral, and the clash cooldowns; once per tick
+void relationTick() {
+    for (int a = 0; a < raceCount; a++)
+        for (int b = a + 1; b < raceCount; b++) {
+            if (relationClashCooldown[a][b] > 0) relationClashCooldown[a][b] = --relationClashCooldown[b][a];
+            float v = relation[a][b];
+            if (v != 0.0f) setRelation(a, b, v > 0.0f ? max(0.0f, v - kRelationDriftPerTick) : min(0.0f, v + kRelationDriftPerTick));
+        }
+}
+
+// race r's coldest standing with any other race (0 if none below neutral)
+float coldestRelationOf(int r) {
+    float v = 0.0f;
+    for (int o = 0; r >= 0 && r < raceCount && o < raceCount; o++) if (o != r) v = min(v, relation[r][o]);
+    return v;
+}
+
+// trade price multiplier for race r: 1 unless r has a cold pair, then kTradePriceMultCold..kTradePriceMultMax (capped)
+float tradePriceMultOf(int r) {
+    float v = coldestRelationOf(r);
+    if (v > kRelationCold) return 1.0f;
+    float depth = clamp((kRelationCold - v) / (kRelationCold - kRelationMin), 0.0f, 1.0f);
+    return min(kTradePriceMultMax, kTradePriceMultCold + (kTradePriceMultMax - kTradePriceMultCold) * depth);
+}
+
+// per-lot trade cost for race r (stone, or the food fallback), with the cold-border markup rounded up
+int tradeCostOf(int r, bool food) {
+    int base = food ? tradeFoodCost : tradeStoneCost;
+    return (int)ceil(base * tradePriceMultOf(r) - 0.001f);
+}
+
 // Know-how (R20-F1): one unit of practice; at the threshold the tech is learned once, with a ticker line
 void practice(techId t) {
     know.count[t]++;
@@ -4514,7 +4597,8 @@ int traderPickRace(const vector<barb>& barbs, bool food) {
     int best = -1;
     for (int r = 0; r < raceCount; r++) {
         if (raceCooldown[r] > 0 || !traderRaceAlive(barbs, r)) continue;
-        bool pays = food ? stock[r].food >= tradeFoodReserve + tradeFoodCost : stock[r].stone >= tradeStoneCost;
+        int cost = tradeCostOf(r, food);   // R51-F4: cold-border markup
+        bool pays = food ? stock[r].food >= tradeFoodReserve + cost : stock[r].stone >= cost;
         if (pays && (best < 0 || stock[r].wood < stock[best].wood)) best = r;
     }
     return best;
@@ -4612,7 +4696,14 @@ void traderTick(optional<trader>& tr, const vector<barb>& barbs, const storehous
         const char* what = t.buysFood ? "food" : "stone";
         if (tr_r >= 0) {
             raceStock& rs = stock[tr_r];
-            int cost = t.buysFood ? tradeFoodCost : tradeStoneCost;
+            int base = t.buysFood ? tradeFoodCost : tradeStoneCost;
+            int cost = tradeCostOf(tr_r, t.buysFood);   // R51-F4: a cold pair raises the price per lot
+            if (cost > base) {
+                char toll[96];
+                snprintf(toll, sizeof(toll), "Border tension: %s pay %d %s a lot (was %d)", racePlurals[tr_r], cost, what, base);
+                printf("TRADE TOLL - %s x%.2f\n", racePlurals[tr_r], tradePriceMultOf(tr_r));
+                logEvent(toll, kRelationTickerColdTint);
+            }
             int avail = t.buysFood ? max(0, rs.food - tradeFoodReserve) : rs.stone;
             lots = min(avail / cost, tradeMaxLots + (hasStall ? stallExtraLots : 0));
             paid = lots * cost;
@@ -5352,6 +5443,23 @@ void drawMinimap(RenderWindow& window, VertexArray& va, const View& worldView,
             minimapDot(va, inner, quarterCentre(k) + Vector2f(cos(a), sin(a)) * frontierRadius, 1.0f, col);
         }
     }
+    // R51-F4: one border segment per race pair, midway between the two crates and across the line joining them, over the
+    // faint frontier dots: 2px thick and near-opaque, slate blue at neutral easing to brick red as the pair turns cold
+    for (int a = 0; a < raceCount; a++)
+        for (int b = a + 1; b < raceCount; b++) {
+            Vector2f ca = quarterCentre(a), cb = quarterCentre(b), d = cb - ca;
+            float len = sqrt(d.x * d.x + d.y * d.y);
+            if (len < 1.0f) continue;
+            Vector2f across(-d.y / len, d.x / len), mid = (ca + cb) / 2.0f;
+            float t = clamp(-relation[a][b] / -kRelationMin, 0.0f, 1.0f);   // 0 neutral (or better) .. 1 at the floor
+            auto mix = [t](uint8_t x, uint8_t y) { return (uint8_t)round(x + (y - x) * t); };
+            Color col(mix(kRelationNeutralColor.r, kRelationColdColor.r), mix(kRelationNeutralColor.g, kRelationColdColor.g),
+                      mix(kRelationNeutralColor.b, kRelationColdColor.b), mix(kRelationNeutralColor.a, kRelationColdColor.a));
+            float halfWorld = kRelationMinimapLenPx / 2.0f / minimapScale();
+            int steps = max(2, (int)round(kRelationMinimapLenPx));   // ~1 minimap px apart so the 2px dots form a solid bar
+            for (int i = 0; i <= steps; i++)
+                minimapDot(va, inner, mid + across * (-halfWorld + 2.0f * halfWorld * i / steps), kRelationMinimapPx, col);
+        }
     for (int i = 0; i < (int)houses.size(); i++)
         minimapDot(va, inner, houseshapes[i].getPosition() + houseshapes[i].getSize() / 2.0f, MM_HOUSE_PX, storehouseColors[houses[i].race]);
     for (int k = 0; k < raceCount; k++)
@@ -9615,6 +9723,31 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
         if (barbs[j].inMine && (!barbUnderground(barbs[j]) || shaftMiner[barbs[j].race] != j)) leaveMine(barbs[j]);
     leaderNeed liveNeed[raceCount];   // R30-F2: a race's need counts only while its leader is alive (checked once per tick)
     for (int r = 0; r < raceCount; r++) liveNeed[r] = findBarbById(barbs, raceLeaderId[r]) >= 0 ? raceNeed[r] : needNone;
+    // R51-F4: barb j just claimed the tree/rock whose work spot is spot. Inside any race's frontier, a tree or rock within
+    // kRelationClashRadius already claimed this tick by another race's barb is a claim clash between the two races.
+    // Claims are this tick's index tables, read and range-checked here only; nothing is stored.
+    auto noteClaimClash = [&](int j, Vector2f spot) {
+        int r = barbs[j].race;
+        if (r < 0 || r >= raceCount) return;
+        int owner = -1;
+        for (int k = 0; k < raceCount && owner < 0; k++) {
+            Vector2f d = spot - quarterCentre(k);
+            if (d.x * d.x + d.y * d.y < frontierRadius * frontierRadius) owner = k;
+        }
+        if (owner < 0) return;
+        auto foreign = [&](int c) {
+            return c >= 0 && c < (int)barbs.size() && c != j && barbs[c].race >= 0 && barbs[c].race < raceCount && barbs[c].race != r;
+        };
+        int t = findNearestTree(tris, spot, kRelationClashRadius, [&](int i) { return i >= (int)treeClaim.size() || !foreign(treeClaim[i]); });
+        int other = t >= 0 ? barbs[treeClaim[t]].race : -1;
+        if (other < 0) {
+            int k = findNearest(spot, kRelationClashRadius, (int)octs.size(),
+                                [&](int i) { return octs[i].getPosition() + rockWorkOffset; },
+                                [&](int i) { return i >= (int)rockClaim.size() || !foreign(rockClaim[i]); });
+            if (k >= 0) other = barbs[rockClaim[k]].race;
+        }
+        if (other >= 0) relationClash(r, other, owner);
+    };
     for (int j = 0; j < (int)squares.size(); j++) {
         auto& sq = squares[j];
         auto& b  = barbs[j];
@@ -9757,12 +9890,14 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
                         b.targety = (int)(tp.y + 15);
                         b.target = targetNone;
                         treeClaim[hit] = j;
+                        noteClaimClash(j, tp + treeWorkOffset);   // R51-F4
                     } else if (m.kind == memRock) {
                         Vector2f rp = octs[hit].getPosition();
                         b.targetx = (int)(rp.x + 6);
                         b.targety = (int)(rp.y + 10);
                         b.target = targetRock;
                         rockClaim[hit] = j;
+                        noteClaimClash(j, rp + rockWorkOffset);   // R51-F4
                     } else {
                         Vector2f wp = bushWorkSpot(bushshapes[hit]);
                         b.targetx = (int)wp.x;
@@ -9792,6 +9927,7 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
                 b.moving  = true;
                 b.target = targetNone;
                 treeClaim[best] = j;
+                noteClaimClash(j, tp + treeWorkOffset);   // R51-F4
                 freshKind = memTree;   // INBOX-F2
                 freshPos = Vector2f(b.targetx, b.targety);
             }
@@ -9810,6 +9946,7 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
 		    b.moving = true;
 		    b.target = targetRock;
 		    rockClaim[best] = j;
+		    noteClaimClash(j, rp + rockWorkOffset);   // R51-F4
 		    freshKind = memRock;   // INBOX-F2
 		    freshPos = Vector2f(b.targetx, b.targety);
         }
@@ -9863,6 +10000,7 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
                     b.moving = true;
                     b.target = targetRock;
                     rockClaim[wRock] = j;
+                    noteClaimClash(j, rp + rockWorkOffset);   // R51-F4
                 } else if (wTree != -1) {
                     Vector2f tp = tris[wTree].getPosition();
                     b.targetx = (int)(tp.x + 8);
@@ -9870,6 +10008,7 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
                     b.moving = true;
                     b.target = targetNone;
                     treeClaim[wTree] = j;
+                    noteClaimClash(j, tp + treeWorkOffset);   // R51-F4
                 }
             }
         if (b.targetx == -1) continue;
@@ -10997,6 +11136,7 @@ int main() {
                 poiTick(barbs, squares);   // R47-F4: site discovery and spent-site crumbling, after the party's tick
                 clockk();
                 weatherTick();
+                relationTick();   // R51-F4: drift to neutral and clash cooldowns, before the trader prices a visit
                 traderTick(activeTrader, barbs, stores);
                 graveTick(barbs, squares);   // R47-F9: morale term per race, before hungerTick() reads it
                 veilTick();   // R50-F1a: throttled diffusion/decay of the hidden soul-ether
