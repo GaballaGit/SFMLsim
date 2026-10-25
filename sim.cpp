@@ -546,6 +546,29 @@ const Color prowlerOutlineColor(222, 214, 240, 150); // pale 1px rim
 const Color prowlerEyeColor(235, 50, 45);   // two 1px red eyes, drawn after the night overlay
 const Color prowlerSafeRingColor(235, 165, 85, 60);  // faint warm 1px ring marking the safe zone at night (fire lit)
 const Color prowlerEventColor(185, 160, 225);        // ticker tint for the first prowler of a night
+// R51-F1 The Night Watch, phase 1: at night, armed and drilled barbs (a weapon and kDrillPipCount drills) take the watch
+// (barb.watching, owned by watchTick(), cleared only by clearWatch()) and walk a ring of watchRingPx round their race's
+// crate with a 1px torch. A prowler within watchEngagePx (coarse squared distance, watchmen only) is chased and struck
+// with the barb's weapon; at 0 hp it dissolves through the shared dissolveProwler() fade. Hp-bar polish and bite-back
+// tuning are follow-ups.
+const int prowlerMaxHp = 45;                 // 3 hits at any tier (spear 15 -> 21 at tier 3)
+const int prowlerFlashFrames = 2;            // white hit flash, counted in drawn frames
+const Color prowlerFlashColor(255, 255, 255);
+const float watchRingPx = 70.0f;             // patrol ring radius round the race's crate centre (house disc 56)
+const int watchRingStops = 12;               // patrol waypoints round the ring (~37px apart)
+const int watchMaxPerRace = 3;               // watchmen per race at once
+const int watchMinHealth = 40;               // a barb below this hp is not sent out on watch
+const int watchEnlistTicks = 60;             // eligibility scan throttle while the night lasts (~1s at 1x)
+const float watchEngagePx = 48.0f;           // coarse engage range, watchman centre to prowler centre
+const float watchLeashPx = 72.0f;            // a chased prowler farther than this is let go
+const float watchStrikeRangePx = 4.0f;       // centre distance to strike
+const int watchStrikeCooldownTicks = 90;     // ticks between strikes (~1.5s at 1x)
+const Color watchTorchColor(255, 156, 56);   // orange torch pixel, drawn above the night overlay
+const Color watchTorchFlickerColor(232, 116, 40);
+const Color watchTorchGlowColor(255, 150, 60, 40);   // faint 3x3 halo behind the pixel, night only
+const int watchTorchFlickerFrames = 7;
+const Color watchRingColor(235, 160, 80, 55);        // faint 1px patrol ring, only while a watchman is hovered/selected
+const int watchRingPoints = 72;
 
 // Skittish deer: bolt away from a nearby barb for a short, capped time, then a cooldown so hunts can still land
 const int deerStepInterval = 3;            // ticks per 1px step while wandering (deer row of speciesDefs)
@@ -2628,6 +2651,10 @@ struct barb {
     int drillTimer = 0;          // R47-F6: work ticks since the last hit (separate from timer); reset by clearTraining()
     int drillHits = 0;           // R47-F6: hits this session; reset by clearTraining()
     int drillCount = 0;          // R47-F6: the drill counter, hits over the barb's life; reset only in makeBarb()
+    bool watching = false;       // R51-F1: exclusive night-watch state owned by watchTick(); set only by startWatch(), cleared only by clearWatch()
+    int watchStop = 0;           // R51-F1: patrol waypoint index round the ring
+    int watchPreyId = -1;        // R51-F1: prowler.id being fought (stable id, re-resolved every tick); -1 = patrolling
+    int watchCooldown = 0;       // R51-F1: ticks until the next strike
 };
 // R39-F1: the one route reset, called wherever moving/movingbspot is cleared and before a barb is swapRemoved
 void clearRoute(barb& b) {
@@ -2641,6 +2668,14 @@ bool barbAvailable(const barb& b) { return !b.garrisoned && !b.onExpedition; }
 // R47-F7: busy at the forge (temperTick() or smeltTick() walks and works the barb); wander, hunts and orders skip it
 bool atForgeTask(const barb& b) { return b.tempering || b.smelting; }
 
+// R51-F1: the one way out of the watch state. Leaves movement alone, like clearTraining(); watchTick() stops the walk
+// on its own exits. Called from clearTraining() (so every claim path, the bell and removeBarb() end a watch too).
+void clearWatch(barb& b) {
+    b.watching = false;
+    b.watchPreyId = -1;
+    b.watchCooldown = 0;
+}
+
 // R47-F6: the one way out of the drill state (session done, interrupted, reassigned, barracks gone, sheltering, death).
 // Frees the barb's slot if it still holds it and leaves the drill counter alone. Like clearSmelt() it leaves movement
 // alone, so a new assignment made right after is not undone (drillTick() clears movement on its own exits). Safe on a
@@ -2652,6 +2687,7 @@ void clearTraining(barb& b) {
     b.drillSlot = -1;
     b.drillTimer = 0;
     b.drillHits = 0;
+    clearWatch(b);   // R51-F1: a claim that outranks the drill outranks the watch
 }
 
 // R45-F2: the one party. Members are held by barb id (never an index) and re-resolved by expeditionTick() every tick;
@@ -2868,8 +2904,11 @@ struct prowler {
     int stepTimer = 0;
     int biteCooldown = 0;
     int fade = 0;
+    int hp = prowlerMaxHp;    // R51-F1: also set explicitly at the spawn site; 0 = slain, dissolving
+    int flashFrames = 0;      // R51-F1: drawn frames of white hit flash left (counted down after drawProwlers())
 };
 int nextProwlerId = 0;
+vector<Vector2f> watchTorchPts;   // R51-F1: this frame's torch pixels, filled by drawBarbs(), drawn by drawWatchTorches()
 
 char tradeMsg[64] = "";
 int tradeMsgTimer = 0;
@@ -3181,6 +3220,7 @@ const char* barbTaskName(const barb& b) {
     if (b.tempering) return "tempering pick";   // R41-F2
     if (b.smelting) return "smelting ingots";   // R47-F7
     if (b.training) return "drilling";          // R47-F6: no stripe (idle colour); the tooltip names it
+    if (b.watching) return b.watchPreyId >= 0 ? "on watch: fighting" : "on watch";   // R51-F1: no stripe either, just the torch
     if (b.chopping && b.target == targetBush) return "picking";
     if (b.chopping && b.target == targetField) return "harvesting";
     if (b.chopping && b.target == targetLake) return "fishing";
@@ -3233,6 +3273,7 @@ void deerkilling(vector<deer>& deers, vector<RectangleShape>& deershape, vector<
 			auto& b = barbs[j];
 			auto& sq = squares[j];
 			if (!barbAvailable(b) || b.building || b.movingbspot || b.chopping || b.timer > 0 || b.carryKind != carryNone || atForgeTask(b)) continue;   // R29-F1: haulers finish the trip; R41-F2: so do temperers (R47-F7: and smelters); R45-F2
+			if (b.watching) continue;   // R51-F1: watchmen keep to the watch
 			if (!b.deertargeting) {
 				Vector2f bpos = sq.getPosition();
 				float dx = deerpos.x - bpos.x, dy = deerpos.y - bpos.y;
@@ -4176,6 +4217,7 @@ void drawBarbs(RenderWindow& window, const vector<barb>& barbs, const vector<Rec
     int lootId = lootCarrierId();       // R47-F5
     static VertexArray lookVerts(PrimitiveType::Triangles);   // R35-F1: every race mark this frame, one draw after the loop
     lookVerts.clear();
+    watchTorchPts.clear();   // R51-F1
     auto addLookQuad = [](Vector2f p, Vector2f sz, Color c) {
         Vector2f q[4] = {p, p + Vector2f(sz.x, 0.0f), p + sz, p + Vector2f(0.0f, sz.y)};
         int idx[6] = {0, 1, 2, 0, 2, 3};
@@ -4338,6 +4380,8 @@ void drawBarbs(RenderWindow& window, const vector<barb>& barbs, const vector<Rec
             window.draw(tool);
             tool.setSize(barbToolSize);
         }
+        if (b.watching)   // R51-F1: torch held out left at head height, clear of horns, ears and the trait dot; drawn after the overlay
+            watchTorchPts.push_back(Vector2f(base.x - 2.0f, bodyTop - 1.0f));
         if (b.id == carrierId) {   // R45-F2: 1px relic held low, one column out from the arm/spear column, twinkling
             dot.setFillColor((frame / relicGlintFrames) % 2 == 0 ? relicGlintColor : relicGlintDimColor);
             dot.setPosition(Vector2f(side + 1.0f, bodyTop + bodyH - 1.0f));
@@ -7004,6 +7048,9 @@ void makeBarb(Vector2i pos, vector<barb>& barbs, vector<RectangleShape>& squares
     b.training = false;   // R47-F6: not drilling, no slot, counter at 0
     b.drillSlot = -1;
     b.drillTimer = b.drillHits = b.drillCount = 0;
+    b.watching = false;   // R51-F1: not on watch
+    b.watchStop = b.watchCooldown = 0;
+    b.watchPreyId = -1;
     for (auto& m : b.mem) m = workMem{};   // INBOX-F2: a newborn remembers no spots
     b.memReturn = b.memShared = false;
     b.order = needNone;   // INBOX-F2b: a newborn holds no order
@@ -7059,7 +7106,7 @@ void shinobiTick(vector<barb>& barbs, vector<RectangleShape>& squares, const vec
         barb& b = barbs[i];
         if (!b.shinobi) continue;
         if (!barbAvailable(b) || b.moving || b.chopping || b.building || b.movingbspot || b.deertargeting || b.timer > 0 || b.jobKind != jobNone
-            || b.training) continue;   // R47-F6: no blinking off the drill slot
+            || b.training || b.watching) continue;   // R47-F6: no blinking off the drill slot (R51-F1: or the watch)
         if (blinkChance(gen) != 0) continue;
         Vector2f from = squares[i].getPosition(), size = squares[i].getSize();
         for (int t = 0; t < shinobiBlinkTries; t++) {
@@ -7938,6 +7985,7 @@ void removeBarb(vector<barb>& barbs, vector<RectangleShape>& squares, int i,
     ungarrison(b);                                // R31-F3: the shared reset also frees any keep slot before the swapRemove
     expeditionMemberLost(b);                      // R45-F2: invalidates its party id; expeditionTick() dissolves the party
     setWeapon(b, weaponDrop);                     // R47-F8: the unequip half of the helper (craft already refunded above)
+    clearWatch(b);                                // R51-F1: explicit, though releaseBarbWork()'s clearTraining() already did it
     if (isLeader(b)) loseLeader(b.race);
     printf("BARB DIED - %s the %s (%s, %s), id %d - %d left\n", b.name, traitOf(b).name, raceOf(b).name,
            isGentry(b) ? "Gentry" : "Commoner", b.id, (int)barbs.size() - 1);
@@ -8029,6 +8077,8 @@ void prowlerTick(vector<prowler>& prowlers, vector<barb>& barbs, const vector<Re
     if (night && spawnedTonight < cap && uniform_int_distribution<int>(0, prowlerSpawnChance - 1)(gen) == 0) {
         prowler p;
         p.id = nextProwlerId++;
+        p.hp = prowlerMaxHp;   // R51-F1: the one spawn site
+        p.flashFrames = 0;
         float lo = prowlerEdgeInsetPx, hi = worldSize - prowlerEdgeInsetPx - prowlerSize.x;
         float a = uniform_real_distribution<float>(lo, hi)(gen);
         switch (uniform_int_distribution<int>(0, 3)(gen)) {
@@ -8101,7 +8151,10 @@ void prowlerTick(vector<prowler>& prowlers, vector<barb>& barbs, const vector<Re
             b.health = max(0, b.health - prowlerBiteDamage);
             p.biteCooldown = prowlerBiteCooldownTicks;
             printf("PROWLER %d bit %s (id %d) - %d hp\n", p.id, b.name, b.id, b.health);
-            if (b.health <= 0) logRaceEvent(string(b.name) + " was taken by a night prowler", b.race);
+            if (b.health <= 0) {
+                logRaceEvent(string(b.name) + " was taken by a night prowler", b.race);
+                clearWatch(b);   // R51-F1: off the watch at once on death, before starveDeathTick() removes the barb
+            }
         }
         if (hi >= 0 && bi < 0 && dSq <= prowlerBiteRangePx * prowlerBiteRangePx) {   // sniffed the door: on to the next
             p.sniffedHouseId = p.targetHouseId;
@@ -8115,12 +8168,186 @@ void prowlerTick(vector<prowler>& prowlers, vector<barb>& barbs, const vector<Re
     }
 }
 
+// R51-F1: index of the prowler with this id, or -1 (dissolved and removed, or never)
+int findProwlerById(const vector<prowler>& prowlers, int id) {
+    if (id < 0) return -1;
+    for (int i = 0; i < (int)prowlers.size(); i++) if (prowlers[i].id == id) return i;
+    return -1;
+}
+
+// R51-F1: patrol waypoint k (hitbox centre) on race r's ring
+Vector2f watchStopPos(int r, int k) {
+    float a = 2.0f * 3.14159265f * (float)(((k % watchRingStops) + watchRingStops) % watchRingStops) / (float)watchRingStops;
+    return quarterCentre(clampRace(r)) + Vector2f(cos(a), sin(a)) * watchRingPx;
+}
+
+// R51-F1: a stop the barb can stand on: inside the map and off the lake
+bool watchStopOk(Vector2f centre, Vector2f size) {
+    Vector2f tl = centre - size / 2.0f;
+    if (tl.x < prowlerEdgeInsetPx || tl.y < prowlerEdgeInsetPx || tl.x + size.x > worldSize - prowlerEdgeInsetPx
+        || tl.y + size.y > worldSize - prowlerEdgeInsetPx) return false;
+    return lakeClear(FloatRect(tl, size));
+}
+
+// R51-F1: may this barb take the watch tonight? Armed, drilled, hale enough, surface, and idle (standing or on a wander
+// walk) or drilling (the watch outranks the dummy).
+bool watchEligible(const barb& b) {
+    if (b.watching || !b.hasSpear || b.drillCount < kDrillPipCount || b.health < watchMinHealth) return false;
+    if (!barbAvailable(b) || barbHidden(b) || barbUnderground(b) || b.inMine) return false;
+    if (b.chopping || b.building || b.movingbspot || b.deertargeting || b.jobKind != jobNone || b.carryKind != carryNone
+        || atForgeTask(b) || b.timer > 0 || b.target != targetNone || b.order != needNone) return false;
+    bool wandering = b.targetx == b.wanderX && b.targety == b.wanderY;
+    return !b.moving || wandering || b.training;
+}
+
+// R51-F1: the only place the watch state is set. Ends any drill first (clearTraining() also clears the watch, so the
+// flag is set after it), drops any wander walk and starts at the nearest open stop on the ring.
+void startWatch(barb& b, const RectangleShape& sq) {
+    clearTraining(b);
+    b.watching = true;
+    b.watchPreyId = -1;
+    b.watchCooldown = 0;
+    b.moving = false; clearRoute(b);
+    b.stepTimer = 0;
+    b.wanderX = b.wanderY = -1;
+    b.targetx = b.targety = -1;
+    Vector2f c = sq.getPosition() + sq.getSize() / 2.0f;
+    float best = numeric_limits<float>::infinity();
+    b.watchStop = 0;
+    for (int k = 0; k < watchRingStops; k++) {
+        Vector2f d = watchStopPos(b.race, k) - c;
+        float dSq = d.x * d.x + d.y * d.y;
+        if (dSq < best && watchStopOk(watchStopPos(b.race, k), sq.getSize())) { best = dSq; b.watchStop = k; }
+    }
+    printf("WATCH STARTED - barb %d (%s, %s), %d drills, stop %d\n", b.id, b.name, racePlurals[clampRace(b.race)],
+           b.drillCount, b.watchStop);
+}
+
+// R51-F1: off the watch and standing still (dawn, or the barb can no longer walk the ring)
+void endWatch(barb& b, const char* why) {
+    printf("WATCH ENDED - barb %d (%s)\n", b.id, why);
+    clearWatch(b);
+    b.moving = false; clearRoute(b);
+    b.stepTimer = 0;
+    b.targetx = b.targety = -1;
+}
+
+// R51-F1: runs right after prowlerTick(). At night enlists eligible barbs (throttled, capped per race), walks each
+// watchman round its ring and fights the nearest live prowler in range (coarse squared distance over watchmen x
+// prowlers only; no tree or grid scan). A slain prowler is never removed here: dissolveProwler() starts the shared fade
+// and prowlerTick() removes it later, so no prowler index moves during this tick. Dawn ends every watch.
+void watchTick(vector<barb>& barbs, vector<RectangleShape>& squares, vector<prowler>& prowlers) {
+    static int enlistTimer = 0;
+    int n = min((int)barbs.size(), (int)squares.size());
+    if (!isNightHour(game_time)) {
+        for (int i = 0; i < n; i++) if (barbs[i].watching) endWatch(barbs[i], "dawn");
+        enlistTimer = 0;   // first scan on the first night tick
+        return;
+    }
+
+    if (--enlistTimer <= 0) {
+        enlistTimer = watchEnlistTicks;
+        int on[raceCount] = {};
+        for (int i = 0; i < n; i++) if (barbs[i].watching) on[clampRace(barbs[i].race)]++;
+        for (int i = 0; i < n; i++) {
+            int r = clampRace(barbs[i].race);
+            if (on[r] >= watchMaxPerRace || !watchEligible(barbs[i])) continue;
+            startWatch(barbs[i], squares[i]);
+            on[r]++;
+        }
+    }
+
+    for (int i = 0; i < n; i++) {
+        barb& b = barbs[i];
+        RectangleShape& sq = squares[i];
+        if (!b.watching) continue;
+        if (b.health <= 0) { endWatch(b, "fell"); continue; }   // death: off the watch before starveDeathTick()
+        if (!barbAvailable(b) || barbHidden(b) || barbUnderground(b) || !b.hasSpear) { endWatch(b, "called away"); continue; }
+        if (b.watchCooldown > 0) b.watchCooldown--;
+        Vector2f c = sq.getPosition() + sq.getSize() / 2.0f;
+
+        // re-resolve the prey by id; a dissolving or far-off prowler is let go
+        int pi = findProwlerById(prowlers, b.watchPreyId);
+        if (pi >= 0) {
+            Vector2f d = prowlers[pi].pos + prowlerSize / 2.0f - c;
+            if (prowlers[pi].fade > 0 || d.x * d.x + d.y * d.y > watchLeashPx * watchLeashPx) pi = -1;
+        }
+        if (pi < 0) {
+            b.watchPreyId = -1;
+            float best = watchEngagePx * watchEngagePx;
+            for (int k = 0; k < (int)prowlers.size(); k++) {
+                if (prowlers[k].fade > 0) continue;
+                Vector2f d = prowlers[k].pos + prowlerSize / 2.0f - c;
+                float dSq = d.x * d.x + d.y * d.y;
+                if (dSq < best) { best = dSq; pi = k; }
+            }
+            if (pi >= 0) {
+                b.watchPreyId = prowlers[pi].id;
+                printf("WATCH ENGAGES - barb %d -> prowler %d\n", b.id, b.watchPreyId);
+            }
+        }
+
+        if (pi >= 0) {   // fight: close in straight (short range), strike on cooldown
+            prowler& p = prowlers[pi];
+            Vector2f pc = p.pos + prowlerSize / 2.0f;
+            Vector2f d = pc - c;
+            if (d.x * d.x + d.y * d.y <= watchStrikeRangePx * watchStrikeRangePx) {
+                b.moving = false; clearRoute(b);
+                b.stepTimer = 0;
+                if (b.watchCooldown == 0) {
+                    b.watchCooldown = watchStrikeCooldownTicks;
+                    int dmg = weaponDamage(b);
+                    p.hp = max(0, p.hp - dmg);
+                    p.flashFrames = prowlerFlashFrames;
+                    printf("WATCH HIT - %s (id %d) hits prowler %d for %d, %d hp left\n", b.name, b.id, p.id, dmg, p.hp);
+                    if (p.hp <= 0) {
+                        logRaceEvent(string(b.name) + " " + weaponOf(b).killVerb + " a night prowler", b.race);
+                        dissolveProwler(p, "slain");   // removal stays in prowlerTick(): indices here stay valid
+                        b.watchPreyId = -1;
+                    }
+                }
+            } else {
+                Vector2f goal = pc - sq.getSize() / 2.0f;
+                b.targetx = (int)goal.x;
+                b.targety = (int)goal.y;
+                b.moving = true;
+                walkStep(b, sq, true);
+            }
+            continue;
+        }
+
+        // patrol: walk to the current stop, then on to the next open one round the ring
+        Vector2f stop = watchStopPos(b.race, b.watchStop);
+        if (!watchStopOk(stop, sq.getSize())) {
+            int k = 1;
+            while (k < watchRingStops && !watchStopOk(watchStopPos(b.race, b.watchStop + k), sq.getSize())) k++;
+            if (k >= watchRingStops) { endWatch(b, "no ring to walk"); continue; }
+            b.watchStop = (b.watchStop + k) % watchRingStops;
+            stop = watchStopPos(b.race, b.watchStop);
+        }
+        Vector2f goal = stop - sq.getSize() / 2.0f;
+        b.targetx = (int)goal.x;
+        b.targety = (int)goal.y;
+        Vector2f diff = Vector2f((float)b.targetx, (float)b.targety) - sq.getPosition();
+        if (diff.x * diff.x + diff.y * diff.y < 1.0f) {
+            b.watchStop = (b.watchStop + 1) % watchRingStops;
+            b.moving = false; clearRoute(b);
+            b.stepTimer = 0;
+        } else {
+            b.moving = true;
+            walkStep(b, sq);
+        }
+    }
+}
+
 // R48-F1: bodies, in the world layer before the night overlay; alpha follows the dissolve fade
+// (R51-F1: pure white while a hit flash lasts)
 void drawProwlers(RenderWindow& window, const vector<prowler>& prowlers) {
     RectangleShape body(prowlerSize - Vector2f(2.0f, 2.0f));   // 1px outline drawn outward keeps the 5x4 footprint
     for (auto& p : prowlers) {
         float a = p.fade > 0 ? (float)p.fade / prowlerFadeTicks : 1.0f;
-        Color fill = prowlerColor, rim = prowlerOutlineColor;
+        Color fill = p.flashFrames > 0 ? prowlerFlashColor : prowlerColor, rim = prowlerOutlineColor;
+        if (p.flashFrames > 0) rim = prowlerFlashColor;
         fill.a = (uint8_t)(fill.a * a);
         rim.a = (uint8_t)(rim.a * a);
         body.setFillColor(fill);
@@ -8153,6 +8380,58 @@ void drawProwlerOverlay(RenderWindow& window, const View& worldView, const vecto
         window.draw(eye);
         eye.setPosition(o + Vector2f(3.0f, 1.0f));
         window.draw(eye);
+    }
+    // R51-F1: 1px hp bar, 1 row of grass above the body, only on a damaged prowler that is still fighting
+    RectangleShape bar;
+    for (auto& p : prowlers) {
+        if (p.fade > 0 || p.hp >= prowlerMaxHp) continue;
+        Vector2f o = snapPx(p.pos) + Vector2f(0.0f, -2.0f);
+        float fillW = min(prowlerSize.x, ceil(prowlerSize.x * max(p.hp, 0) / prowlerMaxHp));   // any hp left shows >= 1px
+        bar.setSize(Vector2f(prowlerSize.x, 1.0f));
+        bar.setFillColor(healthBarBackColor);
+        bar.setPosition(o);
+        window.draw(bar);
+        if (fillW > 0.0f) {
+            bar.setSize(Vector2f(fillW, 1.0f));
+            bar.setFillColor(healthBarFillColor);
+            window.draw(bar);
+        }
+    }
+}
+
+// R51-F1: torch pixels collected by drawBarbs() (so they bob with the body), drawn here above the night overlay
+void drawWatchTorches(RenderWindow& window, const View& worldView, int frame) {
+    if (watchTorchPts.empty()) return;
+    window.setView(worldView);
+    bool night = isNightHour(game_time);
+    RectangleShape glow({3.0f, 3.0f}), px({1.0f, 1.0f});
+    glow.setFillColor(watchTorchGlowColor);
+    for (int k = 0; k < (int)watchTorchPts.size(); k++) {
+        Vector2f p = watchTorchPts[k];
+        if (night) { glow.setPosition(p - Vector2f(1.0f, 1.0f)); window.draw(glow); }
+        px.setFillColor(((frame + k * 3) / watchTorchFlickerFrames) % 3 == 0 ? watchTorchFlickerColor : watchTorchColor);
+        px.setPosition(p);
+        window.draw(px);
+    }
+}
+
+// R51-F1: the faint patrol ring, only while the hovered or selected barb is on watch
+void drawWatchRing(RenderWindow& window, const View& worldView, const vector<barb>& barbs, int selectedId, int hoveredId, float zoom) {
+    window.setView(worldView);
+    bool drawn[raceCount] = {};
+    for (int id : {selectedId, hoveredId}) {
+        int i = findBarbById(barbs, id);
+        if (i < 0 || !barbs[i].watching) continue;
+        int r = clampRace(barbs[i].race);
+        if (drawn[r]) continue;
+        drawn[r] = true;
+        CircleShape ring(watchRingPx, watchRingPoints);
+        ring.setOrigin({watchRingPx, watchRingPx});
+        ring.setPosition(quarterCentre(r));
+        ring.setFillColor(Color::Transparent);
+        ring.setOutlineThickness(1.0f / zoom);
+        ring.setOutlineColor(watchRingColor);
+        window.draw(ring);
     }
 }
 
@@ -8355,7 +8634,8 @@ void rankRaceNeed(const vector<barb>& barbs, int r) {
 // INBOX-F2b: idle = no work, build, hunt, haul or job claim. Garrisoned barbs are never idle, so an order never touches shelter
 bool orderIdle(const barb& b) {
     return barbAvailable(b) && !b.chopping && !b.building && !b.movingbspot && !b.deertargeting && b.jobKind == jobNone && b.carryKind == carryNone && !atForgeTask(b)   // R47-F7
-        && !b.training;   // R47-F6: drillers take no orders and join no party (expedition preference deferred)
+        && !b.training     // R47-F6: drillers take no orders and join no party (expedition preference deferred)
+        && !b.watching;    // R51-F1: nor do watchmen (and so they never start a drill)
 }
 
 // INBOX-F2b: right after the leader names its need, it hands that need as an individual order to idle members (not
@@ -8926,7 +9206,7 @@ void barbmove(vector<RectangleShape>& squares, vector<barb>& barbs) {
         auto& sq = squares[i];
         auto& b  = barbs[i];
         if (!barbAvailable(b) || b.chopping || b.timer > 0 || b.movingbspot || b.building || b.carryKind != carryNone || atForgeTask(b)) continue;   // R29-F1: haulTick() walks haulers; INBOX-F1: bellTick() walks garrisoned; R41-F2: temperTick() walks temperers (R47-F7: smeltTick() smelters); R45-F2: expeditionTick() walks parties
-        if (b.training) continue;   // R47-F6: drillTick() walks drillers
+        if (b.training || b.watching) continue;   // R47-F6: drillTick() walks drillers; R51-F1: watchTick() walks watchmen
         Vector2f pos = sq.getPosition();
         if (!b.moving) {
             if (drillWanted(b, pos) && drillJoin(gen) == 0) {   // R47-F6: an idle barb near its barracks may drill instead
@@ -8970,7 +9250,7 @@ void buildWorkClaims(const vector<barb>& barbs, const vector<CircleShape>& tris,
     for (int j = 0; j < (int)barbs.size(); j++) {
         const barb& b = barbs[j];
         if (!barbAvailable(b) || b.targetx == -1 || b.target == targetBush || b.target == targetLake || b.target == targetField || b.target == targetDepot || b.deertargeting || b.movingbspot || b.building
-            || b.training) continue;   // R47-F6: a drill slot is not a tree spot
+            || b.training || b.watching) continue;   // R47-F6: a drill slot is not a tree spot (R51-F1: nor a patrol stop)
         (b.target == targetRock ? rockSpots : treeSpots).emplace(workSpotKey(b.targetx, b.targety), j); // first claimant kept
     }
     treeClaim.assign(tris.size(), -1);
@@ -9361,6 +9641,13 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
                 printf("DRILL INTERRUPTED - barb %d\n", b.id);
                 clearTraining(b);
             } else { drillTick(b, sq); continue; }   // no work search while drilling: the session is short
+        }
+        if (b.watching) {   // R51-F1: backstop: watching is exclusive with work, builds, timers, hunts, hauls and the drill
+            if (b.movingbspot || b.building || b.deertargeting || b.chopping || b.timer > 0 || b.jobKind != jobNone
+                || b.carryKind != carryNone || atForgeTask(b) || b.training || b.target != targetNone) {
+                printf("WATCH INTERRUPTED - barb %d\n", b.id);
+                clearWatch(b);
+            } else continue;   // watchTick() walks and fights; no work search on watch
         }
         if (b.carryKind != carryNone) {   // R29-F1: any other state taken over the haul drops the load
             if (b.target != targetDepot || b.movingbspot || b.building || b.deertargeting || b.chopping || b.jobKind != jobNone) dropCarry(b);
@@ -10703,6 +10990,7 @@ int main() {
                 deerkilling(deers, deershape, barbs, squares, smoke);
                 wolfTick(wolves, deers, deershape, barbs);
                 prowlerTick(prowlers, barbs, squares, houses, houseshapes, fire);   // R48-F1: bites land before starveDeathTick()
+                watchTick(barbs, squares, prowlers);   // R51-F1: watchmen patrol and fight; slain prowlers fade, prowlerTick() removes them
                 bellTick(barbs, squares, houses, houseshapes, wolves, stores, smoke, dwarfForge, fields,
                          trees, tris, rocks, octs, bushes);   // INBOX-F1: after the wolves move
                 expeditionTick(barbs, squares, wolves, stores);   // R45-F2: after the wolves and the bell, before hungerTick()
@@ -10825,6 +11113,7 @@ int main() {
 	for (auto& w : wolves)
 		drawSnapped(window, w.shape);
 	drawProwlers(window, prowlers);   // R48-F1: bodies under the night overlay; eyes after it
+	for (auto& p : prowlers) if (p.flashFrames > 0 && !paused) p.flashFrames--;   // R51-F1: the hit flash lasts 2 drawn frames
 
         {
             // R45-F1a: thousands of stumps (R47-F1: ~12k on the 2400 map), so only the ones in (or touching) the view are drawn
@@ -10880,6 +11169,7 @@ int main() {
         if (isNightHour(t)) drawCampfireGlow(window, worldView, fire, frameCount);
         if (isNightHour(t)) drawHouseLights(window, worldView, houses, houseshapes);
         drawProwlerOverlay(window, worldView, prowlers, fire);   // R48-F1: red eyes + safe-zone ring, above the night overlay
+        drawWatchTorches(window, worldView, frameCount);   // R51-F1: torches glow above the overlay (prowler hp bars are drawn in the call above)
         drawBallots(window, worldView, zoom, barbs, squares); // above the overlays so the pips read true; under hover marks
         if (ballotFramesLeft > 0 && !paused) ballotFramesLeft--;
         if (window.hasFocus() && Keyboard::isKeyPressed(Keyboard::Key::H))   // R44-F2: held, not toggled; under select/hover marks
@@ -10918,6 +11208,7 @@ int main() {
                 if (hover) drawHousehold(window, worldView, *hover, zoom, barbs, squares, houses, houseshapes);
             }
             drawOrderPips(window, worldView, zoom, hover ? hover->hoveredBarb : -1, barbs, squares);   // INBOX-F2b: before the HUD
+            drawWatchRing(window, worldView, barbs, selectedBarbId, hover ? hover->hoveredBarb : -1, zoom);   // R51-F1: hover/selection only
         }
 
         if (hudFontOk) {
