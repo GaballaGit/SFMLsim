@@ -472,6 +472,20 @@ const float faithTickW = 2.0f;                    // HUD tick: 2px wide, 2..8px 
 const float faithTickMinH = 2.0f;
 const Color faithTickLowColor(92, 100, 104);      // dim slate: just visible on the panel backing at faith 0
 const Color faithTickHighColor(214, 226, 232);    // pale silver at faith 1 (the mote colour, a little lifted)
+// R52-F3 The Rite Decree, phase 1: a barb of a high-faith race with a shrine may vote Rite at the dawn council. On a Rite
+// day, from dusk to riteEndHour, idle barbs walk to a slot on a ring round their race's shrine (veil.faithShrineId, found
+// by id every tick) and kneel there (barb.kneeling, the one flag). Any task assignment, removeBarb and dawn clear it.
+// The rite's end logs one ticker line with the kneelers counted and leaves a stub omen per race (no roll in phase 1).
+const float riteBallotLean = 1.4f;                // ballot score x faith, only for a high-faith race with a shrine:
+                                                  // beats the race lean (1.0) from faith ~0.72 up; a full need (1.5) still wins
+const int riteEndHour = 23;                       // the rite runs nightStartHour..riteEndHour-1 on a Rite day
+static_assert(riteEndHour > nightStartHour && riteEndHour <= 24, "the rite window must sit between dusk and midnight");
+const int riteSlots = 8;                          // kneeling places per shrine ring (8px apart on the 10px ring)
+const float riteRingPx = 10.0f;                   // kneel ring radius round the shrine slab's centre (shrines sit >= 10px apart)
+const Color riteRingColor(214, 192, 118, 70);     // shrine-cap gold, faint; under barbs and the night overlay
+const float riteFaithTickDim = 0.45f;             // HUD faith tick alpha on a Rite day (the faith is "spent" at the shrine)
+const int riteOmenDays = 2;                       // a stub omen lasts this many game days after its rite
+const Color riteTickerTint(214, 200, 150);        // rite-end ticker line: pale shrine gold, readable on the black strip
 
 const int eventMaxLines = 5;              // ticker shows (and stores) at most this many events
 const int eventFadeTicks = 300;           // frames an event stays on screen (~5s at 60fps)
@@ -731,8 +745,8 @@ const int eraTownHouses = 10;
 const int eraCheckIntervalTicks = 60;      // recompute about once per second at 1x
 
 // Dawn council: each barb casts one ballot at dawn; the winning decree tilts job weights until the next dawn
-enum councilDecree { decreeTimber, decreeStone, decreeBerries, decreeCount, decreeNone = decreeCount };
-const char* const decreeNames[decreeCount] = {"Timber", "Stone", "Berries"};
+enum councilDecree { decreeTimber, decreeStone, decreeBerries, decreeRite, decreeCount, decreeNone = decreeCount };   // R52-F3: Rite
+const char* const decreeNames[decreeCount] = {"Timber", "Stone", "Berries", "Rite"};
 const int councilDawnHour = 6;             // vote when game_time ticks over to this hour (night ends at 6)
 const float councilDecreeMult = 1.3f;      // matching job weight is multiplied by this (after the need clamp, so it always bites)
 const float councilRaceLean = 1.0f;        // ballot score for a barb's racial preference
@@ -748,7 +762,9 @@ const Color ballotPipColors[decreeCount] = {
     Color(70, 190, 170),   // Timber: teal, clear of chop green and build blue
     Color(170, 176, 186),  // Stone: pale slate, darker than the off-white body and idle white
     Color(190, 80, 170),   // Berries: violet, darker than pick pink, brighter than ripe bushes
+    Color(214, 192, 118),  // R52-F3 Rite: shrine-cap gold, warmer than the slate Stone pip
 };
+extern councilDecree currentDecree;   // R52-F3: defined with castBallot(); the HUD faith tick reads it to dim on a Rite day
 
 const int houseWoodCost = 30;
 const int houseStoneCost = 2;              // small; with less stone a plain house is built instead
@@ -2772,7 +2788,7 @@ struct barb {
     int raidCooldown = 0;        // R52-F1: ticks until the next strike
     bool raidBeaten = false;     // R52-F1: knocked down to kRaidHealthFloor; out of the fight
     int raidFlash = 0;           // R52-F1: hit flash, drawn frames left (counted down in main after drawBarbs())
-    bool kneeling = false;       // R52-F3 reserves this flag (the Rite); read here only, so a kneeler is never recruited for a raid
+    bool kneeling = false;       // R52-F3: the one Rite flag, owned by riteTick() (set only by startKneel(), cleared only by clearKneel()); never recruited for a raid
     int sick = 0;                // R52-F4: ticks of cough left (0 = well); set only by catchCough(), cleared by clearSick()
     int sickImmune = 0;          // R52-F4: ticks of immunity left after a recovery
     int cure = 0;                // R52-F4: reserved for phase 2 (herb hut remedy); unused in phase 1
@@ -2797,6 +2813,13 @@ void clearWatch(barb& b) {
     b.watchCooldown = 0;
 }
 
+// R52-F3: the one way out of kneeling. Leaves movement alone like clearWatch(), so a task assigned right after keeps
+// its walk; riteTick() stops the walk on its own exits. Called from clearTraining(), so every claim path, the bell,
+// expeditions and removeBarb() (via releaseBarbWork()) end a kneel too.
+void clearKneel(barb& b) {
+    b.kneeling = false;
+}
+
 // R47-F6: the one way out of the drill state (session done, interrupted, reassigned, barracks gone, sheltering, death).
 // Frees the barb's slot if it still holds it and leaves the drill counter alone. Like clearSmelt() it leaves movement
 // alone, so a new assignment made right after is not undone (drillTick() clears movement on its own exits). Safe on a
@@ -2809,6 +2832,7 @@ void clearTraining(barb& b) {
     b.drillTimer = 0;
     b.drillHits = 0;
     clearWatch(b);   // R51-F1: a claim that outranks the drill outranks the watch
+    clearKneel(b);   // R52-F3: and any task assignment ends a kneel
 }
 
 // R45-F2: the one party. Members are held by barb id (never an index) and re-resolved by expeditionTick() every tick;
@@ -3457,6 +3481,7 @@ const char* barbTaskName(const barb& b) {
     if (b.smelting) return "smelting ingots";   // R47-F7
     if (b.training) return "drilling";          // R47-F6: no stripe (idle colour); the tooltip names it
     if (b.watching) return b.watchPreyId >= 0 ? "on watch: fighting" : "on watch";   // R51-F1: no stripe either, just the torch
+    if (b.kneeling) return b.moving ? "going to the Rite" : "kneeling at the Rite";   // R52-F3
     if (b.chopping && b.target == targetBush) return "picking";
     if (b.chopping && b.target == targetField) return "harvesting";
     if (b.chopping && b.target == targetLake) return "fishing";
@@ -5570,7 +5595,7 @@ string hudDetailText(const hudValues& v) {
         s += string("\n  ") + racePlurals[r] + ": " + to_string(v.stock[r].wood) + " / " + to_string(v.stock[r].stone) + " / " + to_string(v.stock[r].food);
     s += "\n  Campfire wood: " + to_string(v.campfireWood);
     if (veil.faithSeen) {   // R51-F2: the stock panel's faith tick, in words
-        s += "\nFaith of the Veil:";
+        s += currentDecree == decreeRite ? "\nFaith of the Veil (Rite day):" : "\nFaith of the Veil:";   // R52-F3: why the tick is dim
         for (int r = 0; r < raceCount; r++)
             s += string("\n  ") + racePlurals[r] + ": " + to_string((int)round(veil.faith[r] * 100.0f)) + "%"
                  + (veil.faithTier[r] == 2 ? " (high)" : veil.faithTier[r] == 0 ? " (low)" : "");
@@ -5965,7 +5990,9 @@ FloatRect drawStockPanel(RenderWindow& window, const Font& font, const hudValues
             float iconTop = round(y + (rowH - iconSize) / 2.0f);
             RectangleShape tick(Vector2f(faithTickW, h));
             tick.setPosition(Vector2f(x, iconTop + iconSize - h));
-            tick.setFillColor(empty ? stockEmptyRaceColor : lerpColor(faithTickLowColor, faithTickHighColor, f));
+            Color tc = empty ? stockEmptyRaceColor : lerpColor(faithTickLowColor, faithTickHighColor, f);
+            if (currentDecree == decreeRite) tc.a = (uint8_t)(tc.a * riteFaithTickDim);   // R52-F3: dims all Rite day
+            tick.setFillColor(tc);
             window.draw(tick);
         }
     }
@@ -7572,7 +7599,7 @@ void shinobiTick(vector<barb>& barbs, vector<RectangleShape>& squares, const vec
         barb& b = barbs[i];
         if (!b.shinobi) continue;
         if (!barbAvailable(b) || b.moving || b.chopping || b.building || b.movingbspot || b.deertargeting || b.timer > 0 || b.jobKind != jobNone
-            || b.training || b.watching) continue;   // R47-F6: no blinking off the drill slot (R51-F1: or the watch)
+            || b.training || b.watching || b.kneeling) continue;   // R47-F6: no blinking off the drill slot (R51-F1: or the watch; R52-F3: or the rite)
         if (blinkChance(gen) != 0) continue;
         Vector2f from = squares[i].getPosition(), size = squares[i].getSize();
         for (int t = 0; t < shinobiBlinkTries; t++) {
@@ -7876,12 +7903,14 @@ councilDecree currentDecree = decreeNone;   // none until the first dawn
 
 // Ballot: race lean plus colony needs (wood short of a house, stone short of a foundation, this barb hungry or no food)
 councilDecree castBallot(barb& b) {
-    float score[decreeCount] = {0.0f, 0.0f, 0.0f};
+    float score[decreeCount] = {};
     score[raceLeans[b.race]] += councilRaceLean;
     const raceStock& rs = stockOf(b);   // RACE-F1: each voter weighs its own race's larder
     score[decreeTimber]  += councilNeedLean * clamp((float)(houseWoodCost - rs.wood) / (float)houseWoodCost, 0.0f, 1.0f);
     score[decreeStone]   += councilNeedLean * clamp((float)(houseStoneCost - rs.stone) / (float)houseStoneCost, 0.0f, 1.0f);
     score[decreeBerries] += (isHungry(b) || rs.food <= 0) ? councilNeedLean : 0.0f;
+    int r = clampRace(b.race);   // R52-F3: a high-faith race with a shrine to kneel at leans toward the Rite
+    if (veil.faithTier[r] == 2 && veil.faithShrineId[r] >= 0) score[decreeRite] += riteBallotLean * veil.faith[r];
     int best = raceLeans[b.race];               // ties go to the barb's own lean
     for (int d = 0; d < decreeCount; d++) if (score[d] > score[best]) best = d;
     b.lastVote = (councilDecree)best;           // shown overhead by drawBallots
@@ -8460,6 +8489,7 @@ void removeBarb(vector<barb>& barbs, vector<RectangleShape>& squares, int i,
     raidMemberLost(b);                            // R52-F1: drops its raid id; raidTick() aborts under kRaidMinMembers raiders
     clearRaid(b);
     clearSick(b);                                 // R52-F4
+    clearKneel(b);                                // R52-F3: explicit, though releaseBarbWork()'s clearTraining() already did it
     if (isLeader(b)) loseLeader(b.race);
     printf("BARB DIED - %s the %s (%s, %s), id %d - %d left\n", b.name, traitOf(b).name, raceOf(b).name,
            isGentry(b) ? "Gentry" : "Commoner", b.id, (int)barbs.size() - 1);
@@ -8812,6 +8842,188 @@ void watchTick(vector<barb>& barbs, vector<RectangleShape>& squares, vector<prow
             b.moving = true;
             walkStep(b, sq);
         }
+    }
+}
+
+// R52-F3: the evening's rite. shrineId[r] is the race's shrine (by id, re-found every tick); peak[r] is the most of
+// that race kneeling at their slots at once, reported in the end-of-rite ticker line.
+struct riteState {
+    bool active = false;
+    int day = -1;                          // game_day of the last rite started, so each Rite day holds one rite
+    int shrineId[raceCount] = {-1, -1, -1};
+    int peak[raceCount] = {};
+};
+static_assert(raceCount == 3, "riteState::shrineId initialiser lists one -1 per race");
+riteState rite;
+
+// R52-F3: stub omen left by a race's rite. Phase 1 only records and expires it; nothing reads it and nothing is rolled
+// (the phase 2 roll on births and prowlers will read `active`).
+struct riteOmen {
+    bool active = false;
+    int kneelers = 0;                      // the rite's peak kneelers for this race
+    int expiresDay = -1;                   // game_day the omen lapses at (checked every tick)
+};
+riteOmen riteOmens[raceCount];
+
+// R52-F3: centre of a shrine's slab, the kneel ring's centre
+Vector2f riteRingCentre(const shrine& s) { return Vector2f((float)s.x, (float)s.y) + shrineSlabSize / 2.0f; }
+
+// R52-F3: top-left a barb of this body size stands at in slot k of the ring (first slot a little off the top, clear of the cap)
+Vector2f riteSlotPos(const shrine& s, int k, Vector2f size) {
+    float a = 6.2831853f * ((float)k + 0.5f) / (float)riteSlots - 1.5707963f;
+    Vector2f p = riteRingCentre(s) + Vector2f(cos(a), sin(a)) * riteRingPx;
+    return snapPx(p - size / 2.0f);
+}
+
+// R52-F3: idle on the surface (standing or on a wander walk), with no task, haul, hunt, order, drill, watch or raid
+bool riteEligible(const barb& b) {
+    if (b.kneeling || b.health <= 0 || !barbAvailable(b) || barbHidden(b) || barbUnderground(b) || b.inMine) return false;
+    if (b.training || b.watching || b.chopping || b.building || b.movingbspot || b.deertargeting || b.jobKind != jobNone
+        || b.carryKind != carryNone || atForgeTask(b) || b.timer > 0 || b.target != targetNone || b.order != needNone) return false;
+    bool wandering = b.targetx == b.wanderX && b.targety == b.wanderY;
+    return !b.moving || wandering;
+}
+
+// R52-F3: the only place the kneeling flag is set. clearTraining() first (it also clears the flag, so it is set after),
+// then the walk to the slot.
+void startKneel(barb& b, Vector2f slot) {
+    clearTraining(b);
+    b.kneeling = true;
+    b.wanderX = b.wanderY = -1;
+    b.targetx = (int)slot.x;
+    b.targety = (int)slot.y;
+    b.moving = true; clearRoute(b);
+    b.stepTimer = 0;
+}
+
+// R52-F3: up from the ring and standing still (rite over, dawn, shrine gone, or the barb was called away)
+void endKneel(barb& b, const char* why) {
+    printf("KNEEL ENDED - barb %d (%s)\n", b.id, why);
+    clearKneel(b);
+    b.moving = false; clearRoute(b);
+    b.stepTimer = 0;
+    b.targetx = b.targety = -1;
+}
+
+// R52-F3: one ticker line naming who knelt, and a stub omen for each race that did
+void endRite(vector<barb>& barbs) {
+    for (auto& b : barbs) if (b.kneeling) endKneel(b, "rite over");
+    rite.active = false;
+    string who;
+    int races = 0, total = 0;
+    for (int r = 0; r < raceCount; r++) total += rite.peak[r] > 0 ? 1 : 0;
+    for (int r = 0; r < raceCount; r++) {
+        int k = rite.peak[r];
+        if (k <= 0) continue;
+        races++;
+        who += races == 1 ? "" : races == total ? " and " : ", ";
+        who += to_string(k) + " " + (k == 1 ? raceDefs[r].name : racePlurals[r]);
+        riteOmens[r].active = true;
+        riteOmens[r].kneelers = k;
+        riteOmens[r].expiresDay = game_day + riteOmenDays;
+        printf("RITE OMEN - %s: %d knelt, omen held until day %d (stub, no roll)\n", racePlurals[r], k, riteOmens[r].expiresDay + 1);
+    }
+    string line = total > 0 ? "The Rite ends: " + who + " knelt at the shrines" : string("The Rite ends: none knelt at the shrines");
+    printf("RITE ENDED - %s\n", line.c_str());
+    logEvent(line, riteTickerTint);
+}
+
+// R52-F3: runs after barbmove(). On a Rite day from dusk to riteEndHour, idle barbs walk to a free slot on the ring round
+// their race's shrine and kneel there; riteTick() owns their walk. The shrine is re-found by id every tick and a lost one
+// sends its kneelers home. Dawn clears every kneel (backstop: the rite has normally ended at riteEndHour).
+void riteTick(vector<barb>& barbs, vector<RectangleShape>& squares, const vector<shrine>& shrines) {
+    int n = min((int)barbs.size(), (int)squares.size());
+    for (int r = 0; r < raceCount; r++)
+        if (riteOmens[r].active && game_day >= riteOmens[r].expiresDay) {
+            riteOmens[r].active = false;
+            printf("RITE OMEN LAPSED - %s\n", racePlurals[r]);
+        }
+
+    bool inWindow = currentDecree == decreeRite && game_time >= nightStartHour && game_time < riteEndHour;
+    if (!inWindow) {
+        if (rite.active) endRite(barbs);
+        if (game_time == nightEndHour)
+            for (int i = 0; i < n; i++) if (barbs[i].kneeling) endKneel(barbs[i], "dawn");
+        return;
+    }
+    if (!rite.active) {
+        if (rite.day == game_day) return;   // this Rite day's rite already ran
+        rite.active = true;
+        rite.day = game_day;
+        for (int r = 0; r < raceCount; r++) {
+            rite.peak[r] = 0;
+            rite.shrineId[r] = findShrineById(shrines, veil.faithShrineId[r]) >= 0 ? veil.faithShrineId[r] : -1;
+            for (int o = 0; o < r; o++)   // one race per ring: faithShrineTick() keeps them apart, this makes sure
+                if (rite.shrineId[r] >= 0 && rite.shrineId[o] == rite.shrineId[r]) rite.shrineId[r] = -1;
+        }
+        printf("RITE BEGINS - shrines %d / %d / %d\n", rite.shrineId[0], rite.shrineId[1], rite.shrineId[2]);
+    }
+
+    int si[raceCount];
+    for (int r = 0; r < raceCount; r++) {
+        si[r] = findShrineById(shrines, rite.shrineId[r]);
+        if (si[r] < 0 && rite.shrineId[r] >= 0) {
+            printf("RITE - %s shrine %d is gone\n", racePlurals[r], rite.shrineId[r]);
+            rite.shrineId[r] = -1;
+        }
+    }
+
+    // walk the kneelers; any that can no longer kneel get up
+    int knelt[raceCount] = {};
+    bool taken[raceCount][riteSlots] = {};
+    for (int i = 0; i < n; i++) {
+        barb& b = barbs[i];
+        if (!b.kneeling) continue;
+        int r = clampRace(b.race);
+        if (si[r] < 0) { endKneel(b, "shrine gone"); continue; }
+        if (b.health <= 0 || !barbAvailable(b) || barbHidden(b) || barbUnderground(b) || b.inMine) { endKneel(b, "called away"); continue; }
+        for (int k = 0; k < riteSlots; k++) {
+            Vector2f p = riteSlotPos(shrines[si[r]], k, squares[i].getSize());
+            if ((int)p.x == b.targetx && (int)p.y == b.targety) taken[r][k] = true;
+        }
+        Vector2f diff = Vector2f((float)b.targetx, (float)b.targety) - squares[i].getPosition();
+        if (diff.x * diff.x + diff.y * diff.y < 1.0f) {
+            b.moving = false; clearRoute(b);
+            b.stepTimer = 0;
+            knelt[r]++;
+        } else {
+            b.moving = true;
+            walkStep(b, squares[i]);
+        }
+    }
+
+    // bring idle barbs to free slots (every tick: a barb is idle for only the tick between one job and the next)
+    for (int i = 0; i < n; i++) {
+        barb& b = barbs[i];
+        int r = clampRace(b.race);
+        if (si[r] < 0 || !riteEligible(b)) continue;
+        for (int k = 0; k < riteSlots; k++) {
+            if (taken[r][k]) continue;
+            Vector2f p = riteSlotPos(shrines[si[r]], k, squares[i].getSize());
+            Vector2f from = squares[i].getPosition();
+            if (!lakeClear(FloatRect(p, squares[i].getSize()), &from)) continue;
+            taken[r][k] = true;
+            startKneel(b, p);
+            printf("KNEEL - %s (id %d, %s) to shrine %d, slot %d\n", b.name, b.id, racePlurals[r], rite.shrineId[r], k);
+            break;
+        }
+    }
+    for (int r = 0; r < raceCount; r++) rite.peak[r] = max(rite.peak[r], knelt[r]);
+}
+
+// R52-F3: one faint 1px ring round each rite shrine, in the world layer under barbs (so kneelers sit on it)
+void drawRiteRings(RenderWindow& window, const vector<shrine>& shrines) {
+    if (!rite.active) return;
+    CircleShape ring(riteRingPx, 32);
+    ring.setOrigin(Vector2f(riteRingPx, riteRingPx));
+    ring.setFillColor(Color::Transparent);
+    ring.setOutlineColor(riteRingColor);
+    ring.setOutlineThickness(-1.0f);   // inward: a 1px line just inside the 10px radius, under the kneelers' bodies
+    for (int r = 0; r < raceCount; r++) {   // riteTick() gives each race its own shrine, so no ring is drawn twice
+        int si = findShrineById(shrines, rite.shrineId[r]);
+        if (si < 0) continue;
+        ring.setPosition(riteRingCentre(shrines[si]));   // slab centre sits on a pixel corner, as the 20px circle needs
+        window.draw(ring);
     }
 }
 
@@ -9196,7 +9408,7 @@ void councilTick(vector<barb>& barbs) {
     if (game_time == lastHour) return;
     lastHour = game_time;
     if (game_time != councilDawnHour || barbs.empty()) return;
-    int votes[decreeCount] = {0, 0, 0};
+    int votes[decreeCount] = {};   // sized and zeroed from decreeCount, so a new decree needs no edit here
     int gentry = 0;
     for (auto& b : barbs) {
         bool g = isGentry(b);
@@ -9208,10 +9420,14 @@ void councilTick(vector<barb>& barbs) {
     vector<int> tied;
     for (int d = 0; d < decreeCount; d++) if (votes[d] == top) tied.push_back(d);
     currentDecree = (councilDecree)tied[uniform_int_distribution<int>(0, (int)tied.size() - 1)(gen)];
-    printf("DAWN COUNCIL - Timber %d, Stone %d, Berries %d -> %s (Gentry %d x%d, Commoners %d)\n", votes[decreeTimber], votes[decreeStone],
-           votes[decreeBerries], decreeNames[currentDecree], gentry, gentryVoteWeight, (int)barbs.size() - gentry);
-    logEvent(string("Council decrees ") + decreeNames[currentDecree] + " (" + to_string(votes[decreeTimber]) + "-" +
-             to_string(votes[decreeStone]) + "-" + to_string(votes[decreeBerries]) + ")");
+    string tally, counts;   // "Timber 3, Stone 1, ..." for the log, "3-1-..." for the ticker, both in decree order
+    for (int d = 0; d < decreeCount; d++) {
+        tally += string(d ? ", " : "") + decreeNames[d] + " " + to_string(votes[d]);
+        counts += (d ? "-" : "") + to_string(votes[d]);
+    }
+    printf("DAWN COUNCIL - %s -> %s (Gentry %d x%d, Commoners %d)\n", tally.c_str(),
+           decreeNames[currentDecree], gentry, gentryVoteWeight, (int)barbs.size() - gentry);
+    logEvent(string("Council decrees ") + decreeNames[currentDecree] + " (" + counts + ")");
     if (gentry > 0)   // R24-F1 ticker line: who carried the weight this dawn
         logEvent(to_string(gentry) + " Gentry cast " + to_string(gentry * gentryVoteWeight) + " of " +
                  to_string(gentry * gentryVoteWeight + (int)barbs.size() - gentry) + " votes");
@@ -10069,7 +10285,7 @@ void barbmove(vector<RectangleShape>& squares, vector<barb>& barbs) {
         auto& sq = squares[i];
         auto& b  = barbs[i];
         if (!barbAvailable(b) || b.chopping || b.timer > 0 || b.movingbspot || b.building || b.carryKind != carryNone || atForgeTask(b)) continue;   // R29-F1: haulTick() walks haulers; INBOX-F1: bellTick() walks garrisoned; R41-F2: temperTick() walks temperers (R47-F7: smeltTick() smelters); R45-F2: expeditionTick() walks parties
-        if (b.training || b.watching) continue;   // R47-F6: drillTick() walks drillers; R51-F1: watchTick() walks watchmen
+        if (b.training || b.watching || b.kneeling) continue;   // R47-F6: drillTick() walks drillers; R51-F1: watchTick() walks watchmen; R52-F3: riteTick() kneelers
         Vector2f pos = sq.getPosition();
         if (!b.moving) {
             if (drillWanted(b, pos) && drillJoin(gen) == 0) {   // R47-F6: an idle barb near its barracks may drill instead
@@ -10113,7 +10329,7 @@ void buildWorkClaims(const vector<barb>& barbs, const vector<CircleShape>& tris,
     for (int j = 0; j < (int)barbs.size(); j++) {
         const barb& b = barbs[j];
         if (!barbAvailable(b) || b.targetx == -1 || b.target == targetBush || b.target == targetLake || b.target == targetField || b.target == targetDepot || b.deertargeting || b.movingbspot || b.building
-            || b.training || b.watching) continue;   // R47-F6: a drill slot is not a tree spot (R51-F1: nor a patrol stop)
+            || b.training || b.watching || b.kneeling) continue;   // R47-F6: a drill slot is not a tree spot (R51-F1: nor a patrol stop; R52-F3: nor a kneel slot)
         (b.target == targetRock ? rockSpots : treeSpots).emplace(workSpotKey(b.targetx, b.targety), j); // first claimant kept
     }
     treeClaim.assign(tris.size(), -1);
@@ -10536,6 +10752,13 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
                 printf("WATCH INTERRUPTED - barb %d\n", b.id);
                 clearWatch(b);
             } else continue;   // watchTick() walks and fights; no work search on watch
+        }
+        if (b.kneeling) {   // R52-F3: backstop: kneeling is exclusive with work, builds, timers, hunts, hauls, the drill and the watch
+            if (b.movingbspot || b.building || b.deertargeting || b.chopping || b.timer > 0 || b.jobKind != jobNone
+                || b.carryKind != carryNone || atForgeTask(b) || b.training || b.watching || b.target != targetNone) {
+                printf("KNEEL INTERRUPTED - barb %d\n", b.id);
+                clearKneel(b);
+            } else continue;   // riteTick() walks the kneeler to its slot; no work search while kneeling
         }
         if (b.carryKind != carryNone) {   // R29-F1: any other state taken over the haul drops the load
             if (b.target != targetDepot || b.movingbspot || b.building || b.deertargeting || b.chopping || b.jobKind != jobNone) dropCarry(b);
@@ -11907,6 +12130,7 @@ int main() {
                 craftspear(barbs, squares, dwarfForge);
                 minematerials(squares, barbs, tris, stumps, trees, octs, rocks, rockGold, bushes, bushshapes, catchRings, fields, stores, dwarfForge);
                 barbmove(squares, barbs);
+                riteTick(barbs, squares, shrines);   // R52-F3: after the work search, so a barb between jobs is caught idle
                 shaftTick(barbs);   // R40-F1: dust puffs and lintel flash
                 shinobiTick(barbs, squares, houseshapes, octs, shinobiPuffs);
                 treespawn(trees, tris, stumps, fields, houses, barbs);
@@ -12057,6 +12281,7 @@ int main() {
                 if (viewRect.findIntersection(stumps[i].getGlobalBounds())) drawSnapped(window, stumps[i]);
         }
 
+        drawRiteRings(window, shrines);   // R52-F3: faint ring round each rite shrine, under the kneelers
         drawBarbs(window, barbs, squares, frameCount, zoom);
         for (auto& b : barbs) if (b.raidFlash > 0 && !paused) b.raidFlash--;   // R52-F1: the hit flash lasts 2 drawn frames
 	if (activeTrader) drawSnapped(window, activeTrader->shape);
