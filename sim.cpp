@@ -761,6 +761,23 @@ const Color kTradeCoinColor(206, 190, 136);   // 1px pale brass pip on the cart 
 const float kRelFriendlyMinRelation = 0.0f;   // a swap leaving the pair at or above this makes it friendly
 const int kRelFriendlyDays = 2;               // friendly timer per swap, in game days
 const int kRelFriendlyTicks = kRelFriendlyDays * 24 * ticksPerGameHour;
+// R54-F3 Exiles and Emigrants, phase 1: at dawn, one long-starving barb may walk to a better-fed rival crate (never a
+// cold pair; a friendly pair takes a shorter starvation) and join that race, keeping its name and trait. At most one
+// departure per race per season and one migrant on the road at a time. Held by barb id; any state conflict cancels.
+const int kExileStarveTicks = starveGraceTicks + 8 * ticksPerMinute;          // hungry this long since the last meal
+const int kExileFriendlyStarveTicks = starveGraceTicks + 3 * ticksPerMinute;  // ...or this long toward a friendly race
+const int kExileMinHealth = 10;               // too weak below this to make the walk
+const float kExileFedMinPerHead = 1.5f;       // the rival's food per head must be at least this...
+const float kExileFedMarginPerHead = 1.0f;    // ...and this much above the home race's
+const int kExileMaxTicks = 12 * ticksPerMinute;   // backstop on the walk
+const int kExileCrateSlot = 2;                // stands this many column gaps left of the rival crate's stand spot
+const Color kExileTickerTint(196, 176, 156);  // dusty tan: apart from the trade jade, the raid reds and the race tints
+// 1px cloak hem in the birth race's colour, muted toward the ground so it reads as a mark, not a task stripe
+const Color kExileCloakColors[raceCount] = {
+    Color(164, 138, 92),                      // human-born: dull gold
+    Color(140, 120, 162),                     // dwarf-born: dull lavender
+    Color(112, 150, 104),                     // elf-born: dull mint
+};
 
 // Skittish deer: bolt away from a nearby barb for a short, capped time, then a cooldown so hunts can still land
 const int deerStepInterval = 3;            // ticks per 1px step while wandering (deer row of speciesDefs)
@@ -2929,7 +2946,7 @@ enum raidRole { raidNone, raidAttacker, raidDefender };   // R52-F1
 // R53-F4: the one exclusive state a barb is in (work flags like chopping/building stay separate). Set only by
 // beginActivity(), cleared only by endActivity(), which also runs the activity's cleanup.
 enum barbActivity { actNone, actShelter, actExpedition, actRaidAttack, actRaidDefend, actTemper, actSmelt, actDrill, actWatch,
-                    actKneel, actHerb, actCaravan, activityCount };   // R53-F2: actHerb = tending the herb bed; R54-F1: actCaravan
+                    actKneel, actHerb, actCaravan, actExile, activityCount };   // R53-F2: actHerb = tending the herb bed; R54-F1: actCaravan; R54-F3: actExile
 struct activityDef {
     const char* name;
     bool ownsBarb;    // its tick owns the barb outright: every job selector skips it (barbAvailable() false)
@@ -2949,6 +2966,7 @@ const activityDef activityDefs[activityCount] = {
     {"kneel",         false, false, true},
     {"tend herbs",    false, false, true},   // R53-F2: any claim outranks tending, like the drill
     {"caravan",       true,  false, false},  // R54-F1: caravanTick() owns the barb for the whole trip
+    {"emigrate",      true,  false, false},  // R54-F3: exileTick() owns the migrant until it joins or is called back
 };
 
 struct barb {
@@ -2972,7 +2990,8 @@ struct barb {
     int targetDeerId = -1;
     int hunger = 0;
     int slowTick = 0;
-    barbRace race = raceHuman;   // rolled once in makeBarb()
+    barbRace race = raceHuman;   // rolled once in makeBarb(); changed afterwards only by transferBarb() (R54-F3)
+    barbRace birthRace = raceHuman; // R54-F3: race at birth; set only in makeBarb(), never changed
     int homeHouse = -1;          // house.id of the birth house (stable id, not an index); -1 = founder
     councilDecree lastVote = decreeNone; // ballot from the latest dawn; lives in the struct so it is dropped with the barb
     bool hasSpear = false;       // R20-F3: kept for life; cleared only in makeBarb()
@@ -3167,6 +3186,20 @@ void caravanMemberLost(const barb& b) {
 int caravanCartId() { return caravan.active ? caravan.memberIds[0] : -1; }   // R54-F1: drawBarbs() puts the cart on this barb
 bool caravanLaden() { return caravan.active && caravan.cargo.food + caravan.cargo.wood + caravan.cargo.stone > 0; }
 
+// R54-F3: the one migrant on the road. Held by barb id (never an index) and re-resolved by exileTick() every tick; a
+// removed barb simply stops resolving and the trip is cancelled. An arrival is queued in exileQueue and applied by
+// applyExileTransfers() after exileTick() returns, so transferBarb() never runs inside a barb loop.
+struct exileTrip {
+    bool active = false;
+    int barbId = -1;
+    int from = -1, to = -1;
+    int ticks = 0;
+};
+exileTrip exile;
+struct exileTransfer { int barbId, from, to; };
+vector<exileTransfer> exileQueue;
+int exileSeasonMark[raceCount] = {-1, -1, -1};   // absolute season (game_day / daysPerSeason) of each race's last departure
+
 // R52-F1: the one way out of the raid state, on every exit (outcome, abort, beaten defender, removeBarb, backstop)
 bool inRaid(const barb& b) { return b.activity == actRaidAttack || b.activity == actRaidDefend; }   // R53-F4
 void clearRaid(barb& b) {
@@ -3289,6 +3322,7 @@ void endActivity(barb& b) {
             break;
         case actKneel:       // R52-F3: nothing else to reset
         case actCaravan:     // R54-F1: the cart's goods live on the caravan entry, not the barb
+        case actExile:       // R54-F3: the trip lives on the exile entry; exileTick() resets the walk
         case actNone:
         case activityCount:
             break;
@@ -3814,6 +3848,7 @@ const char* barbTaskName(const barb& b) {
     if (b.activity == actCaravan)   // R54-F1
         return caravan.phase == caravanTrip::Trade ? "caravan: trading at the crate"
              : caravan.phase == caravanTrip::Home ? "caravan: heading home" : "caravan: on the road";
+    if (b.activity == actExile) return "emigrating";   // R54-F3: the tooltip names the destination
     if (b.deertargeting) return b.hasSpear ? weaponOf(b).huntLabel : "hunting";   // R47-F8: "hunting (axe)" for dwarves
     if (b.building) return "building";
     if (b.activity == actTemper) return "tempering pick";   // R41-F2
@@ -5040,6 +5075,11 @@ void drawBarbs(RenderWindow& window, const vector<barb>& barbs, const vector<Rec
             if (mh <= 0.0f) continue;   // a drooping body can be too short for the cloak
             addLookQuad(Vector2f(mx, bodyTop + mk.y), Vector2f(mk.w, mh), (mk.rainDarkens && raining) ? lk.rainColor : mk.color);
         }
+        // R54-F3: an exile's 1px cloak hem in its birth race's muted colour, left of the bottom body row (the elf cloak's
+        // foot when it joined the elves; batched after the race marks so it sits on top). Skipped on a row-1 body
+        // (hungry dwarf) so it never covers the trait dot.
+        if (b.birthRace != b.race && bodyH - 1.0f > 1.0f)
+            addLookQuad(Vector2f(base.x - 1.0f, bodyTop + bodyH - 1.0f), Vector2f(1.0f, 1.0f), kExileCloakColors[clampRace(b.birthRace)]);
         if (zoom >= crownMinZoom && isLeader(b)) {   // R28-F2: gold band on the very top of the head or hat (stays under the ballot pip)
             float headTop = bodyTop - rd.hatSize.y - rd.hatTipSize.y;
             stripe.setSize(crownSize);
@@ -5487,6 +5527,9 @@ optional<hoverHit> pickHover(Vector2f p, float radius, const vector<barb>& barbs
                 label += ", of house " + to_string(b.homeHouse + 1) + ", " + to_string(kin) + " kin";
             }
             if (b.sick > 0) label += ", coughing";   // R52-F4
+            if (b.birthRace != b.race) label += string(", born ") + raceDefs[clampRace(b.birthRace)].name;   // R54-F3
+            if (b.activity == actExile && exile.active)   // R54-F3
+                label += string("\nLeaving the ") + racePlurals[clampRace(exile.from)] + " for the " + racePlurals[clampRace(exile.to)];
             if (b.activity == actCaravan && caravan.active) {   // R54-F1: where the cart goes and what it carries
                 int dest = caravan.phase == caravanTrip::Home ? caravan.from : caravan.to;
                 label += string("\nCaravan ") + (caravan.phase == caravanTrip::Home ? "home to the " : "to the ") + racePlurals[clampRace(dest)];
@@ -8114,6 +8157,7 @@ void makeBarb(Vector2i pos, vector<barb>& barbs, vector<RectangleShape>& squares
     // R28-F1: race passed in by the caller; -1 (or out of range) rolls one at random
     b.race = (race >= 0 && race < raceCount) ? (barbRace)race
                                              : (barbRace)uniform_int_distribution<int>(0, raceCount - 1)(gen);
+    b.birthRace = b.race;   // R54-F3
     b.hasSpear = false;   // R20-F3: every new barb starts unarmed with no craft in progress
     b.spearTimer = 0;
     b.spearPaid = false;  // POL-F3
@@ -11070,6 +11114,152 @@ void caravanTick(vector<barb>& barbs, vector<RectangleShape>& squares, const sto
     }
 }
 
+// R54-F3: the one way a barb changes race. Race, home house and the hitbox (squares[i] takes the new race's body size,
+// feet kept on the same row) are written together; birthRace, name and trait are kept. Race head counts are never
+// stored (every system counts barbs[].race when it needs them), so they move with the race field in this same write.
+// Per-race leftovers are reset: remembered work spots (the old quarter), order and ballot. Leaders never emigrate.
+// Never called from inside a barb loop: exileTick() queues arrivals and applyExileTransfers() runs this after it.
+void transferBarb(vector<barb>& barbs, vector<RectangleShape>& squares, int i, int to, int houseId) {
+    if (i < 0 || i >= (int)barbs.size() || i >= (int)squares.size() || to < 0 || to >= raceCount) return;
+    barb& b = barbs[i];
+    RectangleShape& sq = squares[i];
+    float feet = sq.getPosition().y + sq.getSize().y;
+    b.race = (barbRace)to;
+    b.homeHouse = houseId;
+    Vector2f size = raceOf(b).bodySize;
+    sq.setSize(size);
+    sq.setPosition(Vector2f(sq.getPosition().x, feet - size.y));
+    for (auto& m : b.mem) m = workMem{};
+    b.memReturn = b.memShared = false;
+    b.order = needNone;
+    b.orderTicks = 0;
+    b.lastVote = decreeNone;
+    clearRoute(b);
+}
+
+// hand the migrant back to the other systems, standing where it is (every exit goes through here)
+void releaseExileBarb(barb& b) {
+    if (b.activity != actExile) return;
+    expeditionReset(b);
+    endActivity(b, actExile);
+}
+void cancelExile(vector<barb>& barbs, const char* why) {
+    int i = findBarbById(barbs, exile.barbId);
+    if (i >= 0) releaseExileBarb(barbs[i]);
+    printf("---EXILE CANCELLED--- barb %d, %s to the %s: %s\n", exile.barbId, racePlurals[clampRace(exile.from)],
+           racePlurals[clampRace(exile.to)], why);
+    exile = exileTrip{};
+}
+
+// R54-F3: food per head of race r (an empty race counts one head, so it never divides by zero)
+float exileFedOf(int r, const int (&members)[raceCount]) {
+    return (float)stockOfRace(r).food / (float)max(1, members[clampRace(r)]);
+}
+
+// R54-F3: once at dawn. With no migrant on the road, picks one long-starving, free barb (raidIdle(), not a leader, not
+// Sasuke, no order) from a race that has not lost one this season, and the best-fed rival that will take it: not a cold
+// pair, crate built, at least one house, food per head over kExileFedMinPerHead and kExileFedMarginPerHead above home.
+// A friendly pair (R54-F1) needs only kExileFriendlyStarveTicks; without the friendly tier the cold rule alone applies.
+void exileDawn(vector<barb>& barbs, const vector<house>& houses, const storehouse (&stores)[raceCount]) {
+    if (exile.active || barbs.empty()) return;
+    int season = game_day / daysPerSeason;
+    int members[raceCount] = {}, raceHouses[raceCount] = {};
+    for (auto& b : barbs) members[clampRace(b.race)]++;
+    for (auto& h : houses) raceHouses[clampRace(h.race)]++;
+    int n = (int)barbs.size();
+    int start = uniform_int_distribution<int>(0, n - 1)(gen);
+    for (int k = 0; k < n; k++) {
+        barb& b = barbs[(start + k) % n];
+        int from = clampRace(b.race);
+        if (exileSeasonMark[from] == season || !isStarving(b) || b.health < kExileMinHealth || b.starveTicks < kExileFriendlyStarveTicks) continue;
+        if (!raidIdle(b) || isLeader(b) || b.shinobi || b.order != needNone) continue;
+        int best = -1;
+        float bestFed = 0.0f, homeFed = exileFedOf(from, members);
+        for (int o = 0; o < raceCount; o++) {
+            if (o == from || members[o] == 0 || raceHouses[o] == 0 || !stores[o].built) continue;
+            if (relationTierOf(raceRelation[from][o]) == relCold) continue;
+            if (b.starveTicks < (pairFriendly(from, o) ? kExileFriendlyStarveTicks : kExileStarveTicks)) continue;
+            float fed = exileFedOf(o, members);
+            if (fed < kExileFedMinPerHead || fed < homeFed + kExileFedMarginPerHead || fed <= bestFed) continue;
+            best = o;
+            bestFed = fed;
+        }
+        if (best < 0) continue;
+        expeditionReset(b);   // ends any drill or wander walk first
+        beginActivity(b, actExile);
+        exile = exileTrip{};
+        exile.active = true;
+        exile.barbId = b.id;
+        exile.from = from;
+        exile.to = best;
+        exileSeasonMark[from] = season;
+        string line = string(b.name) + " leaves the starving " + racePlurals[from] + " for the " + racePlurals[best];
+        printf("---EXILE OUT--- %s (id %d, starving %d ticks, food/head %.1f vs %.1f%s)\n", line.c_str(), b.id, b.starveTicks,
+               homeFed, bestFed, pairFriendly(from, best) ? ", friendly" : "");
+        logEvent(line, kExileTickerTint);
+        return;
+    }
+}
+
+// R54-F3: runs in the fixed-step sim loop after caravanTick(). Clears a stale emigrate flag, then walks the migrant
+// (re-resolved by id) to the rival crate through the route planner. A missing migrant, a state conflict, a timeout, the
+// rival crate gone or the pair turning cold cancels the trip. Arrival only queues the transfer.
+void exileTick(vector<barb>& barbs, vector<RectangleShape>& squares, const storehouse (&stores)[raceCount]) {
+    int n = min((int)barbs.size(), (int)squares.size());
+    for (int i = 0; i < n; i++) {   // backstop: an emigrate flag with no exile entry behind it is cleared
+        barb& b = barbs[i];
+        if (b.activity == actExile && (!exile.active || exile.barbId != b.id)) {
+            printf("EXILE FLAG CLEARED - barb %d (no exile entry)\n", b.id);
+            releaseExileBarb(b);
+        }
+    }
+    if (!exile.active) return;
+    for (auto& q : exileQueue) if (q.barbId == exile.barbId) return;   // already arrived, waiting on the transfer
+    exile.ticks++;
+    int i = findBarbById(barbs, exile.barbId);
+    if (i < 0 || i >= n) { cancelExile(barbs, "migrant gone"); return; }
+    const barb& m = barbs[i];
+    if (m.activity != actExile || inRaid(m) || m.chopping || m.building || m.movingbspot || m.deertargeting || m.inMine
+        || m.race != exile.from || m.health <= 0 || isLeader(m)) {
+        printf("EXILE CONFLICT - barb %d (%s)\n", m.id, activityDefs[m.activity].name);
+        cancelExile(barbs, "state conflict");
+        return;
+    }
+    int to = clampRace(exile.to);
+    if (exile.ticks > kExileMaxTicks || !stores[to].built || relationTierOf(raceRelation[clampRace(exile.from)][to]) == relCold) {
+        cancelExile(barbs, exile.ticks > kExileMaxTicks ? "timeout" : !stores[to].built ? "crate gone" : "pair turned cold");
+        return;
+    }
+    int ri[1] = {i};
+    if (raidColumnStep(barbs, squares, ri, raidCrateSpot(to, kExileCrateSlot)))
+        exileQueue.push_back({m.id, exile.from, exile.to});
+}
+
+// R54-F3: applies queued arrivals once exileTick() has returned (no barb loop is live). Each entry is re-resolved by id
+// and re-checked; the new home is a random house of the joined race (none left = cancelled).
+void applyExileTransfers(vector<barb>& barbs, vector<RectangleShape>& squares, const vector<house>& houses) {
+    if (exileQueue.empty()) return;
+    vector<exileTransfer> todo;
+    todo.swap(exileQueue);
+    for (auto& q : todo) {
+        int i = findBarbById(barbs, q.barbId);
+        if (i < 0 || i >= (int)squares.size() || barbs[i].activity != actExile || barbs[i].race != q.from
+            || !exile.active || exile.barbId != q.barbId) {
+            if (exile.active && exile.barbId == q.barbId) cancelExile(barbs, "arrival no longer valid");
+            continue;
+        }
+        vector<int> homes;
+        for (auto& h : houses) if (h.race == q.to) homes.push_back(h.id);
+        if (homes.empty()) { cancelExile(barbs, "no house to join"); continue; }
+        int houseId = homes[uniform_int_distribution<int>(0, (int)homes.size() - 1)(gen)];
+        releaseExileBarb(barbs[i]);
+        transferBarb(barbs, squares, i, q.to, houseId);
+        exile = exileTrip{};
+        printf("---EXILE JOINS--- %s (id %d, born %s) joins the %s, house %d\n", barbs[i].name, barbs[i].id,
+               raceDefs[clampRace(barbs[i].birthRace)].name, racePlurals[clampRace(q.to)], houseId + 1);
+    }
+}
+
 void barbspawner(vector<RectangleShape>& squares, vector<barb>& barbs, const vector<house>& houses, vector<RectangleShape>& houseshapes, vector<birthRing>& rings) {
     static int deferCooldown = 0;
     if (deferCooldown > 0) deferCooldown--;
@@ -13288,6 +13478,8 @@ int main() {
                 watchTick(barbs, squares, prowlers);   // R51-F1: watchmen patrol and fight; slain prowlers fade, prowlerTick() removes them
                 raidTick(barbs, squares, stores);   // R52-F1: raid march and fight; sets raidThreat[] for bellTick() just below
                 caravanTick(barbs, squares, stores);   // R54-F1: caravans, swaps and the friendly timers, once per sim tick
+                exileTick(barbs, squares, stores);     // R54-F3: walks the migrant; an arrival is only queued here...
+                applyExileTransfers(barbs, squares, houses);   // ...and applied here, outside every barb loop
                 bellTick(barbs, squares, houses, houseshapes, wolves, stores, smoke, dwarfForge, fields,
                          trees, tris, rocks, octs, bushes);   // INBOX-F1: after the wolves move
                 expeditionTick(barbs, squares, wolves, stores);   // R45-F2: after the wolves and the bell, before hungerTick()
@@ -13295,7 +13487,10 @@ int main() {
                 {
                     int hourWas = game_time;
                     clockk();
-                    if (game_time != hourWas && game_time == nightEndHour) chronicleDawn(houses);   // R54-F2: dawn autosave
+                    if (game_time != hourWas && game_time == nightEndHour) {
+                        chronicleDawn(houses);   // R54-F2: dawn autosave
+                        exileDawn(barbs, houses, stores);   // R54-F3: the dawn emigration check
+                    }
                 }
                 weatherTick();
                 relationTick();   // R51-F4: drift to neutral and clash cooldowns, before the trader prices a visit
