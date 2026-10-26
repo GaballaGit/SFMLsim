@@ -485,8 +485,31 @@ const int riteSlots = 8;                          // kneeling places per shrine 
 const float riteRingPx = 10.0f;                   // kneel ring radius round the shrine slab's centre (shrines sit >= 10px apart)
 const Color riteRingColor(214, 192, 118, 70);     // shrine-cap gold, faint; under barbs and the night overlay
 const float riteFaithTickDim = 0.45f;             // HUD faith tick alpha on a Rite day (the faith is "spent" at the shrine)
-const int riteOmenDays = 2;                       // a stub omen lasts this many game days after its rite
+const int riteOmenDays = 2;                       // an omen lasts this many full game days after its rite night
 const Color riteTickerTint(214, 200, 150);        // rite-end ticker line: pale shrine gold, readable on the black strip
+// R53-F3 Rite Omens, phase 2: at the rite's end each race that knelt rolls a blessing or a curse (more kneelers, better odds)
+// on one effect, births or the cough. Everything reads it through omenMult(race, kind), 1.0 with no omen. Mild by design:
+// a curse is never rolled for a small race, its births stay above the veil floor's range, and cough deaths keep their floors.
+constexpr float omenBlessBase = 0.45f;            // blessing chance with one kneeler...
+constexpr float omenBlessPerKneeler = 0.06f;      // ...plus this per extra kneeler...
+constexpr float omenBlessMin = 0.45f;             // ...clamped to this range (a full ring of 8 reaches the cap)
+constexpr float omenBlessMax = 0.85f;
+constexpr float omenBlessBirthMult = 1.25f;       // blessing: births x this (a second spawn roll, see barbspawner)
+constexpr float omenCurseBirthMult = 0.8f;        // curse: births x this
+constexpr float omenBlessCoughMult = 0.6f;        // blessing: chance to catch the cough x this
+constexpr float omenCurseCoughMult = 1.3f;        // curse: chance to catch the cough x this
+constexpr float omenMultMin = 0.5f;               // omenMult() clamps every value to this range
+constexpr float omenMultMax = 1.5f;
+static_assert(omenBlessMin >= 0.0f && omenBlessMax <= 1.0f && omenBlessMin <= omenBlessMax, "blessing chance is a probability");
+static_assert(omenCurseBirthMult >= omenMultMin && omenBlessBirthMult <= omenMultMax && omenBlessBirthMult < 2.0f,
+              "births: mild multipliers; the extra roll in barbspawner needs a blessing below x2");
+static_assert(omenBlessCoughMult >= omenMultMin && omenCurseCoughMult <= omenMultMax, "cough: mild multipliers");
+const int omenCurseFloor = 6;                     // a race at or under this many at the rite's end is always blessed
+const float omenAuraPx = 13.0f;                   // aura ring radius round the shrine slab's centre (outside the 10px kneel ring)
+const Color omenAuraBlessColor(226, 210, 140, 46);  // pale shrine gold, very faint
+const Color omenAuraCurseColor(150, 112, 104, 52);  // ashen rose-brown: dimmer than the brick-red birth/shortage lines
+enum omenKind { omenBirths, omenCough, omenKindCount };
+float omenMult(int race, int kind);               // defined with riteOmens[]; read by sickTick() and barbspawner()
 // R53-F4 Activity Enum: the exclusive owned states (shelter, expedition, raid, forge tasks, drill, watch, kneel) are one
 // barb.activity, changed only by beginActivity()/endActivity(). Build with -DSIM_DEBUG for the debug checks: starting a
 // second activity over a live one aborts, and kDebugActivityKey toggles the activity name in the hover tooltip (off at start).
@@ -4744,10 +4767,16 @@ void sickTick(vector<barb>& barbs) {
         for (auto& kv : buckets) for (int i : kv.second) if (barbs[i].sickImmune <= 0 && barbs[i].health > 0) open.push_back(i);
         if (!open.empty()) {
             barb& p = barbs[open[uniform_int_distribution<int>(0, (int)open.size() - 1)(gen)]];
-            catchCough(p);
             int r = clampRace(p.race);
-            printf("COUGH OUTBREAK - %s (%s), %s\n", p.name, raceDefs[r].name, isWinter() ? "winter" : "out of season");
-            logRaceEvent(string(isWinter() ? "Winter cough" : "A cough") + " in the " + raceDefs[r].name + " quarter - " + p.name + " is sick", r);
+            // R53-F3: a blessed race may shrug off the first case (curses act on the spread below, not the seed)
+            float seedMult = min(1.0f, omenMult(r, omenCough));
+            if (seedMult < 1.0f && roll(gen) >= seedMult) {
+                printf("COUGH OUTBREAK AVERTED - %s (%s omen x%.2f)\n", p.name, racePlurals[r], seedMult);
+            } else {
+                catchCough(p);
+                printf("COUGH OUTBREAK - %s (%s), %s\n", p.name, raceDefs[r].name, isWinter() ? "winter" : "out of season");
+                logRaceEvent(string(isWinter() ? "Winter cough" : "A cough") + " in the " + raceDefs[r].name + " quarter - " + p.name + " is sick", r);
+            }
         }
     }
 
@@ -4761,7 +4790,8 @@ void sickTick(vector<barb>& barbs) {
         for (int i : m) {
             barb& b = barbs[i];
             if (b.sick > 0 || b.sickImmune > 0 || b.health <= 0) continue;
-            if (roll(gen) < chance) { catchCough(b); printf("COUGH SPREADS - %s (house %d)\n", b.name, kv.first); }
+            // R53-F3: the race's omen scales the catch rate
+            if (roll(gen) < chance * omenMult(clampRace(b.race), omenCough)) { catchCough(b); printf("COUGH SPREADS - %s (house %d)\n", b.name, kv.first); }
         }
     }
 
@@ -9131,14 +9161,66 @@ struct riteState {
 static_assert(raceCount == 3, "riteState::shrineId initialiser lists one -1 per race");
 riteState rite;
 
-// R52-F3: stub omen left by a race's rite. Phase 1 only records and expires it; nothing reads it and nothing is rolled
-// (the phase 2 roll on births and prowlers will read `active`).
+// R52-F3 / R53-F3: the omen left by a race's rite. Written only by rollRiteOmen() and riteOmenTick(); everything else reads
+// it through omenMult() (prowlers are a later phase).
 struct riteOmen {
     bool active = false;
+    bool blessed = false;                  // blessing or curse
+    int kind = omenBirths;                 // the one effect it touches (omenKind)
     int kneelers = 0;                      // the rite's peak kneelers for this race
     int expiresDay = -1;                   // game_day the omen lapses at (checked every tick)
 };
 riteOmen riteOmens[raceCount];
+
+// R53-F3: the single accessor. 1.0 with no omen or for the other kind; else the clamped blessing/curse multiplier.
+float omenMult(int race, int kind) {
+    if (race < 0 || race >= raceCount) return 1.0f;
+    const riteOmen& o = riteOmens[race];
+    if (!o.active || o.kind != kind) return 1.0f;
+    float m = 1.0f;
+    if (kind == omenBirths) m = o.blessed ? omenBlessBirthMult : omenCurseBirthMult;
+    else if (kind == omenCough) m = o.blessed ? omenBlessCoughMult : omenCurseCoughMult;
+    return min(omenMultMax, max(omenMultMin, m));
+}
+
+// R53-F3: is this race's omen good for it? Read through omenMult only (a blessing lifts births or lowers the cough).
+int omenSign(int race) {
+    float b = omenMult(race, omenBirths), c = omenMult(race, omenCough);
+    if (b > 1.0f || c < 1.0f) return 1;
+    if (b < 1.0f || c > 1.0f) return -1;
+    return 0;
+}
+
+// R53-F3: roll a race's omen at the rite's end, weighted by its kneelers; a small race is never cursed
+void rollRiteOmen(int r, int kneelers, int members) {
+    float pBless = min(omenBlessMax, max(omenBlessMin, omenBlessBase + omenBlessPerKneeler * (float)(kneelers - 1)));
+    bool blessed = members <= omenCurseFloor || uniform_real_distribution<float>(0.0f, 1.0f)(gen) < pBless;
+    int kind = uniform_int_distribution<int>(0, omenKindCount - 1)(gen);
+    riteOmen& o = riteOmens[r];
+    o.active = true;
+    o.blessed = blessed;
+    o.kind = kind;
+    o.kneelers = kneelers;
+    o.expiresDay = game_day + riteOmenDays + 1;   // the rite ends at 23:00, so this lapses at the midnight 2 full days on
+    const char* effect = kind == omenBirths ? (blessed ? "more births" : "fewer births")
+                                            : (blessed ? "the cough keeps away" : "the cough spreads faster");
+    printf("RITE OMEN - %s: %d knelt, p(bless) %.2f, %s (%s, x%.2f) until day %d\n", racePlurals[r], kneelers, pBless,
+           blessed ? "blessing" : "curse", effect, omenMult(r, kind), o.expiresDay + 1);
+    logRaceEvent(string("Omen for the ") + racePlurals[r] + ": " + (blessed ? "a blessing - " : "a curse - ") + effect +
+                 " for " + to_string(riteOmenDays) + " days", r);
+}
+
+// R53-F3: lapse at the expiry midnight, with one "glow fades" ticker line
+void riteOmenTick() {
+    for (int r = 0; r < raceCount; r++) {
+        riteOmen& o = riteOmens[r];
+        if (!o.active || game_day < o.expiresDay) continue;
+        printf("RITE OMEN LAPSED - %s (%s)\n", racePlurals[r], o.blessed ? "blessing" : "curse");
+        logEvent(string("The ") + racePlurals[r] + "' shrine glow fades - the " + (o.blessed ? "blessing" : "curse") + " has passed",
+                 riteTickerTint);
+        o = riteOmen();
+    }
+}
 
 // R52-F3: centre of a shrine's slab, the kneel ring's centre
 Vector2f riteRingCentre(const shrine& s) { return Vector2f((float)s.x, (float)s.y) + shrineSlabSize / 2.0f; }
@@ -9180,7 +9262,7 @@ void endKneel(barb& b, const char* why) {
     b.targetx = b.targety = -1;
 }
 
-// R52-F3: one ticker line naming who knelt, and a stub omen for each race that did
+// R52-F3: one ticker line naming who knelt; R53-F3: then a rolled omen for each race that did
 void endRite(vector<barb>& barbs) {
     for (auto& b : barbs) if (b.activity == actKneel) endKneel(b, "rite over");
     rite.active = false;
@@ -9193,14 +9275,14 @@ void endRite(vector<barb>& barbs) {
         races++;
         who += races == 1 ? "" : races == total ? " and " : ", ";
         who += to_string(k) + " " + (k == 1 ? raceDefs[r].name : racePlurals[r]);
-        riteOmens[r].active = true;
-        riteOmens[r].kneelers = k;
-        riteOmens[r].expiresDay = game_day + riteOmenDays;
-        printf("RITE OMEN - %s: %d knelt, omen held until day %d (stub, no roll)\n", racePlurals[r], k, riteOmens[r].expiresDay + 1);
     }
     string line = total > 0 ? "The Rite ends: " + who + " knelt at the shrines" : string("The Rite ends: none knelt at the shrines");
     printf("RITE ENDED - %s\n", line.c_str());
     logEvent(line, riteTickerTint);
+    // R53-F3: then one omen line per race that knelt (after the tally line, so the ticker reads in order)
+    int members[raceCount] = {};
+    for (auto& b : barbs) members[clampRace(b.race)]++;
+    for (int r = 0; r < raceCount; r++) if (rite.peak[r] > 0) rollRiteOmen(r, rite.peak[r], members[r]);
 }
 
 // R52-F3: runs after barbmove(). On a Rite day from dusk to riteEndHour, idle barbs walk to a free slot on the ring round
@@ -9208,11 +9290,7 @@ void endRite(vector<barb>& barbs) {
 // sends its kneelers home. Dawn clears every kneel (backstop: the rite has normally ended at riteEndHour).
 void riteTick(vector<barb>& barbs, vector<RectangleShape>& squares, const vector<shrine>& shrines) {
     int n = min((int)barbs.size(), (int)squares.size());
-    for (int r = 0; r < raceCount; r++)
-        if (riteOmens[r].active && game_day >= riteOmens[r].expiresDay) {
-            riteOmens[r].active = false;
-            printf("RITE OMEN LAPSED - %s\n", racePlurals[r]);
-        }
+    riteOmenTick();   // R53-F3: lapse first, so a rite ending this tick can roll a fresh omen
 
     bool inWindow = currentDecree == decreeRite && game_time >= nightStartHour && game_time < riteEndHour;
     if (!inWindow) {
@@ -9299,6 +9377,26 @@ void drawRiteRings(RenderWindow& window, const vector<shrine>& shrines) {
         if (si < 0) continue;
         ring.setPosition(riteRingCentre(shrines[si]));   // slab centre sits on a pixel corner, as the 20px circle needs
         window.draw(ring);
+    }
+}
+
+// R53-F3: while a race's omen holds, one thin faint ring round its shrine (gold blessing, ashen curse). One cached shape.
+void drawOmenAuras(RenderWindow& window, const vector<shrine>& shrines) {
+    static CircleShape aura = [] {
+        CircleShape c(omenAuraPx, 40);
+        c.setOrigin(Vector2f(omenAuraPx, omenAuraPx));
+        c.setFillColor(Color::Transparent);
+        c.setOutlineThickness(-1.0f);   // 1px just inside the radius
+        return c;
+    }();
+    for (int r = 0; r < raceCount; r++) {
+        int sign = omenSign(r);
+        if (sign == 0) continue;
+        int si = findShrineById(shrines, veil.faithShrineId[r]);
+        if (si < 0) continue;
+        aura.setOutlineColor(sign > 0 ? omenAuraBlessColor : omenAuraCurseColor);
+        aura.setPosition(riteRingCentre(shrines[si]));
+        window.draw(aura);
     }
 }
 
@@ -10486,10 +10584,14 @@ void barbspawner(vector<RectangleShape>& squares, vector<barb>& barbs, const vec
     if (deferCooldown > 0) deferCooldown--;
     int cap = popCap(houses);
     for (int i = 0; i < (int)houseshapes.size() && i < (int)houses.size(); i++) {
-        if (spawnChance(gen) != 0) continue;
+        // R53-F3: a blessing on births gives a failed spawn roll a second try (rate ~x omenMult); a curse holds some back below
+        int r = clampRace(houses[i].race);
+        float omenBirth = omenMult(r, omenBirths);
+        bool spawnHit = spawnChance(gen) == 0;
+        if (!spawnHit && omenBirth > 1.0f && uniform_real_distribution<float>(0.0f, 1.0f)(gen) < omenBirth - 1.0f) spawnHit = spawnChance(gen) == 0;
+        if (!spawnHit) continue;
         if ((int)barbs.size() >= cap) continue;
         // RACE-F1: a birth draws on the house race's larder, gated on that race's own head count
-        int r = clampRace(houses[i].race);
         raceStock& rs = stock[r];
         int members = 0;
         for (auto& b : barbs) members += clampRace(b.race) == r ? 1 : 0;
@@ -10515,6 +10617,11 @@ void barbspawner(vector<RectangleShape>& squares, vector<barb>& barbs, const vec
                 veilOmen(string(racePlurals[r]) + ": the air is still here");   // R50-F1b: rare, shared cooldown
                 continue;   // nothing paid: the next roll may succeed
             }
+        }
+        // R53-F3: a curse holds a share of births back, never while the race is under the free-birth floor
+        if (omenBirth < 1.0f && members >= birthFreeFloor && uniform_real_distribution<float>(0.0f, 1.0f)(gen) >= omenBirth) {
+            printf("OMEN - %s birth held back by the curse (x%.2f)\n", racePlurals[r], omenBirth);
+            continue;   // nothing paid
         }
         int paid = min(rs.food, birthFoodCost);
         spend(rs, 0, 0, birthFoodCost);
@@ -12808,6 +12915,7 @@ int main() {
 
         drawStumps(window, stumps, stumpVerts, camRect);   // R45-F1a: ~12k stumps (R47-F1), only those touching the view
 
+        drawOmenAuras(window, shrines);   // R53-F3: faint aura round a shrine while its race's omen holds
         drawRiteRings(window, shrines);   // R52-F3: faint ring round each rite shrine, under the kneelers
         drawBarbs(window, barbs, squares, frameCount, zoom);
         for (auto& b : barbs) if (b.raidFlash > 0 && !paused) b.raidFlash--;   // R52-F1: the hit flash lasts 2 drawn frames
