@@ -309,7 +309,8 @@ const char* const kChroniclePath = "chronicle.sav";
 const char* const kChronicleTmpPath = "chronicle.sav.tmp";
 const int32_t kChronicleMagic = 0x4C524843;         // "CHRL" little-endian
 const int32_t kChronicleEndMark = 0x444E4543;       // "CEND": trailer, so a truncated file is rejected
-const int32_t kChronicleVersion = 1;
+const int32_t kChronicleVersion = 2;                // R54-F4: v2 adds the per-race era array after the relations
+const int32_t kChronicleVersionNoEras = 1;          // v1 files (no eras) still load, with every race back at Camp
 const int kChronicleMaxHouses = 600;                // a load with more houses than this is rejected outright
 const int kChronicleMaxDay = 1000000;               // game_day bound on load
 const int kChronicleMaxStock = 1000000;             // per wood/stone/food bound on load
@@ -840,13 +841,26 @@ const Vector2f householdPipSize(2.0f, 2.0f);  // one pip per resident, about a b
 const float householdPipGap = 4.0f;           // pip bottom this far above the hitbox top: clears the 2px elf hat, 1px bob and 1px air
 
 // Settlement eras: a rank needs both thresholds (houses are capped at one per barb, so both grow together)
-enum settlementEra { eraCamp, eraHamlet, eraTown, eraCount };
-const char* const eraNames[eraCount] = {"Camp", "Hamlet", "Town"};
+// R54-F4: each race has its own era (raceEra[]), counted from its own barbs and houses
+enum settlementEra { eraCamp, eraHamlet, eraTown, eraFourth, eraCount };
+const char* const eraNames[eraCount] = {"Camp", "Hamlet", "Town", "Fourth Age"};
 const int eraHamletBarbs = 4;              // a few births in, first few houses up
 const int eraHamletHouses = 3;
 const int eraTownBarbs = 12;               // a well-established village, long after startup
 const int eraTownHouses = 10;
+// R54-F4 The Fourth Age: a Town race with all four of these enters it for good (never demoted, so its houses stay promoted)
+const int eraFourthBarbs = 18;             // living barbs of the race
+const int eraFourthHouses = 14;            // standing houses of the race
+const int eraFourthFood = 60;              // food surplus in the race's stock
+const int eraFourthStone = 30;             // stone surplus in the race's stock
 const int eraCheckIntervalTicks = 60;      // recompute about once per second at 1x
+settlementEra raceEra[raceCount] = {};   // R54-F4: per race (indexed by barbRace); saved in the chronicle (v2)
+// R54-F4: thin muted pennant on a Fourth Age race's crate: a 1px pole rising from the lid's middle, a tapered 3+2px flag.
+// x 5 sits between the raid marker (x 0..2) and the bell marker (x 7..9); the flag rows are above both markers.
+const float eraPennantPoleX = 5.0f;        // offsets from the crate top-left
+const float eraPennantPoleTop = -8.0f;     // pole runs from here down to the lid (y 0)
+const Color eraPennantPoleColor(84, 74, 62);     // dark weathered wood
+const Color eraPennantFlagColor(140, 130, 160);  // muted slate-lilac: clear of the bell gold, raid red and race tints
 
 // Dawn council: each barb casts one ballot at dawn; the winning decree tilts job weights until the next dawn
 enum councilDecree { decreeTimber, decreeStone, decreeBerries, decreeRite, decreeCount, decreeNone = decreeCount };   // R52-F3: Rite
@@ -928,6 +942,14 @@ const Color houseWindowGlowElfColor(52, 80, 36, 255);
 const int houseBodyHumanFirst = 22, houseBodyHumanCount = 4;
 const int houseBodyDwarfFirst = houseBodyHumanFirst + houseBodyHumanCount, houseBodyDwarfCount = 5;
 const int houseBodyElfFirst = houseBodyDwarfFirst + houseBodyDwarfCount, houseBodyElfCount = 6;
+const int houseBodyFourthFirst = houseBodyElfFirst + houseBodyElfCount, houseBodyFourthCount = 7;   // R54-F4
+// R54-F4 Fourth Age townhouse, one style for every race: the same 6x4 ground floor plus a 2px upper storey on a dark
+// beam, under a steep 3-row slate roof. 8x10 overall (others are 8x7 or 8x8), so the tall block reads at a distance.
+const Color houseWallFourthColor(172, 166, 150);    // muted limewash grey: paler and greyer than tan, ashlar or birch
+const Color houseBeamFourthColor(96, 84, 70);       // floor beam between the storeys
+const Color houseRoofFourthColor(82, 88, 100);      // dark slate blue-grey (ramped like the other roofs)
+const Color houseDoorFourthColor(62, 50, 42);
+const float houseFourthUpperTop = -2.0f;            // upper storey rows -2..-1, beam at y 0, ground floor from y 1
 const int houseStyleMaxRows = 4;
 struct houseStyle {
     int rows;
@@ -952,6 +974,10 @@ const houseStyle houseStyles[raceCount] = {
     {4, {1.0f, 0.0f, -1.0f, -2.0f}, {2.0f, 4.0f, 6.0f, 8.0f}, -3.0f, houseRoofElfColor, {0.0f, 0.0f}, {0.0f, 0.0f},
      houseBodyElfFirst, houseBodyElfCount, houseWindowElfPos, houseWindowElfSize, houseWindowNightElfColor, houseWindowGlowElfColor},
 };
+// R54-F4: house.tier 1 (Fourth Age) draws with this instead of the race style; rows end on y -3, over the upper storey
+const houseStyle houseStyleFourth =
+    {3, {1.0f, 0.0f, -2.0f}, {2.0f, 4.0f, 8.0f}, houseFourthUpperTop - 3.0f, houseRoofFourthColor, {0.0f, 0.0f}, {0.0f, 0.0f},
+     houseBodyFourthFirst, houseBodyFourthCount, houseWindowPos, houseWindowSize, houseWindowNightColor, houseWindowGlowColor};
 
 // Shrine stones: build and placement only (no prayer yet). Houses always get first call on stone.
 const int maxShrines = 3;                  // hard cap on standing stones in the village
@@ -1260,12 +1286,20 @@ const partDef buildingParts[] = {
     {houseDoorElfPos, houseDoorElfSize, houseDoorElfColor},
     {houseDoorElfCrownPos, {1.0f, 1.0f}, houseDoorElfColor},
     {houseWindowElfPos, houseWindowElfSize, houseWindowDayColor},
+    // [37..43] R54-F4 Fourth Age townhouse, fixed: ground walls, upper storey, floor beam, two upper windows, door, window
+    {houseWallPos, houseWallSize, houseWallFourthColor},
+    {{houseWallPos.x, houseFourthUpperTop}, {houseWallSize.x, -houseFourthUpperTop}, houseWallFourthColor},
+    {{houseWallPos.x, 0.0f}, {houseWallSize.x, 1.0f}, houseBeamFourthColor},
+    {{0.0f, houseFourthUpperTop + 1.0f}, {1.0f, 1.0f}, houseWindowDayColor},
+    {{3.0f, houseFourthUpperTop + 1.0f}, {1.0f, 1.0f}, houseWindowDayColor},
+    {houseDoorPos, houseDoorSize, houseDoorFourthColor},
+    {houseWindowPos, houseWindowSize, houseWindowDayColor},
 };
 const partRange storeShadowParts{0, 1}, storeBodyParts{1, 4}, storeTrimParts{5, 1};
 const partRange keepShadowParts{6, 1}, keepStoneParts{7, 11}, keepTrimParts{18, 3};
 const partRange houseShadowParts{21, 1};
-static_assert(houseBodyElfFirst + houseBodyElfCount == 37, "house body ranges must end the buildingParts table");
-static_assert(size(buildingParts) == 37, "partRange indices above must match the buildingParts table");
+static_assert(houseBodyFourthFirst + houseBodyFourthCount == 44, "house body ranges must end the buildingParts table");
+static_assert(size(buildingParts) == 44,"partRange indices above must match the buildingParts table");
 // Curtain Wall and Gate (R31-F2): cosmetic only (no collision or pathing). Once a race's keep stands, a ring of
 // wallSlots arc slots centred on the keep gets one 2px-thick stone segment every wallRiseTicks, growing out from both
 // sides of a wallGateSlots-wide gate gap that faces the campfire. A slot whose arc would touch a building, plot, rock,
@@ -2290,7 +2324,9 @@ void drawStumps(RenderWindow& window, const vector<RectangleShape>& stumps, Vert
     if (va.getVertexCount() > 0) window.draw(va);
 }
 
-struct house {int x, y; bool hasFoundation = false; int id = -1; barbRace race = raceHuman;}; // id: stable, from nextHouseId; race: builder's, picks the roof style
+struct house {int x, y; bool hasFoundation = false; int id = -1; barbRace race = raceHuman; int tier = 0;}; // id: stable, from nextHouseId; race: builder's, picks the roof style; tier: R54-F4, 1 = Fourth Age townhouse
+// R54-F4: the one style lookup for a house (drawing, lights, garrison retint, hover outline)
+const houseStyle& houseStyleOf(const house& h) { return h.tier >= 1 ? houseStyleFourth : houseStyles[(h.race >= 0 && h.race < raceCount) ? h.race : 0]; }
 int nextHouseId = 0;   // assigned only in buildhouse(); never reused, so ids survive any swapRemove
 struct shrine {int x, y; int id = -1;};  // x,y = slab top-left; id: stable, from nextShrineId (refer to shrines by id, never index)
 int nextShrineId = 0;  // assigned only in buildshrine(); at most maxShrines are ever standing
@@ -5211,7 +5247,7 @@ void drawHouses(RenderWindow& window, const vector<house>& houses, const vector<
     va.clear();
     for (int i = 0; i < (int)houseshapes.size() && i < (int)houses.size(); i++) {
         auto& hs = houseshapes[i];
-        const houseStyle& st = houseStyles[houses[i].race];
+        const houseStyle& st = houseStyleOf(houses[i]);   // R54-F4: tier picks the townhouse
         Vector2f o = snapPx(hs.getPosition());
         drawParts(va, houseShadowParts, o, Color::White);
         if (st.chimneySize.x > 0.0f) {                  // behind the roof so its base tucks in
@@ -5234,7 +5270,7 @@ void drawHouseLights(RenderWindow& window, const View& worldView, const vector<h
     RectangleShape glow, lamp;
     const Vector2f halo(houseWindowGlowPx, houseWindowGlowPx);
     for (int i = 0; i < (int)houseshapes.size() && i < (int)houses.size(); i++) {
-        const houseStyle& st = houseStyles[clampRace(houses[i].race)];
+        const houseStyle& st = houseStyleOf(houses[i]);   // R54-F4
         Vector2f w = snapPx(houseshapes[i].getPosition()) + st.windowPos;
         glow.setSize(st.windowSize + 2.0f * halo);
         glow.setPosition(w - halo);
@@ -5799,7 +5835,7 @@ void drawHousehold(RenderWindow& window, const View& worldView, const hoverHit& 
             if (houses[i].id != h.homeOfBarb) continue;
             // outline the whole drawn sprite (stepped roof down to the walls), not just the 4x4 logic shape
             Vector2f o = snapPx(houseshapes[i].getPosition());
-            const houseStyle& st = houseStyles[houses[i].race];
+            const houseStyle& st = houseStyleOf(houses[i]);   // R54-F4
             float top = st.top;
             if (st.chimneySize.x > 0.0f) top = min(top, st.chimneyPos.y);
             Vector2f tl(o.x + st.left[st.rows - 1], o.y + top);
@@ -5974,7 +6010,7 @@ struct hudValues {
     bool night, paused, raining;
     const char* trader;      // Away / Arriving / Trading / Leaving
     const char* tradeLine;   // last trade message, "" when expired
-    const char* era;         // settlement rank: Camp / Hamlet / Town
+    const char* era;         // settlement rank: Camp / Hamlet / Town / Fourth Age (R54-F4: the leading race's)
     bool learned[techCount]; // know-how pips (R20-F1)
     int pulse[techCount];    // frames of white pulse left per pip
     int gold;                // R46-F1a: global nuggets
@@ -6016,6 +6052,8 @@ string hudDetailText(const hudValues& v) {
     for (int r = 0; r < raceCount; r++)
         s += string("\n  ") + racePlurals[r] + ": " + to_string(v.stock[r].wood) + " / " + to_string(v.stock[r].stone) + " / " + to_string(v.stock[r].food);
     s += "\n  Campfire wood: " + to_string(v.campfireWood);
+    s += "\nEras:";   // R54-F4: each race's own rank (the strip shows the leading one)
+    for (int r = 0; r < raceCount; r++) s += string("\n  ") + racePlurals[r] + ": " + eraNames[raceEra[r]];
     if (veil.faithSeen) {   // R51-F2: the stock panel's faith tick, in words
         s += currentDecree == decreeRite ? "\nFaith of the Veil (Rite day):" : "\nFaith of the Veil:";   // R52-F3: why the tick is dim
         for (int r = 0; r < raceCount; r++)
@@ -6712,6 +6750,7 @@ bool homesteadSpotOk(const vector<barb>& barbs, const vector<house>& houses, int
 // comes from nextHouseId. Used by buildhouse() and the chronicle restore.
 int addHouse(vector<house>& houses, vector<RectangleShape>& houseshapes, int x, int y, bool foundation, barbRace race) {
     house h{x, y, foundation, nextHouseId++, race};
+    h.tier = race >= 0 && race < raceCount && raceEra[race] >= eraFourth ? 1 : 0;   // R54-F4: a Fourth Age race builds townhouses
     houses.push_back(h);
     RectangleShape hs(Vector2f(4, 4));
     hs.setPosition(Vector2f(h.x, h.y));
@@ -6832,6 +6871,7 @@ struct chronicleData {
     int day = 0, hour = 0;
     raceStock stocks[raceCount];
     float relation[raceCount][raceCount] = {};
+    int era[raceCount] = {};   // R54-F4 (v2): settlementEra per race
     vector<chronicleHouse> houses;
 };
 
@@ -6857,6 +6897,7 @@ bool chronicleSave(const vector<house>& houses) {
     for (int a = 0; ok && a < raceCount; a++)
         for (int b = a + 1; ok && b < raceCount; b++)
             ok = chronPut(f, (int32_t)lround(clamp(raceRelation[a][b], kRelationMin, kRelationMax) * kChronicleRelScale));
+    for (int r = 0; ok && r < raceCount; r++) ok = chronPut(f, (int32_t)raceEra[r]);   // R54-F4 (v2)
     int n = min((int)houses.size(), kChronicleMaxHouses);   // never write a file the loader would reject
     ok = ok && chronPut(f, n);
     for (int i = 0; ok && i < n; i++) {
@@ -6896,7 +6937,8 @@ bool chronicleRead(chronicleData& out, const char*& why) {
     const int offMax = (int)worldSize;
     do {
         if (!chronGet(f, v) || v != kChronicleMagic) { why = "not a chronicle file"; break; }
-        if (!chronGet(f, v) || v != kChronicleVersion) { why = "unknown version"; break; }
+        if (!chronGet(f, v) || (v != kChronicleVersion && v != kChronicleVersionNoEras)) { why = "unknown version"; break; }
+        int version = v;
         if (!chronGet(f, v) || v != raceCount) { why = "race count differs"; break; }
         if (!chronGetIn(f, 0, kChronicleMaxDay, d.day) || !chronGetIn(f, 0, 23, d.hour)) { why = "clock out of range"; break; }
         bool ok = true;
@@ -6911,6 +6953,8 @@ bool chronicleRead(chronicleData& out, const char*& why) {
                 d.relation[a][b] = d.relation[b][a] = q / kChronicleRelScale;
             }
         if (!ok) { why = "relation out of range"; break; }
+        for (int r = 0; ok && r < raceCount && version >= 2; r++) ok = chronGetIn(f, eraCamp, eraCount - 1, d.era[r]);   // R54-F4
+        if (!ok) { why = "era out of range"; break; }
         if (!chronGet(f, v)) { why = "truncated"; break; }
         if (v < 0 || v > kChronicleMaxHouses) { why = "house count over the cap"; break; }
         n = v;
@@ -6965,6 +7009,9 @@ void chronicleRestore(const vector<barb>& barbs, vector<house>& houses, vector<R
         for (int b = 0; b < raceCount; b++) raceRelation[a][b] = a == b ? 0.0f : d.relation[a][b];   // direct: no tier lines on load
     for (auto& row : stockAnnounced) for (auto& s : row) s = false;   // transient: re-armed against the restored stocks
     for (auto& row : relationClashCooldown) for (auto& c : row) c = 0;
+    // R54-F4: eras before the houses, so addHouse() rebuilds a Fourth Age race's houses as townhouses. Written directly:
+    // no promotion lines on load; eraTick() later lowers a pre-Fourth era quietly if the live barbs don't support it.
+    for (int r = 0; r < raceCount; r++) raceEra[r] = (settlementEra)d.era[r];
     int placed = 0, moved = 0, dropped = 0;
     for (auto& ch : d.houses) {
         Vector2f qc = quarterCentre(ch.race);
@@ -7558,6 +7605,14 @@ void drawStorehouses(RenderWindow& window, const storehouse (&stores)[raceCount]
         drawParts(va, storeShadowParts, o, Color::White);
         drawParts(va, storeBodyParts, o, lerpColor(storehouseColors[r], Color::White, t));
         drawParts(va, storeTrimParts, o, Color::White);
+        if (raceEra[r] >= eraFourth) {   // R54-F4: thin muted pennant, static
+            const partDef pennant[3] = {
+                {{eraPennantPoleX, eraPennantPoleTop}, {1.0f, -eraPennantPoleTop}, eraPennantPoleColor},
+                {{eraPennantPoleX + 1.0f, eraPennantPoleTop}, {3.0f, 1.0f}, eraPennantFlagColor},
+                {{eraPennantPoleX + 1.0f, eraPennantPoleTop + 1.0f}, {2.0f, 1.0f}, eraPennantFlagColor},
+            };
+            drawParts(va, pennant, 3, o, Color::White);
+        }
     }
     if (va.getVertexCount() > 0) window.draw(va);
 }
@@ -8410,24 +8465,47 @@ void drawQuarterReachRing(RenderWindow& window, const View& worldView, int r, fl
     window.draw(c);
 }
 
-settlementEra currentEra = eraCamp;
 int eraCheckTimer = 0;
 
-settlementEra computeEra(int barbCount, int houseCount) {
-    if (barbCount >= eraTownBarbs && houseCount >= eraTownHouses) return eraTown;
+// R54-F4: one race's rank from its own barbs, houses and stock. The Fourth Age is only reached from Town.
+settlementEra computeEra(int barbCount, int houseCount, const raceStock& rs, settlementEra prev) {
+    if (prev >= eraFourth) return eraFourth;   // never demoted: the townhouses stay
+    if (barbCount >= eraTownBarbs && houseCount >= eraTownHouses) {
+        if (prev >= eraTown && barbCount >= eraFourthBarbs && houseCount >= eraFourthHouses
+            && rs.food >= eraFourthFood && rs.stone >= eraFourthStone) return eraFourth;
+        return eraTown;
+    }
     if (barbCount >= eraHamletBarbs && houseCount >= eraHamletHouses) return eraHamlet;
     return eraCamp;
 }
 
-// Promotions are announced; a drop (barbs dying) just updates the rank quietly
-void eraTick(const vector<barb>& barbs, const vector<house>& houses) {
+// The highest race rank: the HUD's era text, the prowler cap and the campfire paving gate
+settlementEra leadingEra() {
+    settlementEra e = eraCamp;
+    for (int r = 0; r < raceCount; r++) e = max(e, raceEra[r]);
+    return e;
+}
+
+// Promotions are announced; a drop (barbs dying) just updates the rank quietly. R54-F4: per race. Entering the Fourth
+// Age turns every house of that race into a townhouse in place (tier 1, same index and position; no animation).
+void eraTick(const vector<barb>& barbs, vector<house>& houses) {
     if (++eraCheckTimer < eraCheckIntervalTicks) return;
     eraCheckTimer = 0;
-    settlementEra prev = currentEra;
-    currentEra = computeEra((int)barbs.size(), (int)houses.size());
-    if (currentEra > prev) {
-        printf("SETTLEMENT PROMOTED - %s -> %s (pop %d, houses %d)\n", eraNames[prev], eraNames[currentEra], (int)barbs.size(), (int)houses.size());
-        logEvent(string("The settlement grows into a ") + eraNames[currentEra]);
+    int pop[raceCount] = {}, own[raceCount] = {};
+    for (auto& b : barbs) pop[clampRace(b.race)]++;
+    for (auto& h : houses) own[clampRace(h.race)]++;
+    for (int r = 0; r < raceCount; r++) {
+        settlementEra prev = raceEra[r];
+        raceEra[r] = computeEra(pop[r], own[r], stock[r], prev);
+        if (raceEra[r] <= prev) continue;
+        printf("SETTLEMENT PROMOTED - %s: %s -> %s (pop %d, houses %d, food %d, stone %d)\n", raceDefs[r].name, eraNames[prev],
+               eraNames[raceEra[r]], pop[r], own[r], stock[r].food, stock[r].stone);
+        if (raceEra[r] == eraFourth) {
+            int n = 0;
+            for (auto& h : houses) if (clampRace(h.race) == r && h.tier < 1) { h.tier = 1; n++; }
+            printf("FOURTH AGE - %s: %d houses raised to townhouses\n", raceDefs[r].name, n);
+            logRaceEvent(string("The ") + racePlurals[r] + " enter the Fourth Age - their homes rise as townhouses", r);
+        } else logRaceEvent(string("The ") + racePlurals[r] + " grow into a " + eraNames[raceEra[r]], r);
     }
 }
 
@@ -8488,7 +8566,7 @@ void paveTick(vector<barb>& barbs, vector<RectangleShape>& squares) {
     }
     if (++scanTimer < paveScanTicks) return;
     scanTimer = 0;
-    if (currentEra < eraHamlet || pavedCount >= paveMaxCells) return;
+    if (leadingEra() < eraHamlet || pavedCount >= paveMaxCells) return;   // R54-F4: the shared campfire paves once any race is a Hamlet
     bool anyAfford = false;   // RACE-F1: some race must have the stone; the paver is picked from those races below
     for (int r = 0; r < raceCount; r++) if (canAfford(stock[r], 0, paveStoneCost + houseStoneCost)) anyAfford = true;
     if (!anyAfford) return;
@@ -8616,7 +8694,7 @@ void buildkeeps(vector<barb>& barbs, vector<RectangleShape>& squares, const stor
             int i = findBarbById(barbs, keepBuilderId[r]);
             if (i < 0 || barbs[i].jobKind != jobKeep || barbs[i].race != r) cancelKeep(r);
         }
-        if (!keepQueued[r] && (currentEra < eraTown || !stores[r].built)) continue;
+        if (!keepQueued[r] && (raceEra[r] < eraTown || !stores[r].built)) continue;   // R54-F4: this race's own era
         bool done = buildOneOff(barbs, squares, keepQueued[r], jobKeep, Vector2f((float)kp.x, (float)kp.y) + keepStandOffset, "KEEP",
             [&](const barb& b) {
                 FloatRect z = keepZone(r);
@@ -9211,7 +9289,7 @@ void prowlerTick(vector<prowler>& prowlers, vector<barb>& barbs, const vector<Re
     if (night && !wasNight) spawnedTonight = 0;   // dusk: a fresh night's allowance
     wasNight = night;
 
-    int cap = prowlerCapByEra[min((int)currentEra, 2)];
+    int cap = prowlerCapByEra[min((int)leadingEra(), 2)];   // R54-F4: the leading race; the Fourth Age keeps the Town cap
     if (night && spawnedTonight < cap && uniform_int_distribution<int>(0, prowlerSpawnChance - 1)(gen) == 0) {
         prowler p;
         p.id = nextProwlerId++;
@@ -9983,7 +10061,7 @@ void drawGarrison(RenderWindow& window, const vector<barb>& barbs, const vector<
         int n = 0;
         for (auto& b : barbs) if (barbHidden(b) && b.garrisonHouseId == houses[i].id) n++;
         if (n == 0) continue;
-        const houseStyle& st = houseStyles[clampRace(houses[i].race)];
+        const houseStyle& st = houseStyleOf(houses[i]);   // R54-F4
         Vector2f o = snapPx(houseshapes[i].getPosition());
         r.setFillColor(lerpColor(st.roof, garrisonRoofTint, garrisonRoofTintAmount));
         for (int k = 0; k < st.rows; k++) {   // same rows as drawHouses(), retinted on top
@@ -13719,7 +13797,7 @@ int main() {
                 : activeTrader->phase == trader::Arriving ? "Arriving"
                 : activeTrader->phase == trader::Trading ? "Trading" : "Leaving";
             hv.tradeLine = tradeMsgTimer > 0 ? tradeMsg : "";
-            hv.era = eraNames[currentEra];
+            hv.era = eraNames[leadingEra()];   // R54-F4: the leading race's rank; the tooltip lists each race
             hv.gold = gold;              // R46-F1a
             hv.goldFound = goldFound;
             hv.day = game_day;           // R51-F3
