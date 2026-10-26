@@ -1312,6 +1312,55 @@ const Color dummyHeadColor(206, 182, 118);       // sack head, a little lighter
 const Color dummyPostColor(88, 66, 42);          // dark timber, same as the shaft frame
 const Color drillJabColor(222, 214, 196);        // pale fist/stick pixel toward the dummy
 const Color drillPipColor(132, 30, 36);          // dark red on the off-white body: darker than the health bar brick and the hunt stripe
+// Herb Hut and Summer Patch (R53-F2, cough phase 2a): once the elf crate stands and the elves have kHerbHutMinHouses
+// houses, an elf builds one thatched herb hut above-right of the crate (buildOneOff, jobHerbHut) with a 3x2 herb bed
+// beside it. The plants grow outside winter (fastest in summer), bloom on harvest day (the last day of summer) and brown
+// at the first winter midnight. An idle elf near the hut tends ripe plants (activity actHerb, owned by herbTendTick(),
+// ended through clearTraining() like the drill) into the elves' herb stock (raceHerbs), which slowly spoils in winter
+// (faster in rain). No cure yet (phase 2b). The spot is reserved from the start (forgeClear), like the barracks.
+const int kHerbRace = raceElf;                   // only this race builds a herb hut
+const int kHerbHutMinHouses = 2;                 // own houses before the hut is wanted
+const int herbHutWoodCost = 12;                  // from the elves' own stock, with a house's wood kept back
+const int herbHutBuildTicks = houseBuildTicks;
+const Vector2f herbHutCrateOffset(10.0f, -20.0f); // hut top-left relative to the crate: above-right, past the smokehouse, over the shaft
+const Vector2f herbHutSize(7.0f, 6.0f);          // 3 roof rows (top inset 1px, 3rd an eave) over 3 wall rows
+const float herbHutRoofH = 3.0f;
+const Vector2f herbHutDoorPos(3.0f, 4.0f);       // dark 1x2 door centred on the front, on the ground line
+const Vector2f herbHutDoorSize(1.0f, 2.0f);
+const Vector2f herbHutBundlePos[2] = {{1.0f, 3.0f}, {5.0f, 3.0f}};   // 1px drying bundles hung under the eave
+const Vector2f herbHutStandOffset(2.0f, 8.0f);   // builder hitbox top-left relative to the hut: below the shadow, left of the door
+const Vector2f herbBedOffset(9.0f, 0.0f);        // bed top-left relative to the hut: a 2px grass gap to its right
+const Vector2f herbBedSize(11.0f, 7.0f);         // tilled soil; bottom row a shade darker
+const int kHerbCols = 3, kHerbRows = 2;
+const int kHerbPlants = kHerbCols * kHerbRows;
+const Vector2f herbPlantPitch(4.0f, 3.0f);       // 2x2 plants at (1 + 4c, 1 + 3r) in the bed: 2px soil between them
+const Vector2f herbTendOffset(4.0f, 8.0f);       // tender hitbox top-left relative to the bed: under the middle column
+const Vector2f herbZoneSize(20.0f, 13.0f);       // hut + gap + bed, with both stand spots below (elf height)
+const float herbClearPx = 3.0f;                  // houses, plots, mills, walls and towers keep this far from the zone
+const float herbRoadPadPx = 1.0f;                // quarter roads keep this far from the zone
+const int kHerbRipenTicks = 8 * ticksPerGameHour; // a summer plant ripens from bare in 8 game hours
+const float herbSeasonGrowth[seasonCount] = {0.6f, 1.0f, 0.5f, 0.0f};   // growth rate by season: none in winter
+const int kHerbYield = 1;                        // herbs per ripe plant tended...
+const int kHerbBloomYield = 2;                   // ...or per plant still in bloom from harvest day
+const int kHerbStockMax = 24;                    // stock cap: a well-tended year fills it by autumn
+const int kHerbSpoilTicks = 3 * ticksPerGameHour; // winter: one herb spoils per 3 game hours (16 over a dry winter)...
+const int kHerbRainSpoilMult = 2;                // ...twice as fast in rain, so a wet, poorly stocked winter runs dry
+const float kHerbJoinRadius = 70.0f;             // idle elves within this of the bed may come to tend...
+const int kHerbJoinOneIn = 180;                  // ...each idle tick with chance 1 in this (~3 s at 1x)
+const int kHerbTendTicks = 240;                  // work ticks at the bed (~4 s) to pick every ripe plant
+const Color herbHutWallColor(112, 92, 66);       // pale weathered timber, lighter than the barracks
+const Color herbHutRoofColor(128, 134, 92);      // sage thatch, near the elf hat
+const Color herbHutEaveColor(98, 104, 70);       // eave row, one step darker
+const Color herbHutDoorColor(30, 24, 20);
+const Color herbBundleColor(150, 122, 160);      // dried lavender: dull, so the live flowers stay the bright purple
+const Color herbBedColor(58, 42, 28);            // tilled soil, warm brown on the dark green
+const Color herbBedEdgeColor(42, 30, 20);        // bottom row of the bed
+const Color herbLeafColor(84, 136, 72);          // live leaves: muted green, lighter than the grass
+const Color herbBudColor(150, 168, 122);         // half-grown: one pale bud pixel
+const Color herbFlowerColor(194, 164, 222);      // ripe: light purple, two pixels
+const Color herbBloomColor(228, 204, 246);       // harvest-day bloom: paler and brighter, with a third pixel on top
+const Color herbBrownColor(108, 80, 50);         // winter: browned leaves, no flower
+const Color herbStockColor(196, 168, 222);       // HUD herb count tint (the flower purple, lifted for the text)
 
 // UI red (UIO-F1/F2/F3): one muted brick red for every "starving" mark in the UI (minimap dots, inspect panel, hunger lens)
 const Color uiStarvingRed = healthBarFillColor;
@@ -1852,8 +1901,8 @@ static_assert(weaponTierBonus[0] == 0, "an untiered weapon hits for its base dam
 // Build jobs: which structure a barb's movingbspot/building belongs to. jobNone = no job, or a house (buildhouse()).
 // jobSpear is a craft, not a structure: it uses movingbspot (so no other system grabs the barb) but never building/timer.
 // jobPave (R20-F2) is run by paveTick(): movingbspot while walking, building/timer while laying the cobbles.
-enum buildJob {jobNone, jobShrine, jobSmoke, jobStall, jobForge, jobField, jobSpear, jobPave, jobStore, jobMill, jobKeep, jobShaft, jobCamp, jobBarracks, buildJobCount};
-const int buildJobTicks[buildJobCount] = {houseBuildTicks, shrineBuildTicks, smokehouseBuildTicks, stallBuildTicks, forgeBuildTicks, fieldBuildTicks, spearCraftTicks, paveTicks, storehouseBuildTicks, millBuildTicks, keepBuildTicks, shaftBuildTicks, campBuildTicks, barracksBuildTicks};
+enum buildJob {jobNone, jobShrine, jobSmoke, jobStall, jobForge, jobField, jobSpear, jobPave, jobStore, jobMill, jobKeep, jobShaft, jobCamp, jobBarracks, jobHerbHut, buildJobCount};
+const int buildJobTicks[buildJobCount] = {houseBuildTicks, shrineBuildTicks, smokehouseBuildTicks, stallBuildTicks, forgeBuildTicks, fieldBuildTicks, spearCraftTicks, paveTicks, storehouseBuildTicks, millBuildTicks, keepBuildTicks, shaftBuildTicks, campBuildTicks, barracksBuildTicks, herbHutBuildTicks};
 // Game animals share the deer code (deers/deershape vectors); per-species numbers live in speciesDefs below.
 // Sprite offsets are relative to the logic shape (body = hitbox), written for an animal facing right.
 enum animalSpecies {speciesDeer, speciesRabbit, speciesCount};
@@ -1972,7 +2021,7 @@ const Vector2f barSize(20.0f, 3.0f);        // inner fill area of a progress bar
 const float barFramePx = 1.0f;
 
 // HUD icon table: 8x8 patterns, '.' = empty, 'a'..'d' = the icon's colour key
-enum hudIconId { iconWood, iconStone, iconFood, iconPeople, iconHouse, iconSun, iconMoon, iconSpeed, iconPause, iconRain, iconSeason, iconCount };
+enum hudIconId { iconWood, iconStone, iconFood, iconPeople, iconHouse, iconSun, iconMoon, iconSpeed, iconPause, iconRain, iconSeason, iconHerb, iconCount };
 struct iconDef {
     const char* rows[hudIconGrid];
     Color key[4];
@@ -2011,6 +2060,9 @@ const iconDef hudIcons[iconCount] = {
     // season (R51-F3): a leaf on a diagonal stem; drawn with the season's own key (seasonDefs[].iconKey)
     {{"......aa", "....aaaa", "...aaaba", "..aaabaa", ".aaabaa.", ".aabaa..", ".baa....", "b......."},
      {seasonDefs[seasonSpring].iconKey[0], seasonDefs[seasonSpring].iconKey[1], Color::Transparent, Color::Transparent}},
+    // herb (R53-F2): two lavender sprigs with pale tips on green stems
+    {{"..b.....", ".aba..b.", "..a..aba", "..ac..a.", "...c.ca.", "...cc...", "...c....", "..ccc..."},
+     {Color(176, 140, 206), Color(226, 206, 240), Color(96, 140, 76), Color::Transparent}},
 };
 
 mt19937 gen(random_device{}());
@@ -2250,6 +2302,30 @@ bool barracksClear(const FloatRect& rect) {
     return true;
 }
 
+// R53-F2: one per race slot (only kHerbRace ever builds), at storehousePos + herbHutCrateOffset. The build claim is not
+// stored ("a barb of this race holds jobHerbHut"). tenderId = barb id tending the bed (never an index), -1 = none; set
+// only by startHerbTend(), freed by endActivity() and herbTick()'s per-tick validation. Fixed arrays, no vectors, so
+// nothing to swapRemove. Reset in placeQuarters(). ripe is cached once per tick by herbTick() so the idle-elf join check
+// never scans the bed.
+struct herbPlant {float growth = 0.0f; bool bloom = false;};   // growth 0..1, ripe at 1; bloom = still in harvest-day flower
+struct herbGarden {bool built = false; herbPlant plants[kHerbPlants]; int ripe = 0; int tenderId = -1;
+                   int lastSeason = -1; int bloomDay = -1; int spoilTicks = 0; int storedLineDay = -1; bool bareSaid = false;};
+herbGarden herbGardens[raceCount];
+int raceHerbs[raceCount] = {0, 0, 0};   // R53-F2: herb stock per race (0..kHerbStockMax); phase 2b spends it on cures
+Vector2f herbHutPos(int r) { return storehousePos[r] + herbHutCrateOffset; }
+Vector2f herbBedPos(int r) { return herbHutPos(r) + herbBedOffset; }
+Vector2f herbTendSpot(int r) { return herbBedPos(r) + herbTendOffset; }
+Vector2f herbPlantPos(int r, int k) { return herbBedPos(r) + Vector2f(1.0f + herbPlantPitch.x * (k % kHerbCols), 1.0f + herbPlantPitch.y * (k / kHerbCols)); }
+FloatRect herbZone(int r) { return FloatRect(herbHutPos(r), herbZoneSize); }
+bool herbHutBuilt(int r) { return r >= 0 && r < raceCount && herbGardens[r].built; }
+bool anyHerbHut() { for (int r = 0; r < raceCount; r++) if (herbGardens[r].built) return true; return false; }
+// False if rect comes within herbClearPx of the herb race's zone (reserved from the start, built or not)
+bool herbClear(const FloatRect& rect) {
+    FloatRect z = herbZone(kHerbRace);
+    FloatRect zone(z.position - Vector2f(herbClearPx, herbClearPx), z.size + Vector2f(2 * herbClearPx, 2 * herbClearPx));
+    return !rect.findIntersection(zone).has_value();
+}
+
 // False if r comes within storehouseClearPx of any race's crate or its stand spot (reserved from the start, built or not)
 bool storehouseClear(const FloatRect& r) {
     for (int k = 0; k < raceCount; k++) {
@@ -2348,7 +2424,8 @@ bool forgeClear(const FloatRect& r) {
     FloatRect zone(forgePos - Vector2f(forgeClearPx, forgeClearPx), forgeParts[0].size + Vector2f(2 * forgeClearPx, 2 * forgeClearPx));
     return !r.findIntersection(zone).has_value() && storehouseClear(r) && smokehouseClear(r) && keepClear(r) && towerClear(r)
         && shaftClear(r)   // R34-F1
-        && barracksClear(r);   // R47-F6
+        && barracksClear(r)   // R47-F6
+        && herbClear(r);      // R53-F2
 }
 
 // R30-F1: race quarters
@@ -2474,6 +2551,8 @@ void placeQuarters() {
             towerReservedStone[k] = 0;
             mineShafts[k] = mineShaft{};                                   // R34-F1: unbuilt, full seam
             halls[k] = barracksHall{};                                     // R47-F6: unbuilt, slots free
+            herbGardens[k] = herbGarden{};                                 // R53-F2: unbuilt, bare bed, no tender
+            raceHerbs[k] = 0;
         }
         wallsegs.clear();
     };
@@ -2789,7 +2868,7 @@ enum raidRole { raidNone, raidAttacker, raidDefender };   // R52-F1
 // R53-F4: the one exclusive state a barb is in (work flags like chopping/building stay separate). Set only by
 // beginActivity(), cleared only by endActivity(), which also runs the activity's cleanup.
 enum barbActivity { actNone, actShelter, actExpedition, actRaidAttack, actRaidDefend, actTemper, actSmelt, actDrill, actWatch,
-                    actKneel, activityCount };
+                    actKneel, actHerb, activityCount };   // R53-F2: actHerb = tending the herb bed
 struct activityDef {
     const char* name;
     bool ownsBarb;    // its tick owns the barb outright: every job selector skips it (barbAvailable() false)
@@ -2807,6 +2886,7 @@ const activityDef activityDefs[activityCount] = {
     {"drill",         false, false, true},
     {"watch",         false, false, true},
     {"kneel",         false, false, true},
+    {"tend herbs",    false, false, true},   // R53-F2: any claim outranks tending, like the drill
 };
 
 struct barb {
@@ -2877,6 +2957,7 @@ struct barb {
     barbActivity activity = actNone; // R53-F4: the one exclusive state; written only by beginActivity()/endActivity()
     raceStock loot{0, 0, 0};     // R53-F1: plunder pack carried home; set only by raidTick() on a win, emptied only by settleLoot()
     int lootFrom = -1;           // R53-F1: race the pack was taken from (gets it back on a drop); -1 = no pack
+    int herbTimer = 0;           // R53-F2: work ticks at the herb bed (separate from timer); reset by endActivity()
 };
 // R53-F4: the only writer of barb.activity on the way in. Starting a second activity over a live one is a bug: a debug
 // build aborts; a release build ends the old one (with its cleanup) first so no state is left half-set.
@@ -3109,6 +3190,10 @@ void endActivity(barb& b) {
         case actWatch:       // R51-F1
             b.watchPreyId = -1;
             b.watchCooldown = 0;
+            break;
+        case actHerb:        // R53-F2: free the bed if still held; picked herbs stay picked
+            if (b.race >= 0 && b.race < raceCount && herbGardens[b.race].tenderId == b.id) herbGardens[b.race].tenderId = -1;
+            b.herbTimer = 0;
             break;
         case actKneel:       // R52-F3: nothing else to reset
         case actNone:
@@ -3640,6 +3725,7 @@ const char* barbTaskName(const barb& b) {
     if (b.activity == actDrill) return "drilling";          // R47-F6: no stripe (idle colour); the tooltip names it
     if (b.activity == actWatch) return b.watchPreyId >= 0 ? "on watch: fighting" : "on watch";   // R51-F1: no stripe either, just the torch
     if (b.activity == actKneel) return b.moving ? "going to the Rite" : "kneeling at the Rite";   // R52-F3
+    if (b.activity == actHerb) return b.moving ? "going to the herb patch" : "tending herbs";      // R53-F2: no stripe either
     if (b.chopping && b.target == targetBush) return "picking";
     if (b.chopping && b.target == targetField) return "harvesting";
     if (b.chopping && b.target == targetLake) return "fishing";
@@ -6069,7 +6155,15 @@ FloatRect drawStockPanel(RenderWindow& window, const Font& font, const hudValues
     const int tierBars = toolTierCount - 1;   // R49-F1: tool tier icon column, shown once any race has smelted an ingot
     float tierIconW = tierBars * tierIconBarW + (tierBars - 1) * tierIconBarGap;
     if (toolTierSeen) innerW += stockCellGap + tierIconW;
-    if (veil.faithSeen) innerW += stockCellGap + faithTickW;   // R51-F2: faith tick, last in the row
+    if (veil.faithSeen) innerW += stockCellGap + faithTickW;   // R51-F2: faith tick
+    // R53-F2: herb count (icon + number), last in the row, shown only once a race has a herb hut and only in that row
+    bool herbCol = anyHerbHut();
+    float herbNumW = Text(font, stockMinNumber, stockFontSize).getLocalBounds().size.x;
+    if (herbCol) {
+        for (int r = 0; r < raceCount; r++)
+            if (herbHutBuilt(r)) herbNumW = max(herbNumW, Text(font, to_string(raceHerbs[r]), stockFontSize).getLocalBounds().size.x);
+        innerW += stockCellGap + iconSize + stockIconGap + herbNumW;
+    }
     float barRowH = rowH + larderBarGap + larderBarH;   // R52-F2: each race row carries its 2px larder bar underneath
     Vector2f size(round(innerW + 2 * stockPad.x), round(raceCount * barRowH + (raceCount - 1) * stockRowGap + 2 * stockPad.y));
     Vector2f pos(round(stockMargin), round(hudBarHeight + stockMargin));
@@ -6160,6 +6254,15 @@ FloatRect drawStockPanel(RenderWindow& window, const Font& font, const hudValues
             if (currentDecree == decreeRite) tc.a = (uint8_t)(tc.a * riteFaithTickDim);   // R52-F3: dims all Rite day
             tick.setFillColor(tc);
             window.draw(tick);
+            x += faithTickW;
+        }
+        if (herbCol && herbHutBuilt(r)) {   // R53-F2: sprig icon + herb stock, purple; dim when the race is empty or the store bare
+            x += stockCellGap;
+            drawIcon(window, iconHerb, Vector2f(x, round(y + (rowH - iconSize) / 2.0f)), stockIconPx);
+            Text t(font, to_string(raceHerbs[r]), stockFontSize);
+            t.setFillColor(empty ? stockEmptyRaceColor : raceHerbs[r] <= 0 ? stockShortColor : herbStockColor);
+            t.setPosition(Vector2f(round(x + iconSize + stockIconGap - t.getLocalBounds().position.x), textY));
+            window.draw(t);
         }
     }
     return box;
@@ -6388,6 +6491,11 @@ bool houseSpotOk(const vector<barb>& barbs, const vector<house>& houses, const f
     {   // R47-F6: nor its own race's barracks and drill yard
         FloatRect z = barracksZone(race);
         FloatRect pad(z.position - Vector2f(barracksRoadPadPx, barracksRoadPadPx), z.size + Vector2f(2 * barracksRoadPadPx, 2 * barracksRoadPadPx));
+        if (segmentHitsRect(qc, door, pad)) return false;
+    }
+    if (race == kHerbRace) {   // R53-F2: nor the herb hut and bed
+        FloatRect z = herbZone(race);
+        FloatRect pad(z.position - Vector2f(herbRoadPadPx, herbRoadPadPx), z.size + Vector2f(2 * herbRoadPadPx, 2 * herbRoadPadPx));
         if (segmentHitsRect(qc, door, pad)) return false;
     }
     return true;
@@ -7764,7 +7872,7 @@ void shinobiTick(vector<barb>& barbs, vector<RectangleShape>& squares, const vec
         barb& b = barbs[i];
         if (!b.shinobi) continue;
         if (!barbAvailable(b) || b.moving || b.chopping || b.building || b.movingbspot || b.deertargeting || b.timer > 0 || b.jobKind != jobNone
-            || b.activity == actDrill || b.activity == actWatch || b.activity == actKneel) continue;   // R47-F6: no blinking off the drill slot (R51-F1: or the watch; R52-F3: or the rite)
+            || b.activity == actDrill || b.activity == actWatch || b.activity == actKneel || b.activity == actHerb) continue;   // R47-F6: no blinking off the drill slot (R51-F1: or the watch; R52-F3: or the rite; R53-F2: or the herb bed)
         if (blinkChance(gen) != 0) continue;
         Vector2f from = squares[i].getPosition(), size = squares[i].getSize();
         for (int t = 0; t < shinobiBlinkTries; t++) {
@@ -9492,7 +9600,8 @@ void rankRaceNeed(const vector<barb>& barbs, int r) {
 bool orderIdle(const barb& b) {
     return barbAvailable(b) && !b.chopping && !b.building && !b.movingbspot && !b.deertargeting && b.jobKind == jobNone && b.carryKind == carryNone && !atForgeTask(b)   // R47-F7
         && b.activity != actDrill     // R47-F6: drillers take no orders and join no party (expedition preference deferred)
-        && b.activity != actWatch;    // R51-F1: nor do watchmen (and so they never start a drill)
+        && b.activity != actWatch     // R51-F1: nor do watchmen (and so they never start a drill)
+        && b.activity != actHerb;     // R53-F2: nor do herb tenders (the bed visit is short)
 }
 
 // INBOX-F2b: right after the leader names its need, it hands that need as an individual order to idle members (not
@@ -10496,15 +10605,95 @@ void drillTick(barb& b, RectangleShape& sq) {
     release();
 }
 
+// R53-F2: may this idle, standing barb (top-left pos) come and tend its race's herb bed? Called from barbmove() only,
+// like drillWanted(). Reads the ripe count herbTick() cached this tick, so no barb ever scans the bed. Daylight only.
+bool herbWanted(const barb& b, Vector2f pos) {
+    if (b.activity != actNone || b.moving || b.timer > 0 || b.inMine || b.target != targetNone || b.order != needNone || !orderIdle(b)) return false;
+    if (!herbHutBuilt(b.race) || isNightHour(game_time)) return false;
+    const herbGarden& g = herbGardens[b.race];
+    if (g.tenderId >= 0 || g.ripe <= 0 || raceHerbs[b.race] >= kHerbStockMax) return false;
+    Vector2f d = herbBedPos(b.race) + herbBedSize / 2.0f - pos;
+    return d.x * d.x + d.y * d.y < kHerbJoinRadius * kHerbJoinRadius;
+}
+
+// R53-F2: the only place the tend state is set. The bed is held by barb id from here until endActivity().
+void startHerbTend(barb& b) {
+    herbGardens[b.race].tenderId = b.id;
+    beginActivity(b, actHerb);
+    b.herbTimer = 0;
+    Vector2f spot = herbTendSpot(b.race);
+    b.target = targetNone;
+    b.targetx = (int)spot.x;
+    b.targety = (int)spot.y;
+    b.wanderX = b.wanderY = -1;
+    b.moving = true;
+    b.stepTimer = 0;
+    printf("HERBS TENDING - barb %d (%s), %d ripe\n", b.id, racePlurals[clampRace(b.race)], herbGardens[b.race].ripe);
+}
+
+// R53-F2: one tend step, called from minematerials() for a tending barb: walk to the spot under the bed, work
+// kHerbTendTicks, then pick every ripe plant into the race's herb stock (bloom plants give more) and go back to work.
+void herbTendTick(barb& b, RectangleShape& sq) {
+    auto release = [&]() {
+        b.moving = false; clearRoute(b);
+        b.stepTimer = 0;
+        b.targetx = b.targety = -1;
+    };
+    int r = b.race;
+    if (!herbHutBuilt(r) || herbGardens[r].tenderId != b.id) {
+        printf("HERBS ABORTED - barb %d, bed lost\n", b.id);
+        endActivity(b, actHerb);
+        release();
+        return;
+    }
+    Vector2f spot = herbTendSpot(r);
+    b.targetx = (int)spot.x;
+    b.targety = (int)spot.y;
+    Vector2f diff = spot - sq.getPosition();
+    if (diff.x * diff.x + diff.y * diff.y >= 1.0f) {
+        b.moving = true;
+        walkStep(b, sq);   // R39-F1
+        return;
+    }
+    b.moving = false; clearRoute(b);
+    if (!workTick(b)) return;
+    if (++b.herbTimer < kHerbTendTicks) return;
+    herbGarden& g = herbGardens[r];
+    int gained = 0;
+    for (auto& p : g.plants) {
+        if (p.growth < 1.0f) continue;
+        gained += p.bloom ? kHerbBloomYield : kHerbYield;
+        p.growth = 0.0f;
+        p.bloom = false;
+    }
+    int before = raceHerbs[r];
+    raceHerbs[r] = min(kHerbStockMax, raceHerbs[r] + gained);
+    g.ripe = 0;
+    if (raceHerbs[r] > 0) g.bareSaid = false;
+    printf("HERBS TENDED - barb %d (%s) +%d herbs (stock %d)\n", b.id, racePlurals[r], raceHerbs[r] - before, raceHerbs[r]);
+    // the stock fills quietly through summer; from autumn one line a day says it is being laid by
+    if (raceHerbs[r] > before && seasonOf(game_day) == seasonAutumn && g.storedLineDay != game_day) {
+        g.storedLineDay = game_day;
+        logRaceEvent(to_string(raceHerbs[r]) + " herbs stored for winter", r);
+    }
+    endActivity(b, actHerb);
+    release();
+}
+
 void barbmove(vector<RectangleShape>& squares, vector<barb>& barbs) {
     static uniform_int_distribution<int> drillJoin(0, kDrillJoinOneIn - 1);   // R47-F6
+    static uniform_int_distribution<int> herbJoin(0, kHerbJoinOneIn - 1);     // R53-F2
     for (int i = 0; i < (int)squares.size(); i++) {
         auto& sq = squares[i];
         auto& b  = barbs[i];
         if (!barbAvailable(b) || b.chopping || b.timer > 0 || b.movingbspot || b.building || b.carryKind != carryNone || atForgeTask(b)) continue;   // R29-F1: haulTick() walks haulers; INBOX-F1: bellTick() walks garrisoned; R41-F2: temperTick() walks temperers (R47-F7: smeltTick() smelters); R45-F2: expeditionTick() walks parties
-        if (b.activity == actDrill || b.activity == actWatch || b.activity == actKneel) continue;   // R47-F6: drillTick() walks drillers; R51-F1: watchTick() walks watchmen; R52-F3: riteTick() kneelers
+        if (b.activity == actDrill || b.activity == actWatch || b.activity == actKneel || b.activity == actHerb) continue;   // R47-F6: drillTick() walks drillers; R51-F1: watchTick() walks watchmen; R52-F3: riteTick() kneelers; R53-F2: herbTendTick() tenders
         Vector2f pos = sq.getPosition();
         if (!b.moving) {
+            if (herbWanted(b, pos) && herbJoin(gen) == 0) {   // R53-F2: an idle elf near ripe herbs tends them (before the drill: it fills a stock)
+                startHerbTend(b);
+                continue;
+            }
             if (drillWanted(b, pos) && drillJoin(gen) == 0) {   // R47-F6: an idle barb near its barracks may drill instead
                 startTraining(b, freeDrillSlot(b.race));
                 continue;
@@ -10546,7 +10735,7 @@ void buildWorkClaims(const vector<barb>& barbs, const vector<CircleShape>& tris,
     for (int j = 0; j < (int)barbs.size(); j++) {
         const barb& b = barbs[j];
         if (!barbAvailable(b) || b.targetx == -1 || b.target == targetBush || b.target == targetLake || b.target == targetField || b.target == targetDepot || b.deertargeting || b.movingbspot || b.building
-            || b.activity == actDrill || b.activity == actWatch || b.activity == actKneel) continue;   // R47-F6: a drill slot is not a tree spot (R51-F1: nor a patrol stop; R52-F3: nor a kneel slot)
+            || b.activity == actDrill || b.activity == actWatch || b.activity == actKneel || b.activity == actHerb) continue;   // R47-F6: a drill slot is not a tree spot (R51-F1: nor a patrol stop; R52-F3: nor a kneel slot; R53-F2: nor the herb bed)
         (b.target == targetRock ? rockSpots : treeSpots).emplace(workSpotKey(b.targetx, b.targety), j); // first claimant kept
     }
     treeClaim.assign(tris.size(), -1);
@@ -10976,6 +11165,13 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
                 printf("KNEEL INTERRUPTED - barb %d\n", b.id);
                 clearKneel(b);
             } else continue;   // riteTick() walks the kneeler to its slot; no work search while kneeling
+        }
+        if (b.activity == actHerb) {   // R53-F2: backstop: tending is exclusive with work, builds, timers, hunts and hauls
+            if (b.movingbspot || b.building || b.deertargeting || b.chopping || b.timer > 0 || b.jobKind != jobNone
+                || b.carryKind != carryNone || atForgeTask(b) || b.target != targetNone || b.inMine) {
+                printf("HERBS INTERRUPTED - barb %d\n", b.id);
+                endActivity(b, actHerb);
+            } else { herbTendTick(b, sq); continue; }   // no work search at the bed: the visit is short
         }
         if (b.carryKind != carryNone) {   // R29-F1: any other state taken over the haul drops the load
             if (b.target != targetDepot || b.movingbspot || b.building || b.deertargeting || b.chopping || b.jobKind != jobNone) dropCarry(b);
@@ -11922,6 +12118,129 @@ void drawBarracks(RenderWindow& window) {
     }
 }
 
+// R53-F2: runs after buildbarracks(). Once the herb race's crate stands and it has kHerbHutMinHouses houses, a barb of
+// that race builds the herb hut at its fixed spot through buildOneOff (jobHerbHut), paid at claim with a house's wood
+// kept back. The claim is not stored ("a barb of this race holds jobHerbHut"), so a lost builder frees it through
+// releaseBarbWork(). The bed is sown with the hut, its plants part-grown (bare in winter).
+void buildherbhut(vector<barb>& barbs, vector<RectangleShape>& squares, const vector<house>& houses,
+                  const storehouse (&stores)[raceCount], const vector<CircleShape>& bushshapes) {
+    int r = kHerbRace;
+    herbGarden& g = herbGardens[r];
+    if (g.built || !stores[r].built) return;
+    bool claimed = false;
+    for (auto& b : barbs) if (b.jobKind == jobHerbHut && b.race == r) claimed = true;
+    bool done = buildOneOff(barbs, squares, claimed, jobHerbHut, herbHutPos(r) + herbHutStandOffset, "HERB HUT",
+        [&](const barb&) {
+            int raceHouses = 0;
+            for (auto& h : houses) if (h.race == r) raceHouses++;
+            if (raceHouses < kHerbHutMinHouses) return -1;
+            FloatRect z = herbZone(r);
+            if (!lakeClear(z)) return -1;   // fixed spot: a lake or bush on it means no herb hut
+            for (auto& bs : bushshapes) if (z.findIntersection(bs.getGlobalBounds())) return -1;
+            if (!canAfford(stock[r], herbHutWoodCost + houseWoodCost, 0)) return -1;
+            spend(stock[r], herbHutWoodCost, 0);
+            return 1;
+        }, r);
+    if (!done) return;
+    g = herbGarden{};
+    g.built = true;
+    g.lastSeason = seasonOf(game_day);
+    uniform_real_distribution<float> seedGrowth(0.0f, 0.6f);
+    for (auto& p : g.plants) p.growth = isWinter() ? 0.0f : seedGrowth(gen);
+    printf("---HERB HUT BUILT--- %s (%d wood), %d plants sown\n", raceDefs[r].name, herbHutWoodCost, kHerbPlants);
+    logRaceEvent(string(racePlurals[r]) + " raise a herb hut and sow a herb patch", r);
+}
+
+// R53-F2: once per tick. Validates each bed's tender by id, turns the seasons (browns the bed at the first winter
+// midnight with a "stored for winter" line, greens it in spring), grows the plants, makes harvest day (the last day of
+// summer, from dawn) a full bloom, caches the ripe count for herbWanted(), and spoils the stock slowly in winter.
+// kHerbPlants per built bed: no barb loop beyond one id lookup.
+void herbTick(const vector<barb>& barbs) {
+    int s = seasonOf(game_day);
+    bool harvestDay = s == seasonSummer && dayInSeason(game_day) == daysPerSeason - 1 && game_time >= nightEndHour;
+    for (int r = 0; r < raceCount; r++) {
+        herbGarden& g = herbGardens[r];
+        if (!g.built) continue;
+        if (g.tenderId >= 0) {
+            int j = findBarbById(barbs, g.tenderId);
+            if (j < 0 || barbs[j].activity != actHerb || barbs[j].race != r) {
+                printf("HERB BED FREED - %s, barb %d\n", racePlurals[r], g.tenderId);
+                g.tenderId = -1;
+            }
+        }
+        if (s != g.lastSeason) {
+            if (s == seasonWinter) {
+                for (auto& p : g.plants) p = herbPlant{};
+                printf("HERBS BROWNED - %s, stock %d\n", racePlurals[r], raceHerbs[r]);
+                logRaceEvent(raceHerbs[r] > 0 ? "Frost browns the herb patch - " + to_string(raceHerbs[r]) + " herbs stored for winter"
+                                              : "Frost browns the herb patch - no herbs stored for winter", r);
+            } else if (g.lastSeason == seasonWinter) logRaceEvent(string(racePlurals[r]) + "' herb patch greens again", r);
+            g.lastSeason = s;
+            g.spoilTicks = 0;
+        }
+        if (harvestDay && g.bloomDay != game_day) {
+            g.bloomDay = game_day;
+            for (auto& p : g.plants) { p.growth = 1.0f; p.bloom = true; }
+            printf("HERBS BLOOM - %s harvest day\n", racePlurals[r]);
+            logRaceEvent("Harvest day: the " + string(racePlurals[r]) + "' herb patch is in bloom", r);
+        }
+        float grow = herbSeasonGrowth[s] / kHerbRipenTicks;
+        g.ripe = 0;
+        for (auto& p : g.plants) {
+            if (p.bloom && g.bloomDay != game_day) p.bloom = false;   // the bloom lasts the day; the plant stays ripe
+            p.growth = min(1.0f, p.growth + grow);
+            if (p.growth >= 1.0f) g.ripe++;
+        }
+        if (s != seasonWinter || raceHerbs[r] <= 0) continue;
+        g.spoilTicks += raining ? kHerbRainSpoilMult : 1;
+        if (g.spoilTicks < kHerbSpoilTicks) continue;
+        g.spoilTicks = 0;
+        raceHerbs[r]--;
+        printf("HERB SPOILED - %s stock %d\n", racePlurals[r], raceHerbs[r]);
+        if (raceHerbs[r] == 0 && !g.bareSaid) {
+            g.bareSaid = true;
+            logRaceEvent(string(racePlurals[r]) + "' herb store is bare", r);
+        }
+    }
+}
+
+// R53-F2: thatched hut (inset sage roof row, full roof row, darker eave, timber walls, 1x2 door, two dried bundles under
+// the eave) with a 1px ground shadow, and the bed beside it: tilled soil, darker bottom row, six 2x2 plants (leaf row
+// under a flower row): bare leaves, a pale bud from half-grown, two light-purple pixels when ripe, a brighter bloom with
+// a third pixel above on harvest day, and browned leaves in winter. One vertex array; world layer under barbs and trees.
+void drawHerbHut(RenderWindow& window) {
+    static VertexArray va(PrimitiveType::Triangles);
+    va.clear();
+    bool winter = isWinter();
+    for (int r = 0; r < raceCount; r++) {
+        const herbGarden& g = herbGardens[r];
+        if (!g.built) continue;
+        Vector2f o = snapPx(herbHutPos(r));
+        pushQuad(va, o + Vector2f(1.0f, herbHutSize.y), Vector2f(herbHutSize.x, 1.0f), buildingShadowColor);
+        pushQuad(va, o + Vector2f(0.0f, herbHutRoofH), Vector2f(herbHutSize.x, herbHutSize.y - herbHutRoofH), herbHutWallColor);
+        pushQuad(va, o + Vector2f(1.0f, 0.0f), Vector2f(herbHutSize.x - 2.0f, 1.0f), herbHutRoofColor);
+        pushQuad(va, o + Vector2f(0.0f, 1.0f), Vector2f(herbHutSize.x, herbHutRoofH - 2.0f), herbHutRoofColor);
+        pushQuad(va, o + Vector2f(0.0f, herbHutRoofH - 1.0f), Vector2f(herbHutSize.x, 1.0f), herbHutEaveColor);
+        pushQuad(va, o + herbHutDoorPos, herbHutDoorSize, herbHutDoorColor);
+        for (auto& w : herbHutBundlePos) pushQuad(va, o + w, Vector2f(1.0f, 1.0f), herbBundleColor);
+        Vector2f bed = snapPx(herbBedPos(r));
+        pushQuad(va, bed, Vector2f(herbBedSize.x, herbBedSize.y - 1.0f), herbBedColor);
+        pushQuad(va, bed + Vector2f(0.0f, herbBedSize.y - 1.0f), Vector2f(herbBedSize.x, 1.0f), herbBedEdgeColor);
+        for (int k = 0; k < kHerbPlants; k++) {
+            Vector2f p = snapPx(herbPlantPos(r, k));
+            const herbPlant& hp = g.plants[k];
+            if (winter) { pushQuad(va, p + Vector2f(0.0f, 1.0f), Vector2f(2.0f, 1.0f), herbBrownColor); continue; }
+            pushQuad(va, p + Vector2f(0.0f, 1.0f), Vector2f(2.0f, 1.0f), herbLeafColor);
+            if (hp.growth >= 1.0f) {
+                Color c = hp.bloom ? herbBloomColor : herbFlowerColor;
+                pushQuad(va, p, Vector2f(2.0f, 1.0f), c);
+                if (hp.bloom) pushQuad(va, p + Vector2f(0.0f, -1.0f), Vector2f(1.0f, 1.0f), c);
+            } else if (hp.growth >= 0.5f) pushQuad(va, p, Vector2f(1.0f, 1.0f), herbBudColor);
+        }
+    }
+    if (va.getVertexCount() > 0) window.draw(va);
+}
+
 // R45-F1b: pale stones, one vertex array: body, 1px weathered cap (broken stones: a 4px stub, the corner knocked off),
 // 1px shaded right column, moss at the foot of every other stone. Drawn with the buildings, under barbs and trees.
 void drawRuins(RenderWindow& window) {
@@ -12346,6 +12665,7 @@ int main() {
                 buildmills(barbs, squares, fields);   // FARM-F2
                 buildkeeps(barbs, squares, stores);   // R31-F1: Town era
                 buildbarracks(barbs, squares, stores, bushshapes);   // R47-F6: once the keep stands; drill slot upkeep
+                buildherbhut(barbs, squares, houses, stores, bushshapes);   // R53-F2: elf herb hut and bed
                 wallTick(barbs, trees, tris, stumps, octs, bushshapes, houseshapes, shrines, fields);   // R31-F2: cosmetic curtain walls
                 towerTick(barbs, squares);   // R33-F2: gatehouse towers, after the wall completes
                 causewayTick();   // R33-F3: keep -> crate stone road
@@ -12384,6 +12704,7 @@ int main() {
                 trailTick();
                 birdTick(birds, birdHeading, squares, barbs);
                 bushTick(bushes, bushshapes);
+                herbTick(barbs);   // R53-F2: seasons, growth, harvest-day bloom, ripe cache and winter spoilage
                 leanSeasonTick(barbs, bushes, bushshapes);   // R52-F2: first-frost shrivel + cached larder bars
                 fieldTick(fields);
                 campfireTick(fire);
@@ -12467,6 +12788,7 @@ int main() {
 	drawStorehouses(window, stores);
 	drawMineShafts(window, barbs, squares);   // R34-F1: beside the crates, under barbs
 	drawBarracks(window);   // R47-F6: hall + straw dummy, left of the crates, under barbs
+	drawHerbHut(window);    // R53-F2: herb hut + bed, above-right of the elf crate, under barbs
 	drawGarrison(window, barbs, houses, houseshapes, stores);   // INBOX-F1: bell marker, sheltering roof tint + pips
 	drawRaidMarker(window, frameCount);   // R52-F1: pulsing red marker on the raided crate, opposite corner to the bell
 	for (auto& st : stores) if (st.flashFrames > 0 && !paused) st.flashFrames--;
