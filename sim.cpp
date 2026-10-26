@@ -4,6 +4,7 @@
 #include <random>
 #include <vector>
 #include <cstdio>
+#include <cstdlib>
 #include <optional>
 #include <deque>
 #include <string>
@@ -474,7 +475,7 @@ const Color faithTickLowColor(92, 100, 104);      // dim slate: just visible on 
 const Color faithTickHighColor(214, 226, 232);    // pale silver at faith 1 (the mote colour, a little lifted)
 // R52-F3 The Rite Decree, phase 1: a barb of a high-faith race with a shrine may vote Rite at the dawn council. On a Rite
 // day, from dusk to riteEndHour, idle barbs walk to a slot on a ring round their race's shrine (veil.faithShrineId, found
-// by id every tick) and kneel there (barb.kneeling, the one flag). Any task assignment, removeBarb and dawn clear it.
+// by id every tick) and kneel there (activity actKneel). Any task assignment, removeBarb and dawn clear it.
 // The rite's end logs one ticker line with the kneelers counted and leaves a stub omen per race (no roll in phase 1).
 const float riteBallotLean = 1.4f;                // ballot score x faith, only for a high-faith race with a shrine:
                                                   // beats the race lean (1.0) from faith ~0.72 up; a full need (1.5) still wins
@@ -486,6 +487,16 @@ const Color riteRingColor(214, 192, 118, 70);     // shrine-cap gold, faint; und
 const float riteFaithTickDim = 0.45f;             // HUD faith tick alpha on a Rite day (the faith is "spent" at the shrine)
 const int riteOmenDays = 2;                       // a stub omen lasts this many game days after its rite
 const Color riteTickerTint(214, 200, 150);        // rite-end ticker line: pale shrine gold, readable on the black strip
+// R53-F4 Activity Enum: the exclusive owned states (shelter, expedition, raid, forge tasks, drill, watch, kneel) are one
+// barb.activity, changed only by beginActivity()/endActivity(). Build with -DSIM_DEBUG for the debug checks: starting a
+// second activity over a live one aborts, and kDebugActivityKey toggles the activity name in the hover tooltip (off at start).
+#ifdef SIM_DEBUG
+const bool kDebugBuild = true;
+#else
+const bool kDebugBuild = false;
+#endif
+const Keyboard::Key kDebugActivityKey = Keyboard::Key::F9;
+bool debugActivityTip = false;   // toggled by kDebugActivityKey in a debug build only; never on in a release build
 
 const int eventMaxLines = 5;              // ticker shows (and stores) at most this many events
 const int eventFadeTicks = 300;           // frames an event stays on screen (~5s at 60fps)
@@ -618,7 +629,7 @@ const Color prowlerEyeColor(235, 50, 45);   // two 1px red eyes, drawn after the
 const Color prowlerSafeRingColor(235, 165, 85, 60);  // faint warm 1px ring marking the safe zone at night (fire lit)
 const Color prowlerEventColor(185, 160, 225);        // ticker tint for the first prowler of a night
 // R51-F1 The Night Watch, phase 1: at night, armed and drilled barbs (a weapon and kDrillPipCount drills) take the watch
-// (barb.watching, owned by watchTick(), cleared only by clearWatch()) and walk a ring of watchRingPx round their race's
+// (activity actWatch, owned by watchTick(), cleared only by clearWatch()) and walk a ring of watchRingPx round their race's
 // crate with a 1px torch. A prowler within watchEngagePx (coarse squared distance, watchmen only) is chased and struck
 // with the barb's weapon; at 0 hp it dissolves through the shared dissolveProwler() fade. Hp-bar polish and bite-back
 // tuning are follow-ups.
@@ -1246,7 +1257,7 @@ const float kShaftFlashMix = 0.55f;              // peak blend of the lintel tow
 const Color kShaftFlashColor(222, 198, 150);     // pale sandy highlight
 // Barracks and Drill Yard (R47-F6, phase 1): once a race's keep stands, a barb of that race builds one 10x8 grey-roofed
 // hall left of its crate (buildOneOff, jobBarracks) with a straw dummy in front. Idle barbs of that race nearby walk to
-// one of kDrillSlots slots beside the dummy and drill (barb.training, owned by drillTick(), cleared only by
+// one of kDrillSlots slots beside the dummy and drill (activity actDrill, owned by drillTick(), cleared only by
 // clearTraining()); every hit adds to the barb's drill counter and shakes the dummy. No combat bonus or expedition
 // preference yet. The spot is reserved from the start (forgeClear), like the shaft.
 const int barracksWoodCost = 16;                 // from the race's own stock, with a house's wood and stone kept back
@@ -2760,6 +2771,29 @@ struct barbRoute {
 
 enum raidRole { raidNone, raidAttacker, raidDefender };   // R52-F1
 
+// R53-F4: the one exclusive state a barb is in (work flags like chopping/building stay separate). Set only by
+// beginActivity(), cleared only by endActivity(), which also runs the activity's cleanup.
+enum barbActivity { actNone, actShelter, actExpedition, actRaidAttack, actRaidDefend, actTemper, actSmelt, actDrill, actWatch,
+                    actKneel, activityCount };
+struct activityDef {
+    const char* name;
+    bool ownsBarb;    // its tick owns the barb outright: every job selector skips it (barbAvailable() false)
+    bool atForge;     // walked and worked at the forge (atForgeTask())
+    bool yieldsToClaim; // any task claim ends it (clearTraining())
+};
+const activityDef activityDefs[activityCount] = {
+    {"none",          false, false, false},
+    {"shelter",       true,  false, false},
+    {"expedition",    true,  false, false},
+    {"raid (attack)", true,  false, false},
+    {"raid (defend)", true,  false, false},
+    {"temper",        false, true,  false},
+    {"smelt",         false, true,  false},
+    {"drill",         false, false, true},
+    {"watch",         false, false, true},
+    {"kneel",         false, false, true},
+};
+
 struct barb {
     int id = -1;              // stable, unique; assigned only by makeBarb()
     int x, y;
@@ -2796,7 +2830,6 @@ struct barb {
     int carryAmount = 1;         // R34-F1: units in the load (kShaftYield stone from a shaft); back to 1 whenever carryKind clears
     int health = barbMaxHealth;  // R30-F5: 0 = dies at the end of the tick (removeBarb)
     int starveTicks = 0;         // R30-F5: ticks spent hungry since the last meal; starving past starveGraceTicks
-    bool garrisoned = false;     // INBOX-F1: exclusive state owned by bellTick(); every other per-tick loop skips the barb
     bool garrisonInside = false; // INBOX-F1: reached the doorstep and hidden inside (not drawn, not pickable)
     int garrisonHouseId = -1;    // INBOX-F1: house.id (stable, never an index); validated every tick
     workMem mem[memSpotCount];   // INBOX-F2: recent work spots, [0] newest; reset in makeBarb(), moves with the struct on swapRemove
@@ -2806,74 +2839,71 @@ struct barb {
     int orderTicks = 0;          // INBOX-F2b: ticks until the order expires; reset in makeBarb()
     barbRoute route;             // R39-F1: moves with the struct on swapRemove; reset only through clearRoute()
     bool inMine = false;         // R40-F1: down its race's shaft (not drawn); set at the stand spot, cleared only by leaveMine()
-    bool tempering = false;      // R41-F2: exclusive temper state owned by temperTick(); never set with chopping/building; cleared by clearTemper()
     int temperTimer = 0;         // R41-F2: work ticks at the forge; separate from timer; cleared by clearTemper()
     bool temperPaid = false;     // R41-F2: kTemperStoneCost already taken; refunded by clearTemper() unless the temper finished
     int toolCharges = 0;         // R41-F2: tempered rock mines left; set on a finished temper, reset by clearTemper() and makeBarb()
-    bool onExpedition = false;   // R45-F2: the one expedition flag; exclusive state owned by expeditionTick(), set/cleared only there
-    bool smelting = false;       // R47-F7: exclusive smelt state owned by smeltTick(); never set with chopping/building/tempering; cleared by clearSmelt()
     int smeltTimer = 0;          // R47-F7: work ticks at the forge; separate from timer; cleared by clearSmelt()
     bool smeltPaid = false;      // R47-F7: kSmeltStoneCost already taken; refunded by clearSmelt() unless the smelt finished
     int jobTier = 0;             // R47-F7: tool tier read once when the current chop/mine started (toolTierOf); scales chopTicks/mineTicks
-    bool training = false;       // R47-F6: exclusive drill state owned by drillTick(); set only by startTraining(), cleared only by clearTraining()
     int drillSlot = -1;          // R47-F6: slot index in its race's halls[].slotId while training; -1 otherwise
     int drillTimer = 0;          // R47-F6: work ticks since the last hit (separate from timer); reset by clearTraining()
     int drillHits = 0;           // R47-F6: hits this session; reset by clearTraining()
     int drillCount = 0;          // R47-F6: the drill counter, hits over the barb's life; reset only in makeBarb()
-    bool watching = false;       // R51-F1: exclusive night-watch state owned by watchTick(); set only by startWatch(), cleared only by clearWatch()
     int watchStop = 0;           // R51-F1: patrol waypoint index round the ring
     int watchPreyId = -1;        // R51-F1: prowler.id being fought (stable id, re-resolved every tick); -1 = patrolling
     int watchCooldown = 0;       // R51-F1: ticks until the next strike
-    raidRole raidSide = raidNone; // R52-F1: exclusive raid state owned by raidTick(); set only by joinRaid(), cleared only by clearRaid()
     int raidPreyId = -1;         // R52-F1: barb.id of the foe being fought (re-resolved every tick); -1 = none
     int raidCooldown = 0;        // R52-F1: ticks until the next strike
     bool raidBeaten = false;     // R52-F1: knocked down to kRaidHealthFloor; out of the fight
     int raidFlash = 0;           // R52-F1: hit flash, drawn frames left (counted down in main after drawBarbs())
-    bool kneeling = false;       // R52-F3: the one Rite flag, owned by riteTick() (set only by startKneel(), cleared only by clearKneel()); never recruited for a raid
     int sick = 0;                // R52-F4: ticks of cough left (0 = well); set only by catchCough(), cleared by clearSick()
     int sickImmune = 0;          // R52-F4: ticks of immunity left after a recovery
     int cure = 0;                // R52-F4: reserved for phase 2 (herb hut remedy); unused in phase 1
+    barbActivity activity = actNone; // R53-F4: the one exclusive state; written only by beginActivity()/endActivity()
 };
+// R53-F4: the only writer of barb.activity on the way in. Starting a second activity over a live one is a bug: a debug
+// build aborts; a release build ends the old one (with its cleanup) first so no state is left half-set.
+void endActivity(barb& b);
+void beginActivity(barb& b, barbActivity a) {
+    if (b.activity == a) return;
+    if (b.activity != actNone) {
+        fprintf(stderr, "ACTIVITY CLASH - barb %d: %s started over %s\n", b.id, activityDefs[a].name, activityDefs[b.activity].name);
+        if (kDebugBuild) abort();
+        endActivity(b);
+    }
+    b.activity = a;
+}
 // R39-F1: the one route reset, called wherever moving/movingbspot is cleared and before a barb is swapRemoved
 void clearRoute(barb& b) {
     b.route.len = b.route.idx = 0;
     b.route.goalX = b.route.goalY = -1;
     b.route.planned = false;
 }
-bool barbHidden(const barb& b) { return b.garrisoned && b.garrisonInside; }   // INBOX-F1
-// R45-F2: the one eligibility gate every job selector checks: false while bellTick() (garrison) or expeditionTick() owns the barb
-bool barbAvailable(const barb& b) { return !b.garrisoned && !b.onExpedition && b.raidSide == raidNone; }   // R52-F1: or raidTick()
+bool barbHidden(const barb& b) { return b.activity == actShelter && b.garrisonInside; }   // INBOX-F1
+// R45-F2: the one eligibility gate every job selector checks: false while bellTick() (garrison), expeditionTick() or
+// raidTick() owns the barb (R53-F4: one table check, activityDef::ownsBarb)
+bool barbAvailable(const barb& b) { return !activityDefs[b.activity].ownsBarb; }
 // R47-F7: busy at the forge (temperTick() or smeltTick() walks and works the barb); wander, hunts and orders skip it
-bool atForgeTask(const barb& b) { return b.tempering || b.smelting; }
+bool atForgeTask(const barb& b) { return activityDefs[b.activity].atForge; }
 
 // R51-F1: the one way out of the watch state. Leaves movement alone, like clearTraining(); watchTick() stops the walk
 // on its own exits. Called from clearTraining() (so every claim path, the bell and removeBarb() end a watch too).
-void clearWatch(barb& b) {
-    b.watching = false;
-    b.watchPreyId = -1;
-    b.watchCooldown = 0;
-}
+// R53-F4: endActivity(b, a) ends a only if it is the live one; the cleanup lives in endActivity()
+void endActivity(barb& b, barbActivity a);
+void clearWatch(barb& b) { endActivity(b, actWatch); }
 
 // R52-F3: the one way out of kneeling. Leaves movement alone like clearWatch(), so a task assigned right after keeps
 // its walk; riteTick() stops the walk on its own exits. Called from clearTraining(), so every claim path, the bell,
 // expeditions and removeBarb() (via releaseBarbWork()) end a kneel too.
-void clearKneel(barb& b) {
-    b.kneeling = false;
-}
+void clearKneel(barb& b) { endActivity(b, actKneel); }
 
 // R47-F6: the one way out of the drill state (session done, interrupted, reassigned, barracks gone, sheltering, death).
 // Frees the barb's slot if it still holds it and leaves the drill counter alone. Like clearSmelt() it leaves movement
 // alone, so a new assignment made right after is not undone (drillTick() clears movement on its own exits). Safe on a
 // barb that isn't training; every claim path that sets moving/chopping/building/timer on an idle barb calls it first.
+// R51-F1/R52-F3: a claim that outranks the drill outranks the watch and the kneel too (R53-F4: activityDef::yieldsToClaim)
 void clearTraining(barb& b) {
-    if (b.race >= 0 && b.race < raceCount && b.drillSlot >= 0 && b.drillSlot < kDrillSlots && halls[b.race].slotId[b.drillSlot] == b.id)
-        halls[b.race].slotId[b.drillSlot] = -1;
-    b.training = false;
-    b.drillSlot = -1;
-    b.drillTimer = 0;
-    b.drillHits = 0;
-    clearWatch(b);   // R51-F1: a claim that outranks the drill outranks the watch
-    clearKneel(b);   // R52-F3: and any task assignment ends a kneel
+    if (activityDefs[b.activity].yieldsToClaim) endActivity(b);
 }
 
 // R45-F2: the one party. Members are held by barb id (never an index) and re-resolved by expeditionTick() every tick;
@@ -2903,7 +2933,7 @@ int hollowLootLeft = hollowLootCap;
 int hollowFlash = 0;                      // lintel flash ticks left, counted down by expeditionTick()
 bool hollowOpen() { return hollowPlaced && hollowLootLeft > 0; }
 // Below right now: hidden (drawn, hovered and picked like a miner down a shaft)
-bool barbInHollow(const barb& b) { return b.onExpedition && party.active && party.hollow && party.phase == expeditionParty::Delve; }
+bool barbInHollow(const barb& b) { return b.activity == actExpedition && party.active && party.hollow && party.phase == expeditionParty::Delve; }
 RectangleShape hollowShape() {   // the mouth's footprint, for picking and the select ring of a member below
     RectangleShape s(hollowSize);
     s.setPosition(hollowPos);
@@ -2918,7 +2948,7 @@ int lootCarrierId() {
 int raceRelics[raceCount] = {0, 0, 0};   // relics each race has brought home, capped at expRelicCap
 int expeditionCooldown = expFirstDelayTicks;
 void expeditionMemberLost(const barb& b) {
-    if (!party.active || !b.onExpedition) return;
+    if (!party.active || b.activity != actExpedition) return;
     for (auto& id : party.memberIds) if (id == b.id) { id = -1; party.lostName = b.name; }
 }
 // R45-F2: the relic carrier on the walk home, for drawBarbs(); -1 = nobody
@@ -2948,11 +2978,9 @@ int raidPairCooldown[raceCount][raceCount] = {
 static_assert(raceCount == 3, "raidPairCooldown initialiser is written for three races");
 
 // R52-F1: the one way out of the raid state, on every exit (outcome, abort, beaten defender, removeBarb, backstop)
+bool inRaid(const barb& b) { return b.activity == actRaidAttack || b.activity == actRaidDefend; }   // R53-F4
 void clearRaid(barb& b) {
-    b.raidSide = raidNone;
-    b.raidPreyId = -1;
-    b.raidCooldown = 0;
-    b.raidBeaten = false;
+    if (inRaid(b)) endActivity(b);   // R53-F4: the raid fields are reset there
 }
 // R52-F4: the add/remove pair for the cough. catchCough() is the only place `sick` is set; clearSick() wipes the whole
 // state (removeBarb() calls it, so nothing outlives the barb)
@@ -2966,7 +2994,7 @@ void clearSick(barb& b) {
     b.cure = 0;
 }
 void raidMemberLost(const barb& b) {
-    if (!raid.active || b.raidSide == raidNone) return;
+    if (!raid.active || !inRaid(b)) return;
     for (auto& id : raid.raiderIds) if (id == b.id) id = -1;
     for (auto& id : raid.defenderIds) if (id == b.id) id = -1;
 }
@@ -3019,32 +3047,71 @@ void dropCarry(barb& b) {
     if (b.target == targetDepot) b.target = targetNone;
 }
 
-// R41-F2: every way out of a temper (finished, interrupted, reassigned, forge gone, sheltering, death) goes through here.
-// Refunds the stone if it is still owed and resets toolCharges; leaves movement alone so a new assignment is not undone
-// (temperTick() clears movement on its own exits). The finish path clears temperPaid first and sets the charges after.
-void clearTemper(barb& b) {
-    if (b.temperPaid) {
-        stockOf(b).stone += kTemperStoneCost;
-        printf("TEMPER REFUNDED - barb %d, %s +%d stone\n", b.id, racePlurals[clampRace(b.race)], kTemperStoneCost);
+// R53-F4: the only writer of barb.activity on the way out. Runs the live activity's cleanup (what clearTraining(),
+// clearWatch(), clearKneel(), clearRaid(), clearTemper() and clearSmelt() used to do) and leaves movement alone, so a
+// task assigned right after keeps its walk; each tick stops the walk on its own exits. Safe on a barb with no activity.
+void endActivity(barb& b) {
+    switch (b.activity) {
+        case actShelter:     // ungarrison() frees the keep slot and resets the walk
+            b.garrisonInside = false;
+            b.garrisonHouseId = -1;
+            break;
+        case actExpedition:  // expeditionReset() (called by every exit) resets the walk and work
+            break;
+        case actRaidAttack:
+        case actRaidDefend:
+            b.raidPreyId = -1;
+            b.raidCooldown = 0;
+            b.raidBeaten = false;
+            break;
+        case actTemper:      // R41-F2: refund the stone if still owed (the finish path clears temperPaid first)
+            if (b.temperPaid) {
+                stockOf(b).stone += kTemperStoneCost;
+                printf("TEMPER REFUNDED - barb %d, %s +%d stone\n", b.id, racePlurals[clampRace(b.race)], kTemperStoneCost);
+            }
+            b.temperPaid = false;
+            b.temperTimer = 0;
+            break;
+        case actSmelt:       // R47-F7: refund if still owed and free the forge
+            if (b.smeltPaid) {
+                stockOf(b).stone += kSmeltStoneCost;
+                printf("SMELT REFUNDED - barb %d, %s +%d stone\n", b.id, racePlurals[clampRace(b.race)], kSmeltStoneCost);
+            }
+            if (forgeSmelterId == b.id) forgeSmelterId = -1;
+            b.smeltPaid = false;
+            b.smeltTimer = 0;
+            break;
+        case actDrill:       // R47-F6: free the slot if still held; the drill counter stays
+            if (b.race >= 0 && b.race < raceCount && b.drillSlot >= 0 && b.drillSlot < kDrillSlots && halls[b.race].slotId[b.drillSlot] == b.id)
+                halls[b.race].slotId[b.drillSlot] = -1;
+            b.drillSlot = -1;
+            b.drillTimer = 0;
+            b.drillHits = 0;
+            break;
+        case actWatch:       // R51-F1
+            b.watchPreyId = -1;
+            b.watchCooldown = 0;
+            break;
+        case actKneel:       // R52-F3: nothing else to reset
+        case actNone:
+        case activityCount:
+            break;
     }
-    b.temperPaid = false;
-    b.tempering = false;
-    b.temperTimer = 0;
+    b.activity = actNone;
+}
+void endActivity(barb& b, barbActivity a) { if (b.activity == a) endActivity(b); }
+
+// R41-F2: every way out of a temper (finished, interrupted, reassigned, forge gone, sheltering, death) goes through here.
+// Refunds the stone if it is still owed (in endActivity()) and resets toolCharges even with no temper live (the tempered
+// edge is lost with the forge); the finish path clears temperPaid first and sets the charges after.
+void clearTemper(barb& b) {
+    endActivity(b, actTemper);
     b.toolCharges = 0;
 }
 
 // R47-F7: every way out of a smelt (finished, interrupted, reassigned, forge gone, sheltering, expedition, death) goes
-// through here. Refunds the stone if still owed and frees the forge; leaves movement alone like clearTemper().
-void clearSmelt(barb& b) {
-    if (b.smeltPaid) {
-        stockOf(b).stone += kSmeltStoneCost;
-        printf("SMELT REFUNDED - barb %d, %s +%d stone\n", b.id, racePlurals[clampRace(b.race)], kSmeltStoneCost);
-    }
-    if (b.smelting && forgeSmelterId == b.id) forgeSmelterId = -1;
-    b.smeltPaid = false;
-    b.smelting = false;
-    b.smeltTimer = 0;
-}
+// through here. Refunds the stone if still owed and frees the forge (in endActivity()); leaves movement alone.
+void clearSmelt(barb& b) { endActivity(b, actSmelt); }
 
 // R34-F1: true if b's work target is its own race's shaft stand spot (the spot is fixed, so this holds in any shaft state)
 bool atShaftTarget(const barb& b) {
@@ -3062,12 +3129,12 @@ int mineTicksFor(const barb& b) {
 // minematerials() derives its per-tick shaftMiner[] from this, so the tooltip and the work bar agree with the work loop.
 int shaftMinerOf(const vector<barb>& barbs, int r) {
     for (int j = 0; j < (int)barbs.size(); j++)
-        if (barbs[j].race == r && !barbs[j].garrisoned && atShaftTarget(barbs[j])) return j;
+        if (barbs[j].race == r && barbs[j].activity != actShelter && atShaftTarget(barbs[j])) return j;
     return -1;
 }
 // R40-F1: down the shaft right now. Separate from barbHidden() (garrison only); re-checks the job so a stale flag never hides a barb
 bool barbUnderground(const barb& b) {
-    return (b.inMine && !b.garrisoned && atShaftTarget(b) && mineShafts[b.race].built) || barbInHollow(b);   // R47-F5: or down the Hollow
+    return (b.inMine && b.activity != actShelter && atShaftTarget(b) && mineShafts[b.race].built) || barbInHollow(b);   // R47-F5: or down the Hollow
 }
 // R40-F1: the one way out of the pit. withLoad = climbing out with stone (starts the lintel flash). Safe if not in the mine.
 void leaveMine(barb& b, bool withLoad = false) {
@@ -3489,8 +3556,8 @@ Color barbColor(const barb& b) {
     if (barbIdle(b)) return barbIdleColor;
     if (b.deertargeting) return barbHuntColor;
     if (b.building) return barbBuildColor;
-    if (b.tempering) return barbMineColor;   // R41-F2: pick work at the forge; never overlaps chopping/building
-    if (b.smelting) return barbMineColor;    // R47-F7: stone work at the forge, same stripe
+    if (b.activity == actTemper) return barbMineColor;   // R41-F2: pick work at the forge; never overlaps chopping/building
+    if (b.activity == actSmelt) return barbMineColor;    // R47-F7: stone work at the forge, same stripe
     if (b.chopping && b.target == targetBush) return barbPickColor;
     if (b.chopping && b.target == targetField) return barbHarvestColor;
     if (b.chopping && b.target == targetLake) return barbFishColor;
@@ -3505,24 +3572,24 @@ string weaponLabel(const barb& b) { return string(weaponOf(b).name) + ", tier " 
 
 // Same priority as barbColor() so the tooltip always matches the colour on screen
 const char* barbTaskName(const barb& b) {
-    if (b.garrisoned) return b.garrisonInside ? "sheltering" : "running to shelter";   // INBOX-F1
-    if (b.onExpedition)   // R45-F2
+    if (b.activity == actShelter) return b.garrisonInside ? "sheltering" : "running to shelter";   // INBOX-F1
+    if (b.activity == actExpedition)   // R45-F2
         return party.phase == expeditionParty::Out ? "expedition: setting out"
              : party.phase == expeditionParty::Delve ? (party.hollow ? "expedition: below the Hollow" : "expedition: delving")   // R47-F5
              : "expedition: heading home";
-    if (b.raidSide == raidDefender) return b.raidPreyId >= 0 ? "defending the crate: fighting" : "defending the crate";   // R52-F1
-    if (b.raidSide == raidAttacker)
+    if (b.activity == actRaidDefend) return b.raidPreyId >= 0 ? "defending the crate: fighting" : "defending the crate";   // R52-F1
+    if (b.activity == actRaidAttack)
         return raid.phase == raidParty::Home ? "raiding: heading home"
              : b.raidBeaten ? "raiding: beaten"
              : raid.phase == raidParty::Fight ? (b.raidPreyId >= 0 ? "raiding: fighting" : "raiding: at the crate")
              : "raiding: on the march";
     if (b.deertargeting) return b.hasSpear ? weaponOf(b).huntLabel : "hunting";   // R47-F8: "hunting (axe)" for dwarves
     if (b.building) return "building";
-    if (b.tempering) return "tempering pick";   // R41-F2
-    if (b.smelting) return "smelting ingots";   // R47-F7
-    if (b.training) return "drilling";          // R47-F6: no stripe (idle colour); the tooltip names it
-    if (b.watching) return b.watchPreyId >= 0 ? "on watch: fighting" : "on watch";   // R51-F1: no stripe either, just the torch
-    if (b.kneeling) return b.moving ? "going to the Rite" : "kneeling at the Rite";   // R52-F3
+    if (b.activity == actTemper) return "tempering pick";   // R41-F2
+    if (b.activity == actSmelt) return "smelting ingots";   // R47-F7
+    if (b.activity == actDrill) return "drilling";          // R47-F6: no stripe (idle colour); the tooltip names it
+    if (b.activity == actWatch) return b.watchPreyId >= 0 ? "on watch: fighting" : "on watch";   // R51-F1: no stripe either, just the torch
+    if (b.activity == actKneel) return b.moving ? "going to the Rite" : "kneeling at the Rite";   // R52-F3
     if (b.chopping && b.target == targetBush) return "picking";
     if (b.chopping && b.target == targetField) return "harvesting";
     if (b.chopping && b.target == targetLake) return "fishing";
@@ -3575,7 +3642,7 @@ void deerkilling(vector<deer>& deers, vector<RectangleShape>& deershape, vector<
 			auto& b = barbs[j];
 			auto& sq = squares[j];
 			if (!barbAvailable(b) || b.building || b.movingbspot || b.chopping || b.timer > 0 || b.carryKind != carryNone || atForgeTask(b)) continue;   // R29-F1: haulers finish the trip; R41-F2: so do temperers (R47-F7: and smelters); R45-F2
-			if (b.watching) continue;   // R51-F1: watchmen keep to the watch
+			if (b.activity == actWatch) continue;   // R51-F1: watchmen keep to the watch
 			if (!b.deertargeting) {
 				Vector2f bpos = sq.getPosition();
 				float dx = deerpos.x - bpos.x, dy = deerpos.y - bpos.y;
@@ -4475,7 +4542,7 @@ void hungerTick(vector<barb>& barbs) {
                 hungryLogCooldown = eventHungryCooldownTicks;
             }
         }
-        if (isHungry(b) && !isGentry(b) && !b.onExpedition) hungryCommoners[clampRace(b.race)]++;   // R45-F2: away members eat rations
+        if (isHungry(b) && !isGentry(b) && b.activity != actExpedition) hungryCommoners[clampRace(b.race)]++;   // R45-F2: away members eat rations
     }
     // Pass 2 (R24-F1): eating, Gentry first. While a Commoner is hungry, Gentry leave gentryFoodReserve
     // so the Commoners are never shut out of the larder entirely.
@@ -4493,10 +4560,10 @@ void hungerTick(vector<barb>& barbs) {
     };
     for (auto& b : barbs) {
         int gentryKeep = hungryCommoners[clampRace(b.race)] > 0 ? gentryFoodReserve : 0;
-        if (isGentry(b) && isHungry(b) && !b.onExpedition && stockOf(b).food > gentryKeep) eat(b, gentryKeep);
+        if (isGentry(b) && isHungry(b) && b.activity != actExpedition && stockOf(b).food > gentryKeep) eat(b, gentryKeep);
     }
     for (auto& b : barbs)
-        if (!isGentry(b) && isHungry(b) && !b.onExpedition && stockOf(b).food > 0) eat(b, 0);   // R45-F2: rations only, in expeditionTick()
+        if (!isGentry(b) && isHungry(b) && b.activity != actExpedition && stockOf(b).food > 0) eat(b, 0);   // R45-F2: rations only, in expeditionTick()
     // Pass 3 (R30-F5): whoever is still hungry after the meal goes on starving; damage only past the grace period.
     // Health is only lowered here; deaths are removed by starveDeathTick() at the end of the tick.
     for (auto& b : barbs) {
@@ -4530,7 +4597,7 @@ void sickTick(vector<barb>& barbs) {
         const barb& b = barbs[i];
         raceAlive[clampRace(b.race)]++;
         if (b.sick > 0) anySick++;
-        if (b.onExpedition) continue;   // away from home: neither catches nor spreads it
+        if (b.activity == actExpedition) continue;   // away from home: neither catches nor spreads it
         buckets[b.homeHouse >= 0 ? b.homeHouse : -1 - clampRace(b.race)].push_back(i);
     }
 
@@ -4773,7 +4840,7 @@ void drawBarbs(RenderWindow& window, const vector<barb>& barbs, const vector<Rec
             tool.setFillColor(spearTipColor);
             tool.setPosition(Vector2f(side, raised ? bodyTop + 1.0f : bodyTop + 2.0f));
             window.draw(tool);
-        } else if (b.training && !b.moving) {   // R47-F6: at the dummy: wind up (head row) just before a hit, jab (arm row) just after
+        } else if (b.activity == actDrill && !b.moving) {   // R47-F6: at the dummy: wind up (head row) just before a hit, jab (arm row) just after
             bool windUp = b.drillTimer >= kDrillHitTicks - kDrillJabTicks;
             bool jab = b.drillHits > 0 && b.drillTimer < kDrillJabTicks;
             if (windUp || jab) {
@@ -4802,13 +4869,13 @@ void drawBarbs(RenderWindow& window, const vector<barb>& barbs, const vector<Rec
             tool.setPosition(top - Vector2f(0.0f, spearTipSize.y));   // top edge = bodyTop - 2
             window.draw(tool);
             tool.setSize(barbToolSize);
-            if (b.raidSide == raidAttacker) {   // R52-F1: 1px red pennant right of the shaft's top pixel, under the tip
+            if (b.activity == actRaidAttack) {   // R52-F1: 1px red pennant right of the shaft's top pixel, under the tip
                 dot.setFillColor(kRaidPennantColor);
                 dot.setPosition(top + Vector2f(1.0f, 0.0f));
                 window.draw(dot);
             }
         }
-        if (b.watching)   // R51-F1: torch held out left at head height, clear of horns, ears and the trait dot; drawn after the overlay
+        if (b.activity == actWatch)   // R51-F1: torch held out left at head height, clear of horns, ears and the trait dot; drawn after the overlay
             watchTorchPts.push_back(Vector2f(base.x - 2.0f, bodyTop - 1.0f));
         if (b.id == carrierId) {   // R45-F2: 1px relic held low, one column out from the arm/spear column, twinkling
             dot.setFillColor((frame / relicGlintFrames) % 2 == 0 ? relicGlintColor : relicGlintDimColor);
@@ -5164,6 +5231,7 @@ optional<hoverHit> pickHover(Vector2f p, float radius, const vector<barb>& barbs
             if (b.order != needNone)   // INBOX-F2b: hours rounded up so a live order never reads 0h
                 label += string("\nOrder: ") + leaderNeedNames[b.order] + " (" +
                          to_string((b.orderTicks + ticksPerGameHour - 1) / ticksPerGameHour) + "h left)";
+            if (kDebugBuild && debugActivityTip) label += string("\nActivity: ") + activityDefs[b.activity].name;   // R53-F4
             hoverHit h{label, squares[i], nullopt};
             h.homeOfBarb = b.homeHouse;
             h.hoveredBarb = b.id;   // INBOX-F2b: order pip
@@ -7573,16 +7641,15 @@ void makeBarb(Vector2i pos, vector<barb>& barbs, vector<RectangleShape>& squares
     b.spearPaid = false;  // POL-F3
     b.spearAtForge = false;   // POL-F5a
     b.weaponTier = 0;         // R47-F8
-    b.tempering = b.temperPaid = false;   // R41-F2: no temper in progress, an untempered pick
+    b.activity = actNone;   // R53-F4: no shelter, party, raid, forge task, drill, watch or kneel
+    b.temperPaid = false;   // R41-F2: no temper in progress, an untempered pick
     b.temperTimer = 0;
     b.toolCharges = 0;
-    b.smelting = b.smeltPaid = false;   // R47-F7: no smelt in progress, tier read fresh at the first job
+    b.smeltPaid = false;   // R47-F7: no smelt in progress, tier read fresh at the first job
     b.smeltTimer = 0;
     b.jobTier = 0;
-    b.training = false;   // R47-F6: not drilling, no slot, counter at 0
-    b.drillSlot = -1;
+    b.drillSlot = -1;      // R47-F6: not drilling, no slot, counter at 0
     b.drillTimer = b.drillHits = b.drillCount = 0;
-    b.watching = false;   // R51-F1: not on watch
     b.watchStop = b.watchCooldown = 0;
     b.watchPreyId = -1;
     for (auto& m : b.mem) m = workMem{};   // INBOX-F2: a newborn remembers no spots
@@ -7640,7 +7707,7 @@ void shinobiTick(vector<barb>& barbs, vector<RectangleShape>& squares, const vec
         barb& b = barbs[i];
         if (!b.shinobi) continue;
         if (!barbAvailable(b) || b.moving || b.chopping || b.building || b.movingbspot || b.deertargeting || b.timer > 0 || b.jobKind != jobNone
-            || b.training || b.watching || b.kneeling) continue;   // R47-F6: no blinking off the drill slot (R51-F1: or the watch; R52-F3: or the rite)
+            || b.activity == actDrill || b.activity == actWatch || b.activity == actKneel) continue;   // R47-F6: no blinking off the drill slot (R51-F1: or the watch; R52-F3: or the rite)
         if (blinkChance(gen) != 0) continue;
         Vector2f from = squares[i].getPosition(), size = squares[i].getSize();
         for (int t = 0; t < shinobiBlinkTries; t++) {
@@ -8168,7 +8235,7 @@ void placeTowers(int r, vector<barb>& barbs, vector<tree>& trees, vector<CircleS
             Vector2f p = tris[i].getPosition();
             int tix = (int)(p.x + 8), tiy = (int)(p.y + 15);   // same stand spot the clearing pass in main drops
             for (auto& b : barbs) {
-                if (!b.garrisoned && b.target != targetBush && b.targetx == tix && b.targety == tiy) {
+                if (b.activity != actShelter && b.target != targetBush && b.targetx == tix && b.targety == tiy) {
                     b.moving = b.chopping = false; clearRoute(b);
                     b.timer  = 0;
                     b.targetx = b.targety = -1;
@@ -8240,7 +8307,7 @@ void wallTick(vector<barb>& barbs, vector<tree>& trees, vector<CircleShape>& tri
                 Vector2f p = tris[i].getPosition();
                 int tix = (int)(p.x + 8), tiy = (int)(p.y + 15);   // same stand spot the clearing pass in main drops
                 for (auto& b : barbs) {
-                    if (!b.garrisoned && b.target != targetBush && b.targetx == tix && b.targety == tiy) {
+                    if (b.activity != actShelter && b.target != targetBush && b.targetx == tix && b.targety == tiy) {
                         b.moving = b.chopping = false; clearRoute(b);
                         b.timer  = 0;
                         b.targetx = b.targety = -1;
@@ -8580,7 +8647,8 @@ Vector2f keepDoorstep(int r) { return Vector2f((float)keeps[r].x, (float)keeps[r
 // R31-F3: also the one place a keep slot is freed (bell-off, death via removeBarb(), lost keep, failed validation)
 void ungarrison(barb& b) {
     for (auto& slots : keepSlots) slots.erase(std::remove(slots.begin(), slots.end(), b.id), slots.end());
-    b.garrisoned = b.garrisonInside = false;
+    endActivity(b, actShelter);   // R53-F4: safe on a barb that isn't sheltering
+    b.garrisonInside = false;
     b.garrisonHouseId = -1;
     b.moving = false; clearRoute(b);
     b.stepTimer = 0;
@@ -8737,20 +8805,20 @@ bool watchStopOk(Vector2f centre, Vector2f size) {
 // R51-F1: may this barb take the watch tonight? Armed, drilled, hale enough, surface, and idle (standing or on a wander
 // walk) or drilling (the watch outranks the dummy).
 bool watchEligible(const barb& b) {
-    if (b.watching || !b.hasSpear || b.drillCount < kDrillPipCount || b.health < watchMinHealth) return false;
-    if (b.raidSide != raidNone) return false;   // R52-F1: raiders and defenders belong to raidTick()
+    if (b.activity == actWatch || !b.hasSpear || b.drillCount < kDrillPipCount || b.health < watchMinHealth) return false;
+    if (inRaid(b)) return false;   // R52-F1: raiders and defenders belong to raidTick()
     if (!barbAvailable(b) || barbHidden(b) || barbUnderground(b) || b.inMine) return false;
     if (b.chopping || b.building || b.movingbspot || b.deertargeting || b.jobKind != jobNone || b.carryKind != carryNone
         || atForgeTask(b) || b.timer > 0 || b.target != targetNone || b.order != needNone) return false;
     bool wandering = b.targetx == b.wanderX && b.targety == b.wanderY;
-    return !b.moving || wandering || b.training;
+    return !b.moving || wandering || b.activity == actDrill;
 }
 
 // R51-F1: the only place the watch state is set. Ends any drill first (clearTraining() also clears the watch, so the
 // flag is set after it), drops any wander walk and starts at the nearest open stop on the ring.
 void startWatch(barb& b, const RectangleShape& sq) {
     clearTraining(b);
-    b.watching = true;
+    beginActivity(b, actWatch);
     b.watchPreyId = -1;
     b.watchCooldown = 0;
     b.moving = false; clearRoute(b);
@@ -8786,7 +8854,7 @@ void watchTick(vector<barb>& barbs, vector<RectangleShape>& squares, vector<prow
     static int enlistTimer = 0;
     int n = min((int)barbs.size(), (int)squares.size());
     if (!isNightHour(game_time)) {
-        for (int i = 0; i < n; i++) if (barbs[i].watching) endWatch(barbs[i], "dawn");
+        for (int i = 0; i < n; i++) if (barbs[i].activity == actWatch) endWatch(barbs[i], "dawn");
         enlistTimer = 0;   // first scan on the first night tick
         return;
     }
@@ -8794,7 +8862,7 @@ void watchTick(vector<barb>& barbs, vector<RectangleShape>& squares, vector<prow
     if (--enlistTimer <= 0) {
         enlistTimer = watchEnlistTicks;
         int on[raceCount] = {};
-        for (int i = 0; i < n; i++) if (barbs[i].watching) on[clampRace(barbs[i].race)]++;
+        for (int i = 0; i < n; i++) if (barbs[i].activity == actWatch) on[clampRace(barbs[i].race)]++;
         for (int i = 0; i < n; i++) {
             int r = clampRace(barbs[i].race);
             if (on[r] >= watchMaxPerRace || !watchEligible(barbs[i])) continue;
@@ -8806,7 +8874,7 @@ void watchTick(vector<barb>& barbs, vector<RectangleShape>& squares, vector<prow
     for (int i = 0; i < n; i++) {
         barb& b = barbs[i];
         RectangleShape& sq = squares[i];
-        if (!b.watching) continue;
+        if (b.activity != actWatch) continue;
         if (b.health <= 0) { endWatch(b, "fell"); continue; }   // death: off the watch before starveDeathTick()
         if (!barbAvailable(b) || barbHidden(b) || barbUnderground(b) || !b.hasSpear) { endWatch(b, "called away"); continue; }
         if (b.watchCooldown > 0) b.watchCooldown--;
@@ -8918,8 +8986,8 @@ Vector2f riteSlotPos(const shrine& s, int k, Vector2f size) {
 
 // R52-F3: idle on the surface (standing or on a wander walk), with no task, haul, hunt, order, drill, watch or raid
 bool riteEligible(const barb& b) {
-    if (b.kneeling || b.health <= 0 || !barbAvailable(b) || barbHidden(b) || barbUnderground(b) || b.inMine) return false;
-    if (b.training || b.watching || b.chopping || b.building || b.movingbspot || b.deertargeting || b.jobKind != jobNone
+    if (b.activity == actKneel || b.health <= 0 || !barbAvailable(b) || barbHidden(b) || barbUnderground(b) || b.inMine) return false;
+    if (b.activity == actDrill || b.activity == actWatch || b.chopping || b.building || b.movingbspot || b.deertargeting || b.jobKind != jobNone
         || b.carryKind != carryNone || atForgeTask(b) || b.timer > 0 || b.target != targetNone || b.order != needNone) return false;
     bool wandering = b.targetx == b.wanderX && b.targety == b.wanderY;
     return !b.moving || wandering;
@@ -8929,7 +8997,7 @@ bool riteEligible(const barb& b) {
 // then the walk to the slot.
 void startKneel(barb& b, Vector2f slot) {
     clearTraining(b);
-    b.kneeling = true;
+    beginActivity(b, actKneel);
     b.wanderX = b.wanderY = -1;
     b.targetx = (int)slot.x;
     b.targety = (int)slot.y;
@@ -8948,7 +9016,7 @@ void endKneel(barb& b, const char* why) {
 
 // R52-F3: one ticker line naming who knelt, and a stub omen for each race that did
 void endRite(vector<barb>& barbs) {
-    for (auto& b : barbs) if (b.kneeling) endKneel(b, "rite over");
+    for (auto& b : barbs) if (b.activity == actKneel) endKneel(b, "rite over");
     rite.active = false;
     string who;
     int races = 0, total = 0;
@@ -8984,7 +9052,7 @@ void riteTick(vector<barb>& barbs, vector<RectangleShape>& squares, const vector
     if (!inWindow) {
         if (rite.active) endRite(barbs);
         if (game_time == nightEndHour)
-            for (int i = 0; i < n; i++) if (barbs[i].kneeling) endKneel(barbs[i], "dawn");
+            for (int i = 0; i < n; i++) if (barbs[i].activity == actKneel) endKneel(barbs[i], "dawn");
         return;
     }
     if (!rite.active) {
@@ -9014,7 +9082,7 @@ void riteTick(vector<barb>& barbs, vector<RectangleShape>& squares, const vector
     bool taken[raceCount][riteSlots] = {};
     for (int i = 0; i < n; i++) {
         barb& b = barbs[i];
-        if (!b.kneeling) continue;
+        if (b.activity != actKneel) continue;
         int r = clampRace(b.race);
         if (si[r] < 0) { endKneel(b, "shrine gone"); continue; }
         if (b.health <= 0 || !barbAvailable(b) || barbHidden(b) || barbUnderground(b) || b.inMine) { endKneel(b, "called away"); continue; }
@@ -9149,7 +9217,7 @@ void drawWatchRing(RenderWindow& window, const View& worldView, const vector<bar
     bool drawn[raceCount] = {};
     for (int id : {selectedId, hoveredId}) {
         int i = findBarbById(barbs, id);
-        if (i < 0 || !barbs[i].watching) continue;
+        if (i < 0 || barbs[i].activity != actWatch) continue;
         int r = clampRace(barbs[i].race);
         if (drawn[r]) continue;
         drawn[r] = true;
@@ -9190,7 +9258,7 @@ void bellTick(vector<barb>& barbs, vector<RectangleShape>& squares, const vector
                 raceBell[r] = 0;
                 raceBellCooldown[r] = bellCooldownTicks;
                 int sheltered = 0;
-                for (auto& b : barbs) if (b.garrisoned && b.race == r) sheltered++;
+                for (auto& b : barbs) if (b.activity == actShelter && b.race == r) sheltered++;
                 printf("BELL SILENT - %s%s, %d leave shelter\n", racePlurals[r], timedOut ? " (timeout)" : "", sheltered);
                 logRaceEvent(string(racePlurals[r]) + " leave shelter, the bell falls silent", r);
             }
@@ -9207,7 +9275,7 @@ void bellTick(vector<barb>& barbs, vector<RectangleShape>& squares, const vector
         for (int s = (int)slots.size() - 1; s >= 0; s--) {
             int j = findBarbById(barbs, slots[s]);
             bool dup = find(slots.begin(), slots.begin() + s, slots[s]) != slots.begin() + s;
-            if (dup || j < 0 || !barbs[j].garrisoned || barbs[j].garrisonHouseId != keepGarrisonId || barbs[j].race != r) {
+            if (dup || j < 0 || barbs[j].activity != actShelter || barbs[j].garrisonHouseId != keepGarrisonId || barbs[j].race != r) {
                 printf("KEEP SLOT DROPPED - %s, barb %d\n", racePlurals[r], slots[s]);
                 slots.erase(slots.begin() + s);
             }
@@ -9218,7 +9286,7 @@ void bellTick(vector<barb>& barbs, vector<RectangleShape>& squares, const vector
         barb& b = barbs[i];
         auto& sq = squares[i];
         if (b.race < 0 || b.race >= raceCount) continue;
-        if (b.garrisoned) {
+        if (b.activity == actShelter) {
             Vector2f spot;
             if (b.garrisonHouseId == keepGarrisonId) {   // R31-F3: keep refuge, validated against keepSlots by id
                 const auto& slots = keepSlots[b.race];
@@ -9287,7 +9355,7 @@ void bellTick(vector<barb>& barbs, vector<RectangleShape>& squares, const vector
         b.targetBush = b.targetShore = -1;
         b.wanderX = b.wanderY = -1;
         b.stepTimer = 0;
-        b.garrisoned = true;
+        beginActivity(b, actShelter);   // R53-F4: releaseBarbWork() above ended any forge task, drill, watch or kneel
         b.garrisonInside = false;
         Vector2f spot;
         if (toKeep) {   // R31-F3: the slot is held from now on, while running and while inside
@@ -9365,8 +9433,8 @@ void rankRaceNeed(const vector<barb>& barbs, int r) {
 // INBOX-F2b: idle = no work, build, hunt, haul or job claim. Garrisoned barbs are never idle, so an order never touches shelter
 bool orderIdle(const barb& b) {
     return barbAvailable(b) && !b.chopping && !b.building && !b.movingbspot && !b.deertargeting && b.jobKind == jobNone && b.carryKind == carryNone && !atForgeTask(b)   // R47-F7
-        && !b.training     // R47-F6: drillers take no orders and join no party (expedition preference deferred)
-        && !b.watching;    // R51-F1: nor do watchmen (and so they never start a drill)
+        && b.activity != actDrill     // R47-F6: drillers take no orders and join no party (expedition preference deferred)
+        && b.activity != actWatch;    // R51-F1: nor do watchmen (and so they never start a drill)
 }
 
 // INBOX-F2b: right after the leader names its need, it hands that need as an individual order to idle members (not
@@ -9516,9 +9584,9 @@ Vector2f expeditionGoal(int k) {
 // R45-F2: the one way a party ends. Every member still standing gets the reset and its flag cleared; idx[k] < 0 = gone.
 void endExpedition(vector<barb>& barbs, const int (&idx)[expPartySize]) {
     for (int k = 0; k < expPartySize; k++) {
-        if (idx[k] < 0 || idx[k] >= (int)barbs.size() || !barbs[idx[k]].onExpedition) continue;
+        if (idx[k] < 0 || idx[k] >= (int)barbs.size() || barbs[idx[k]].activity != actExpedition) continue;
         expeditionReset(barbs[idx[k]]);
-        barbs[idx[k]].onExpedition = false;
+        endActivity(barbs[idx[k]], actExpedition);
     }
     party.active = false;
     party.race = -1;
@@ -9615,7 +9683,7 @@ void tryLaunchExpedition(vector<barb>& barbs, vector<RectangleShape>& squares, c
         for (int k = 0; k < expPartySize; k++) {
             barb& b = barbs[pick[k]];
             expeditionReset(b);
-            b.onExpedition = true;
+            beginActivity(b, actExpedition);
             b.order = needNone;
             b.orderTicks = 0;
             party.memberIds[k] = b.id;
@@ -9655,7 +9723,7 @@ void expeditionTick(vector<barb>& barbs, vector<RectangleShape>& squares, const 
     bool broken = false;
     for (int k = 0; k < expPartySize; k++) {
         idx[k] = findBarbById(barbs, party.memberIds[k]);
-        bool bad = idx[k] < 0 || idx[k] >= (int)squares.size() || !barbs[idx[k]].onExpedition || barbs[idx[k]].race != r;
+        bool bad = idx[k] < 0 || idx[k] >= (int)squares.size() || barbs[idx[k]].activity != actExpedition || barbs[idx[k]].race != r;
         if (!bad && barbs[idx[k]].health <= 0) { bad = true; if (!lost) lost = barbs[idx[k]].name; }
         if (bad) { broken = true; if (idx[k] >= (int)squares.size()) idx[k] = -1; }
     }
@@ -9814,11 +9882,11 @@ void expeditionTick(vector<barb>& barbs, vector<RectangleShape>& squares, const 
 // R52-F1: free to be called up for a raid: available (not sheltering, away or already in the raid), on the surface, no
 // job, haul, hunt, forge task or claim, not on watch, not kneeling, and standing, wandering or drilling
 bool raidIdle(const barb& b) {
-    if (!barbAvailable(b) || barbHidden(b) || barbUnderground(b) || b.inMine || b.kneeling || b.watching) return false;
+    if (!barbAvailable(b) || barbHidden(b) || barbUnderground(b) || b.inMine || b.activity == actKneel || b.activity == actWatch) return false;
     if (b.chopping || b.building || b.movingbspot || b.deertargeting || b.jobKind != jobNone || b.carryKind != carryNone
         || atForgeTask(b) || b.timer > 0 || b.target != targetNone) return false;
     bool wandering = !b.moving || (b.targetx == b.wanderX && b.targety == b.wanderY);
-    return wandering || b.training;
+    return wandering || b.activity == actDrill;
 }
 bool raidRaiderOk(const barb& b, int r) {
     return b.race == r && b.hasSpear && raidIdle(b) && b.health >= kRaidMinHealth && !isHungry(b) && !isLeader(b) && !b.shinobi;
@@ -9831,12 +9899,12 @@ bool raidDefenderOk(const barb& b, int r) {
 void joinRaid(barb& b, raidRole side) {
     expeditionReset(b);
     clearRaid(b);
-    b.raidSide = side;
+    beginActivity(b, side == raidAttacker ? actRaidAttack : actRaidDefend);
     if (side == raidAttacker) { b.order = needNone; b.orderTicks = 0; }
 }
 // R52-F1: hand a barb back to the other systems, standing where it is (every exit goes through here)
 void releaseRaidBarb(barb& b) {
-    if (b.raidSide == raidNone) return;
+    if (!inRaid(b)) return;
     expeditionReset(b);
     clearRaid(b);
 }
@@ -10026,11 +10094,11 @@ void raidTick(vector<barb>& barbs, vector<RectangleShape>& squares, const storeh
 
     for (int i = 0; i < n; i++) {   // backstop: a raid flag with no raid entry behind it is cleared
         barb& b = barbs[i];
-        if (b.raidSide == raidNone) continue;
+        if (!inRaid(b)) continue;
         bool listed = false;
         if (raid.active) {
-            if (b.raidSide == raidAttacker) for (int id : raid.raiderIds) listed = listed || id == b.id;
-            if (b.raidSide == raidDefender) for (int id : raid.defenderIds) listed = listed || id == b.id;
+            if (b.activity == actRaidAttack) for (int id : raid.raiderIds) listed = listed || id == b.id;
+            if (b.activity == actRaidDefend) for (int id : raid.defenderIds) listed = listed || id == b.id;
         }
         if (!listed) { printf("RAID FLAG CLEARED - barb %d (no raid entry)\n", b.id); releaseRaidBarb(b); }
     }
@@ -10046,10 +10114,10 @@ void raidTick(vector<barb>& barbs, vector<RectangleShape>& squares, const storeh
     int alive = 0, standing = 0;
     for (int k = 0; k < kRaidPartySize; k++) {
         ri[k] = findBarbById(barbs, raid.raiderIds[k]);
-        bool bad = ri[k] < 0 || ri[k] >= n || barbs[ri[k]].raidSide != raidAttacker || barbs[ri[k]].race != att || barbs[ri[k]].health <= 0;
+        bool bad = ri[k] < 0 || ri[k] >= n || barbs[ri[k]].activity != actRaidAttack || barbs[ri[k]].race != att || barbs[ri[k]].health <= 0;
         if (bad) {
             if (raid.raiderIds[k] >= 0) printf("RAIDER DROPPED - barb %d\n", raid.raiderIds[k]);
-            if (ri[k] >= 0 && ri[k] < n && barbs[ri[k]].raidSide == raidAttacker) releaseRaidBarb(barbs[ri[k]]);
+            if (ri[k] >= 0 && ri[k] < n && barbs[ri[k]].activity == actRaidAttack) releaseRaidBarb(barbs[ri[k]]);
             raid.raiderIds[k] = ri[k] = -1;
             continue;
         }
@@ -10058,10 +10126,10 @@ void raidTick(vector<barb>& barbs, vector<RectangleShape>& squares, const storeh
     }
     for (int k = 0; k < kRaidDefenderMax; k++) {
         di[k] = findBarbById(barbs, raid.defenderIds[k]);
-        bool bad = di[k] < 0 || di[k] >= n || barbs[di[k]].raidSide != raidDefender || barbs[di[k]].race != def || barbs[di[k]].health <= 0;
+        bool bad = di[k] < 0 || di[k] >= n || barbs[di[k]].activity != actRaidDefend || barbs[di[k]].race != def || barbs[di[k]].health <= 0;
         if (bad) {
             if (raid.defenderIds[k] >= 0) printf("DEFENDER DROPPED - barb %d\n", raid.defenderIds[k]);
-            if (di[k] >= 0 && di[k] < n && barbs[di[k]].raidSide == raidDefender) releaseRaidBarb(barbs[di[k]]);
+            if (di[k] >= 0 && di[k] < n && barbs[di[k]].activity == actRaidDefend) releaseRaidBarb(barbs[di[k]]);
             raid.defenderIds[k] = di[k] = -1;
         }
     }
@@ -10256,7 +10324,7 @@ int freeDrillSlot(int r) {
 // R47-F6: may this idle, standing barb (top-left pos) join its race's drill? Called from barbmove() only, which has
 // already ruled out work, builds, hauls and forge tasks; orderIdle() adds hunts and job claims, and no live order.
 bool drillWanted(const barb& b, Vector2f pos) {
-    if (b.training || b.moving || b.timer > 0 || b.inMine || b.target != targetNone || b.order != needNone || !orderIdle(b)) return false;
+    if (b.activity == actDrill || b.moving || b.timer > 0 || b.inMine || b.target != targetNone || b.order != needNone || !orderIdle(b)) return false;
     if (freeDrillSlot(b.race) < 0) return false;
     Vector2f d = barracksPos(b.race) + barracksSize / 2.0f - pos;
     return d.x * d.x + d.y * d.y < kDrillJoinRadius * kDrillJoinRadius;
@@ -10265,7 +10333,7 @@ bool drillWanted(const barb& b, Vector2f pos) {
 // R47-F6: the only place the drill state is set. The slot is held by barb id from here until clearTraining().
 void startTraining(barb& b, int s) {
     halls[b.race].slotId[s] = b.id;
-    b.training = true;
+    beginActivity(b, actDrill);
     b.drillSlot = s;
     b.drillTimer = b.drillHits = 0;
     Vector2f spot = drillSlotSpot(b.race, s);
@@ -10326,7 +10394,7 @@ void barbmove(vector<RectangleShape>& squares, vector<barb>& barbs) {
         auto& sq = squares[i];
         auto& b  = barbs[i];
         if (!barbAvailable(b) || b.chopping || b.timer > 0 || b.movingbspot || b.building || b.carryKind != carryNone || atForgeTask(b)) continue;   // R29-F1: haulTick() walks haulers; INBOX-F1: bellTick() walks garrisoned; R41-F2: temperTick() walks temperers (R47-F7: smeltTick() smelters); R45-F2: expeditionTick() walks parties
-        if (b.training || b.watching || b.kneeling) continue;   // R47-F6: drillTick() walks drillers; R51-F1: watchTick() walks watchmen; R52-F3: riteTick() kneelers
+        if (b.activity == actDrill || b.activity == actWatch || b.activity == actKneel) continue;   // R47-F6: drillTick() walks drillers; R51-F1: watchTick() walks watchmen; R52-F3: riteTick() kneelers
         Vector2f pos = sq.getPosition();
         if (!b.moving) {
             if (drillWanted(b, pos) && drillJoin(gen) == 0) {   // R47-F6: an idle barb near its barracks may drill instead
@@ -10370,7 +10438,7 @@ void buildWorkClaims(const vector<barb>& barbs, const vector<CircleShape>& tris,
     for (int j = 0; j < (int)barbs.size(); j++) {
         const barb& b = barbs[j];
         if (!barbAvailable(b) || b.targetx == -1 || b.target == targetBush || b.target == targetLake || b.target == targetField || b.target == targetDepot || b.deertargeting || b.movingbspot || b.building
-            || b.training || b.watching || b.kneeling) continue;   // R47-F6: a drill slot is not a tree spot (R51-F1: nor a patrol stop; R52-F3: nor a kneel slot)
+            || b.activity == actDrill || b.activity == actWatch || b.activity == actKneel) continue;   // R47-F6: a drill slot is not a tree spot (R51-F1: nor a patrol stop; R52-F3: nor a kneel slot)
         (b.target == targetRock ? rockSpots : treeSpots).emplace(workSpotKey(b.targetx, b.targety), j); // first claimant kept
     }
     treeClaim.assign(tris.size(), -1);
@@ -10481,8 +10549,8 @@ void startHaul(barb& b, carryLoad load, const storehouse (&stores)[raceCount], i
 // clearTemper() on any abort
 void startTemper(barb& b) {
     spend(stockOf(b), 0, kTemperStoneCost);
+    beginActivity(b, actTemper);
     b.temperPaid = true;
-    b.tempering = true;
     b.temperTimer = 0;
     Vector2f spot = forgePos + forgeStandOffset;
     b.targetx = (int)spot.x;
@@ -10537,8 +10605,8 @@ bool smeltWanted(const barb& b, const forge& fg) {
 // R47-F7: started by haulTick() right after a stone deposit; paid here (smeltPaid), refunded by clearSmelt() on any abort
 void startSmelt(barb& b) {
     spend(stockOf(b), 0, kSmeltStoneCost);
+    beginActivity(b, actSmelt);
     b.smeltPaid = true;
-    b.smelting = true;
     b.smeltTimer = 0;
     forgeSmelterId = b.id;
     Vector2f spot = forgePos + smeltStandOffset;
@@ -10550,7 +10618,7 @@ void startSmelt(barb& b) {
 }
 // R47-F7: smelting right now (standing at the forge, work begun): drives the smoke wisp
 bool forgeSmelting(const vector<barb>& barbs) {
-    for (auto& b : barbs) if (b.smelting && b.smeltTimer > 0 && b.id == forgeSmelterId) return true;
+    for (auto& b : barbs) if (b.activity == actSmelt && b.smeltTimer > 0 && b.id == forgeSmelterId) return true;
     return false;
 }
 // R47-F7: one smelt step: walk to the smelt spot, kSmeltTicks work ticks, then the ingots and one spark burst.
@@ -10764,39 +10832,39 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
         auto& sq = squares[j];
         auto& b  = barbs[j];
         if (!barbAvailable(b)) continue;   // INBOX-F1: no work or tree/rock/bush/shore search while sheltering; R45-F2: or away
-        if (b.toolCharges > 0 && !b.tempering && !forgeActive(fg, b.race)) {   // R41-F2: forge gone: the tempered edge goes with it
+        if (b.toolCharges > 0 && b.activity != actTemper && !forgeActive(fg, b.race)) {   // R41-F2: forge gone: the tempered edge goes with it
             printf("PICK UNTEMPERED - barb %d, forge lost\n", b.id);
             clearTemper(b);
         }
-        if (b.tempering) {   // R41-F2: any other state taken over the temper refunds it; temperTick() handles the forge going
+        if (b.activity == actTemper) {   // R41-F2: any other state taken over the temper refunds it; temperTick() handles the forge going
             if (b.movingbspot || b.building || b.deertargeting || b.chopping || b.jobKind != jobNone || b.carryKind != carryNone) {
                 printf("TEMPER INTERRUPTED - barb %d\n", b.id);
                 clearTemper(b);
             } else { temperTick(b, sq, fg); continue; }
         }
-        if (b.smelting) {   // R47-F7: same rule as the temper: any other state taken over the smelt refunds it
-            if (b.movingbspot || b.building || b.deertargeting || b.chopping || b.jobKind != jobNone || b.carryKind != carryNone || b.tempering) {
+        if (b.activity == actSmelt) {   // R47-F7: same rule as the temper: any other state taken over the smelt refunds it
+            if (b.movingbspot || b.building || b.deertargeting || b.chopping || b.jobKind != jobNone || b.carryKind != carryNone || b.activity == actTemper) {
                 printf("SMELT INTERRUPTED - barb %d\n", b.id);
                 clearSmelt(b);
             } else { smeltTick(b, sq, fg); continue; }
         }
-        if (b.training) {   // R47-F6: backstop: any other state set on a driller without clearTraining() ends the session
+        if (b.activity == actDrill) {   // R47-F6: backstop: any other state set on a driller without clearTraining() ends the session
             if (b.movingbspot || b.building || b.deertargeting || b.chopping || b.timer > 0 || b.jobKind != jobNone
                 || b.carryKind != carryNone || atForgeTask(b) || b.target != targetNone) {
                 printf("DRILL INTERRUPTED - barb %d\n", b.id);
                 clearTraining(b);
             } else { drillTick(b, sq); continue; }   // no work search while drilling: the session is short
         }
-        if (b.watching) {   // R51-F1: backstop: watching is exclusive with work, builds, timers, hunts, hauls and the drill
+        if (b.activity == actWatch) {   // R51-F1: backstop: watching is exclusive with work, builds, timers, hunts, hauls and the drill
             if (b.movingbspot || b.building || b.deertargeting || b.chopping || b.timer > 0 || b.jobKind != jobNone
-                || b.carryKind != carryNone || atForgeTask(b) || b.training || b.target != targetNone) {
+                || b.carryKind != carryNone || atForgeTask(b) || b.activity == actDrill || b.target != targetNone) {
                 printf("WATCH INTERRUPTED - barb %d\n", b.id);
                 clearWatch(b);
             } else continue;   // watchTick() walks and fights; no work search on watch
         }
-        if (b.kneeling) {   // R52-F3: backstop: kneeling is exclusive with work, builds, timers, hunts, hauls, the drill and the watch
+        if (b.activity == actKneel) {   // R52-F3: backstop: kneeling is exclusive with work, builds, timers, hunts, hauls, the drill and the watch
             if (b.movingbspot || b.building || b.deertargeting || b.chopping || b.timer > 0 || b.jobKind != jobNone
-                || b.carryKind != carryNone || atForgeTask(b) || b.training || b.watching || b.target != targetNone) {
+                || b.carryKind != carryNone || atForgeTask(b) || b.activity == actDrill || b.activity == actWatch || b.target != targetNone) {
                 printf("KNEEL INTERRUPTED - barb %d\n", b.id);
                 clearKneel(b);
             } else continue;   // riteTick() walks the kneeler to its slot; no work search while kneeling
@@ -11690,7 +11758,7 @@ void buildbarracks(vector<barb>& barbs, vector<RectangleShape>& squares, const s
             int id = hall.slotId[s];
             if (id < 0) continue;
             int j = findBarbById(barbs, id);
-            if (j < 0 || !barbs[j].training || barbs[j].drillSlot != s || barbs[j].race != r) {
+            if (j < 0 || barbs[j].activity != actDrill || barbs[j].drillSlot != s || barbs[j].race != r) {
                 printf("DRILL SLOT FREED - %s slot %d, barb %d\n", racePlurals[r], s, id);
                 hall.slotId[s] = -1;
             }
@@ -11935,7 +12003,7 @@ void leanSeasonTick(const vector<barb>& barbs, vector<bush>& bushes, vector<Circ
     if (refresh > 0) { refresh--; return; }
     refresh = larderRefreshTicks - 1;
     int eaters[raceCount] = {};
-    for (auto& b : barbs) if (!b.onExpedition) eaters[clampRace(b.race)]++;   // away members eat rations, not the larder
+    for (auto& b : barbs) if (b.activity != actExpedition) eaters[clampRace(b.race)]++;   // away members eat rations, not the larder
     float mealsPerDay = 24.0f * ticksPerGameHour / hungerThreshold * winterHungerMult;   // winter rate: it is the lean days we count
     float need = leanDaysToSpring();
     for (int r = 0; r < raceCount; r++) {
@@ -12102,6 +12170,10 @@ int main() {
                     lens = lens == Lens::Off ? Lens::Hunger : lens == Lens::Hunger ? Lens::Race : Lens::Off;
                     printf("Lens: %s\n", lensNames[(int)lens]);
                 }
+                else if (kDebugBuild && kp->code == kDebugActivityKey) {   // R53-F4: debug builds only
+                    debugActivityTip = !debugActivityTip;
+                    printf("Debug activity tooltip: %s\n", debugActivityTip ? "on" : "off");
+                }
             }
             else if (const auto* ms = event->getIf<Event::MouseWheelScrolled>()) {
                 float nz = clamp(zoom * (ms->delta > 0 ? zoomStep : 1.0f / zoomStep), minZoom, maxZoom);
@@ -12222,7 +12294,7 @@ int main() {
             if (inClearing(p)) {   // village clearing or a race quarter (R30-F1)
                 int tix = (int)(p.x + 8), tiy = (int)(p.y + 15);
                 for (auto& b : barbs) {
-                    if (!b.garrisoned && b.target != targetBush && b.targetx == tix && b.targety == tiy) {   // INBOX-F1: doorstep walks untouched
+                    if (b.activity != actShelter && b.target != targetBush && b.targetx == tix && b.targety == tiy) {   // INBOX-F1: doorstep walks untouched
                         b.moving = b.chopping = false; clearRoute(b);
                         b.timer  = 0;
                         b.targetx = b.targety = -1;
@@ -12236,7 +12308,7 @@ int main() {
             if (inClearing(p)) {   // village clearing or a race quarter (R30-F1)
                 int rix = (int)(p.x + 6), riy = (int)(p.y + 10);   // same stand spot minematerials targets
                 for (auto& b : barbs) {
-                    if (!b.garrisoned && b.target == targetRock && b.targetx == rix && b.targety == riy) {
+                    if (b.activity != actShelter && b.target == targetRock && b.targetx == rix && b.targety == riy) {
                         b.moving = b.chopping = false; clearRoute(b);
                         b.timer  = 0;
                         b.targetx = b.targety = -1;
