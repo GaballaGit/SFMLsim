@@ -723,6 +723,29 @@ const float kLootSpeedMult = 0.8f;            // laden walk speed multiplier (fo
 const float kLootRelationDelta = 0.15f;       // relation drop for the pair when anything is plundered
 const Vector2f kLootBundleSize(2.0f, 1.0f);   // carried low beside the body, one column out from the spear's foot
 const Color kLootBundleColor(176, 120, 190);  // muted violet sack: apart from every task stripe, the red pennant and the relic gold
+// R54-F1 Caravans and Coin, phase 1: a race with a spare stock sends one two-barb caravan (held by barb id, owned by
+// caravanTick()) along the route planner to a rival crate that is not cold. There the pair swaps one lot each of a
+// surplus kind, the relation warms, and a pair at or above kRelFriendlyMinRelation becomes "friendly" for
+// kRelFriendlyDays (a fresh visit pushes the timer back). Friendly pairs never raid. Without trade the timer runs out;
+// it also ends at once if the pair slips to uneasy. Every abort hands the cart's goods back to their owner.
+const int kTradeMembers = 2;                  // barbs in a caravan: the first pulls the cart
+const int kTradeCheckTicks = 900;             // launch scan throttle (~15s at 1x)
+const int kTradePairCooldownTicks = 12 * ticksPerGameHour;   // per pair between caravans (also before the first)
+const int kTradeLot = 3;                      // units each side hands over in a swap
+const raceStock kTradeKeep{10, 6, 12};        // (wood, stone, food) a race only trades what sits a full lot above this
+const float kTradeRecruitRadius = 140.0f;     // caravan barbs come from within this of their own crate centre
+const int kTradeMinHealth = 60;               // a caravan barb must be at least this hale (and not hungry)
+const int kTradeStayTicks = 240;              // ticks the caravan stands at the rival crate before the swap (~4s)
+const int kTradeMaxTicks = 12 * ticksPerMinute;   // backstop on the whole trip
+const float kTradeRelationDelta = 0.2f;       // relation warmth per completed swap
+const Color kTradeTickerTint(172, 208, 178);  // soft jade: apart from the raid reds, the rite gold and the race tints
+const Vector2f kTradeCartSize(2.0f, 2.0f);    // cart on the ground behind the lead barb's arm column
+const float kTradeCartGapPx = 2.0f;           // cart's left edge this far right of the body (clear of the arm/spear foot)
+const Color kTradeCartColor(128, 112, 90);    // weathered grey-brown wood, the same for every race
+const Color kTradeCoinColor(206, 190, 136);   // 1px pale brass pip on the cart while it carries goods
+const float kRelFriendlyMinRelation = 0.0f;   // a swap leaving the pair at or above this makes it friendly
+const int kRelFriendlyDays = 2;               // friendly timer per swap, in game days
+const int kRelFriendlyTicks = kRelFriendlyDays * 24 * ticksPerGameHour;
 
 // Skittish deer: bolt away from a nearby barb for a short, capped time, then a cooldown so hunts can still land
 const int deerStepInterval = 3;            // ticks per 1px step while wandering (deer row of speciesDefs)
@@ -2891,7 +2914,7 @@ enum raidRole { raidNone, raidAttacker, raidDefender };   // R52-F1
 // R53-F4: the one exclusive state a barb is in (work flags like chopping/building stay separate). Set only by
 // beginActivity(), cleared only by endActivity(), which also runs the activity's cleanup.
 enum barbActivity { actNone, actShelter, actExpedition, actRaidAttack, actRaidDefend, actTemper, actSmelt, actDrill, actWatch,
-                    actKneel, actHerb, activityCount };   // R53-F2: actHerb = tending the herb bed
+                    actKneel, actHerb, actCaravan, activityCount };   // R53-F2: actHerb = tending the herb bed; R54-F1: actCaravan
 struct activityDef {
     const char* name;
     bool ownsBarb;    // its tick owns the barb outright: every job selector skips it (barbAvailable() false)
@@ -2910,6 +2933,7 @@ const activityDef activityDefs[activityCount] = {
     {"watch",         false, false, true},
     {"kneel",         false, false, true},
     {"tend herbs",    false, false, true},   // R53-F2: any claim outranks tending, like the drill
+    {"caravan",       true,  false, false},  // R54-F1: caravanTick() owns the barb for the whole trip
 };
 
 struct barb {
@@ -3098,6 +3122,36 @@ int raidPairCooldown[raceCount][raceCount] = {
     {kRaidPairCooldownTicks, kRaidPairCooldownTicks, kRaidPairCooldownTicks}};   // kept symmetric
 static_assert(raceCount == 3, "raidPairCooldown initialiser is written for three races");
 
+// R54-F1: the one caravan. Members are held by barb id (never an index) and re-resolved by caravanTick() every tick;
+// removeBarb() invalidates a dying member's id through caravanMemberLost(), and the trip aborts the next tick.
+// The cart's goods live here, with the race that gets them back on an abort.
+struct caravanTrip {
+    enum Phase {Out, Trade, Home} phase = Out;
+    bool active = false;
+    int from = -1, to = -1;                 // sending race and the rival crate's race
+    int memberIds[kTradeMembers] = {-1, -1};
+    raceStock cargo{0, 0, 0};               // on the cart now
+    int cargoOwner = -1;                    // race the cargo goes back to on an abort (sender out, rival home)
+    int giveKind = -1;                      // kind sent out (0 food, 1 wood, 2 stone)
+    int ticks = 0, stayTicks = 0;
+};
+caravanTrip caravan;
+static_assert(kTradeMembers == 2, "caravanTrip::memberIds initialiser is written for two members");
+int tradePairCooldown[raceCount][raceCount] = {
+    {kTradePairCooldownTicks, kTradePairCooldownTicks, kTradePairCooldownTicks},
+    {kTradePairCooldownTicks, kTradePairCooldownTicks, kTradePairCooldownTicks},
+    {kTradePairCooldownTicks, kTradePairCooldownTicks, kTradePairCooldownTicks}};   // kept symmetric
+int relFriendlyTicks[raceCount][raceCount] = {};   // R54-F1: friendly timer per pair (symmetric); > 0 = friendly
+bool pairFriendly(int a, int b) {
+    return a >= 0 && a < raceCount && b >= 0 && b < raceCount && a != b && relFriendlyTicks[a][b] > 0;
+}
+void caravanMemberLost(const barb& b) {
+    if (!caravan.active) return;
+    for (auto& id : caravan.memberIds) if (id == b.id) id = -1;
+}
+int caravanCartId() { return caravan.active ? caravan.memberIds[0] : -1; }   // R54-F1: drawBarbs() puts the cart on this barb
+bool caravanLaden() { return caravan.active && caravan.cargo.food + caravan.cargo.wood + caravan.cargo.stone > 0; }
+
 // R52-F1: the one way out of the raid state, on every exit (outcome, abort, beaten defender, removeBarb, backstop)
 bool inRaid(const barb& b) { return b.activity == actRaidAttack || b.activity == actRaidDefend; }   // R53-F4
 void clearRaid(barb& b) {
@@ -3219,6 +3273,7 @@ void endActivity(barb& b) {
             b.herbTimer = 0;
             break;
         case actKneel:       // R52-F3: nothing else to reset
+        case actCaravan:     // R54-F1: the cart's goods live on the caravan entry, not the barb
         case actNone:
         case activityCount:
             break;
@@ -3741,6 +3796,9 @@ const char* barbTaskName(const barb& b) {
              : b.raidBeaten ? "raiding: beaten"
              : raid.phase == raidParty::Fight ? (b.raidPreyId >= 0 ? "raiding: fighting" : "raiding: at the crate")
              : "raiding: on the march";
+    if (b.activity == actCaravan)   // R54-F1
+        return caravan.phase == caravanTrip::Trade ? "caravan: trading at the crate"
+             : caravan.phase == caravanTrip::Home ? "caravan: heading home" : "caravan: on the road";
     if (b.deertargeting) return b.hasSpear ? weaponOf(b).huntLabel : "hunting";   // R47-F8: "hunting (axe)" for dwarves
     if (b.building) return "building";
     if (b.activity == actTemper) return "tempering pick";   // R41-F2
@@ -4860,6 +4918,8 @@ void drawBarbs(RenderWindow& window, const vector<barb>& barbs, const vector<Rec
     bool showTraits = zoom >= traitDotMinZoom;
     int carrierId = relicCarrierId();   // R45-F2
     int lootId = lootCarrierId();       // R47-F5
+    int cartId = caravanCartId();       // R54-F1
+    bool cartLaden = caravanLaden();
     static VertexArray lookVerts(PrimitiveType::Triangles);   // R35-F1: every race mark this frame, one draw after the loop
     lookVerts.clear();
     watchTorchPts.clear();   // R51-F1
@@ -5047,6 +5107,18 @@ void drawBarbs(RenderWindow& window, const vector<barb>& barbs, const vector<Rec
             stripe.setFillColor(kLootBundleColor);
             stripe.setPosition(Vector2f(side + 1.0f, bodyTop + bodyH - kLootBundleSize.y));   // bobs with the body
             window.draw(stripe);
+        }
+        if (b.id == cartId) {   // R54-F1: 2x2 cart on the ground (no bob), one column clear of the arm/spear foot and the
+            Vector2f cart(side + kTradeCartGapPx, feet - kTradeCartSize.y);   // health bar; coin pip on its top-right while laden
+            stripe.setSize(kTradeCartSize);
+            stripe.setFillColor(kTradeCartColor);
+            stripe.setPosition(cart);
+            window.draw(stripe);
+            if (cartLaden) {
+                dot.setFillColor(kTradeCoinColor);
+                dot.setPosition(cart + Vector2f(kTradeCartSize.x - 1.0f, -1.0f));
+                window.draw(dot);
+            }
         }
         if (b.activity == actWatch)   // R51-F1: torch held out left at head height, clear of horns, ears and the trait dot; drawn after the overlay
             watchTorchPts.push_back(Vector2f(base.x - 2.0f, bodyTop - 1.0f));
@@ -5400,6 +5472,11 @@ optional<hoverHit> pickHover(Vector2f p, float radius, const vector<barb>& barbs
                 label += ", of house " + to_string(b.homeHouse + 1) + ", " + to_string(kin) + " kin";
             }
             if (b.sick > 0) label += ", coughing";   // R52-F4
+            if (b.activity == actCaravan && caravan.active) {   // R54-F1: where the cart goes and what it carries
+                int dest = caravan.phase == caravanTrip::Home ? caravan.from : caravan.to;
+                label += string("\nCaravan ") + (caravan.phase == caravanTrip::Home ? "home to the " : "to the ") + racePlurals[clampRace(dest)];
+                if (b.id == caravanCartId() && caravanLaden()) label += ", cart: " + lootText(caravan.cargo);
+            }
             if (isLeader(b) && raceNeed[b.race] != needNone) label += string("\nNeeds: ") + leaderNeedNames[raceNeed[b.race]];   // R30-F2
             if (b.order != needNone)   // INBOX-F2b: hours rounded up so a live order never reads 0h
                 label += string("\nOrder: ") + leaderNeedNames[b.order] + " (" +
@@ -5483,6 +5560,11 @@ optional<hoverHit> pickHover(Vector2f p, float radius, const vector<barb>& barbs
         crate.setPosition(storehousePos[r]);
         if (!near(crate)) continue;
         hoverHit h{ledgerLine(r, barbs, stores), crate, nullopt};
+        for (int o = 0; o < raceCount; o++)   // R54-F1: friendly tier and its decay, outside the cached ledger string
+            if (pairFriendly(r, o)) {
+                int hrs = (relFriendlyTicks[r][o] + ticksPerGameHour - 1) / ticksPerGameHour;   // rounded up: never reads 0h
+                h.label += string("\nFriendly with the ") + racePlurals[o] + ", fades in " + to_string(hrs) + "h without trade";
+            }
         h.tint = lensRaceColors[r];
         h.hoveredCrate = r;   // R47-F10
         return h;
@@ -8792,6 +8874,8 @@ void removeBarb(vector<barb>& barbs, vector<RectangleShape>& squares, int i,
     raidMemberLost(b);                            // R52-F1: drops its raid id; raidTick() aborts under kRaidMinMembers raiders
     settleLoot(b, false);                         // R53-F1: a dead raider's pack goes back to the robbed race before the swapRemove
     clearRaid(b);
+    caravanMemberLost(b);                         // R54-F1: drops its caravan id; caravanTick() aborts the trip next tick
+    endActivity(b, actCaravan);
     clearSick(b);                                 // R52-F4
     clearKneel(b);                                // R52-F3: explicit, though releaseBarbWork()'s clearTraining() already did it
     if (isLeader(b)) loseLeader(b.race);
@@ -10199,6 +10283,7 @@ void tryLaunchRaid(vector<barb>& barbs, vector<RectangleShape>& squares, const s
     for (int o = 0; o < raceCount; o++) {
         int a = (start + o) % raceCount, b = (a + 1) % raceCount;   // each pair once: (0,1) (1,2) (2,0)
         if (raidPairCooldown[a][b] > 0 || relationTierOf(raceRelation[a][b]) != relCold) continue;
+        if (pairFriendly(a, b)) continue;   // R54-F1: friendly pairs never raid
         if (!stores[a].built || !stores[b].built) continue;
         int ready[2] = {0, 0}, side[2] = {a, b};
         for (int s = 0; s < 2; s++) {
@@ -10246,10 +10331,12 @@ void tryLaunchRaid(vector<barb>& barbs, vector<RectangleShape>& squares, const s
 // R52-F1: the column walk. The head routes to goal and waits while any gap in the column is wider than
 // kRaidColumnStretchPx; each follower walks straight to a spot kRaidColumnGapPx behind the barb ahead.
 // Returns true once the head stands on goal and the column is closed up.
-bool raidColumnStep(vector<barb>& barbs, vector<RectangleShape>& squares, const int (&ri)[kRaidPartySize], Vector2f goal) {
+// R54-F1: sized by the array, so the two-barb caravan walks the same way
+template <int N>
+bool raidColumnStep(vector<barb>& barbs, vector<RectangleShape>& squares, const int (&ri)[N], Vector2f goal) {
     bool stretched = false;
     int prev = -1;
-    for (int k = 0; k < kRaidPartySize; k++) {
+    for (int k = 0; k < N; k++) {
         if (ri[k] < 0) continue;
         if (prev >= 0) {
             Vector2f d = squares[ri[k]].getPosition() - squares[prev].getPosition();
@@ -10259,7 +10346,7 @@ bool raidColumnStep(vector<barb>& barbs, vector<RectangleShape>& squares, const 
     }
     bool headThere = false;
     prev = -1;
-    for (int k = 0; k < kRaidPartySize; k++) {
+    for (int k = 0; k < N; k++) {
         int i = ri[k];
         if (i < 0) continue;
         barb& b = barbs[i];
@@ -10577,6 +10664,209 @@ void drawRaidMarker(RenderWindow& window, int frame) {
     m.setFillColor(c);
     m.setPosition(snapPx(storehousePos[raid.def]) + kRaidMarkerOffset);
     window.draw(m);
+}
+
+// R54-F1: one stock kind by index (0 food, 1 wood, 2 stone, like the plunder packs)
+int& stockKind(raceStock& s, int kind) { return kind == 0 ? s.food : kind == 1 ? s.wood : s.stone; }
+int tradeKeepOf(int kind) { return kind == 0 ? kTradeKeep.food : kind == 1 ? kTradeKeep.wood : kTradeKeep.stone; }
+// the kind race r can best spare (a full kTradeLot above kTradeKeep), skipping `exclude`; -1 = nothing to spare
+int tradeSpareKind(int r, int exclude) {
+    raceStock& s = stockOfRace(r);
+    int best = -1, bestSpare = kTradeLot - 1;
+    for (int k = 0; k < 3; k++) {
+        if (k == exclude) continue;
+        int spare = stockKind(s, k) - tradeKeepOf(k);
+        if (spare > bestSpare) { bestSpare = spare; best = k; }
+    }
+    return best;
+}
+raceStock tradeLot(int kind) { raceStock s{0, 0, 0}; stockKind(s, kind) = kTradeLot; return s; }
+
+bool caravanRecruitOk(const barb& b, int r) {   // raidIdle(): free, on the surface, no job/haul/hunt/claim, not watching or kneeling
+    return b.race == r && raidIdle(b) && b.health >= kTradeMinHealth && !isHungry(b) && !isLeader(b) && !b.shinobi && b.order == needNone;
+}
+// hand a member back to the other systems, standing where it is (every exit goes through here)
+void releaseCaravanBarb(barb& b) {
+    if (b.activity != actCaravan) return;
+    expeditionReset(b);
+    endActivity(b, actCaravan);
+}
+// the one way a trip ends. home = the cart reached the sender's crate (goods go to the sender); otherwise the goods go
+// back to cargoOwner. Every member still there is released.
+void endCaravan(vector<barb>& barbs, bool home) {
+    for (int id : caravan.memberIds) { int i = findBarbById(barbs, id); if (i >= 0) releaseCaravanBarb(barbs[i]); }
+    int to = clampRace(home ? caravan.from : caravan.cargoOwner);
+    raceStock& s = stockOfRace(to);
+    s.food += caravan.cargo.food; s.wood += caravan.cargo.wood; s.stone += caravan.cargo.stone;
+    if (caravanLaden()) printf("CARAVAN GOODS - %s to the %s (%s)\n", lootText(caravan.cargo).c_str(), racePlurals[to], home ? "home" : "returned");
+    caravan = caravanTrip{};
+}
+void abortCaravan(vector<barb>& barbs, const char* why) {
+    int from = clampRace(caravan.from), to = clampRace(caravan.to), owner = clampRace(caravan.cargoOwner);
+    string line = string(racePlurals[from]) + "' caravan to the " + racePlurals[to] + " is called off";
+    if (caravanLaden()) line += " (" + lootText(caravan.cargo) + " back to the " + racePlurals[owner] + ")";
+    printf("---CARAVAN ABORTED--- %s: %s\n", line.c_str(), why);
+    logEvent(line, kTradeTickerTint);
+    endCaravan(barbs, false);
+}
+
+// R54-F1: by daylight, no raid on, a pair that is not cold with its cooldown run out, both crates built and both bells
+// silent. The sender has a spare kind and the rival a different one; two eligible barbs nearest the sender's crate go.
+// The sender's lot is paid at launch and rides on the cart. The pair's cooldown restarts at launch.
+void tryLaunchCaravan(vector<barb>& barbs, vector<RectangleShape>& squares, const storehouse (&stores)[raceCount]) {
+    if (isNightHour(game_time) || raid.active) return;
+    int n = min((int)barbs.size(), (int)squares.size());
+    int start = uniform_int_distribution<int>(0, raceCount - 1)(gen);
+    for (int o = 0; o < raceCount; o++) {
+        int a = (start + o) % raceCount, b = (a + 1) % raceCount;   // each pair once: (0,1) (1,2) (2,0)
+        if (tradePairCooldown[a][b] > 0 || relationTierOf(raceRelation[a][b]) == relCold) continue;
+        if (!stores[a].built || !stores[b].built || raceBell[a] > 0 || raceBell[b] > 0) continue;
+        int first = uniform_int_distribution<int>(0, 1)(gen);
+        for (int d = 0; d < 2; d++) {
+            int from = (d == first) ? a : b, to = from == a ? b : a;
+            int give = tradeSpareKind(from, -1);
+            if (give < 0 || tradeSpareKind(to, give) < 0) continue;
+            int pick[kTradeMembers];
+            bool ok = true;
+            for (int k = 0; k < kTradeMembers && ok; k++) {
+                pick[k] = findNearest(quarterCentre(from), kTradeRecruitRadius, n,
+                                      [&](int i) { return raidCentre(squares[i]); },
+                                      [&](int i) {
+                                          for (int q = 0; q < k; q++) if (pick[q] == i) return true;
+                                          return !caravanRecruitOk(barbs[i], from);
+                                      });
+                ok = pick[k] >= 0;
+            }
+            if (!ok) continue;
+            caravan = caravanTrip{};
+            caravan.active = true;
+            caravan.from = from;
+            caravan.to = to;
+            caravan.phase = caravanTrip::Out;
+            caravan.giveKind = give;
+            caravan.cargo = tradeLot(give);
+            caravan.cargoOwner = from;
+            raceStock& fs = stockOfRace(from);
+            spend(fs, caravan.cargo.wood, caravan.cargo.stone, caravan.cargo.food);
+            tradePairCooldown[a][b] = tradePairCooldown[b][a] = kTradePairCooldownTicks;
+            string names;
+            for (int k = 0; k < kTradeMembers; k++) {
+                barb& m = barbs[pick[k]];
+                expeditionReset(m);   // ends any drill or wander walk first
+                beginActivity(m, actCaravan);
+                caravan.memberIds[k] = m.id;
+                names += string(k == 0 ? "" : k == kTradeMembers - 1 ? " and " : ", ") + m.name;
+            }
+            string line = string(racePlurals[from]) + " send a caravan to the " + racePlurals[to] + " with " + lootText(caravan.cargo) + ": " + names;
+            printf("---CARAVAN OUT--- %s, relation %.2f\n", line.c_str(), raceRelation[from][to]);
+            logEvent(line, kTradeTickerTint);
+            return;
+        }
+    }
+}
+
+// R54-F1: at the rival crate. The sender's lot goes into the rival stock and the rival's best other spare kind comes
+// back on the cart; the relation warms and, at or above kRelFriendlyMinRelation, the friendly timer is (re)set.
+// A rival with nothing left to spare sends the cart home with its own goods.
+void caravanSwap() {
+    int a = clampRace(caravan.from), b = clampRace(caravan.to);
+    int get = tradeSpareKind(b, caravan.giveKind);
+    if (get < 0) {
+        string line = string(racePlurals[b]) + " have nothing to spare: the " + racePlurals[a] + "' caravan heads home";
+        printf("---CARAVAN NO TRADE--- %s\n", line.c_str());
+        logEvent(line, kTradeTickerTint);
+        return;
+    }
+    raceStock& rb = stockOfRace(b);
+    rb.food += caravan.cargo.food; rb.wood += caravan.cargo.wood; rb.stone += caravan.cargo.stone;
+    raceStock sent = caravan.cargo, got = tradeLot(get);
+    spend(rb, got.wood, got.stone, got.food);
+    caravan.cargo = got;
+    caravan.cargoOwner = b;
+    setRelation(a, b, raceRelation[a][b] + kTradeRelationDelta);
+    string line = string(racePlurals[a]) + " and " + racePlurals[b] + " trade " + lootText(sent) + " for " + lootText(got);
+    if (raceRelation[a][b] >= kRelFriendlyMinRelation) {
+        bool renewed = pairFriendly(a, b);
+        relFriendlyTicks[a][b] = relFriendlyTicks[b][a] = kRelFriendlyTicks;
+        line += string(renewed ? ": friendship renewed for " : ": now friendly for ") + to_string(kRelFriendlyDays) + " days";
+    }
+    printf("---CARAVAN TRADE--- %s (relation %.2f)\n", line.c_str(), raceRelation[a][b]);
+    logEvent(line, kTradeTickerTint);
+}
+
+// R54-F1: runs in the fixed-step sim loop after raidTick(), before bellTick(). Counts the pair cooldowns and the
+// friendly timers down once per sim tick (a pair slipping to uneasy loses the tier at once), clears a stale caravan
+// flag, launches on a throttle, then owns the members' walk. Every member id is re-resolved each tick; a missing member
+// or one whose flags conflict (chopping, building, raiding, any other activity) aborts the trip.
+void caravanTick(vector<barb>& barbs, vector<RectangleShape>& squares, const storehouse (&stores)[raceCount]) {
+    static int checkTimer = kTradeCheckTicks;
+    for (int a = 0; a < raceCount; a++)
+        for (int b = a + 1; b < raceCount; b++) {
+            if (tradePairCooldown[a][b] > 0) tradePairCooldown[a][b] = --tradePairCooldown[b][a];
+            if (relFriendlyTicks[a][b] <= 0) continue;
+            bool soured = relationTierOf(raceRelation[a][b]) != relNeutral;
+            relFriendlyTicks[a][b] = relFriendlyTicks[b][a] = soured ? 0 : relFriendlyTicks[a][b] - 1;
+            if (relFriendlyTicks[a][b] > 0) continue;
+            string line = string(racePlurals[a]) + " and " + racePlurals[b] + (soured ? ": the friendship sours" : " drift apart: no longer friendly");
+            printf("RELATION - %s (%.2f)\n", line.c_str(), raceRelation[a][b]);
+            logEvent(line, kTradeTickerTint);
+        }
+    int n = min((int)barbs.size(), (int)squares.size());
+
+    for (int i = 0; i < n; i++) {   // backstop: a caravan flag with no caravan entry behind it is cleared
+        barb& b = barbs[i];
+        if (b.activity != actCaravan) continue;
+        bool listed = false;
+        if (caravan.active) for (int id : caravan.memberIds) listed = listed || id == b.id;
+        if (!listed) { printf("CARAVAN FLAG CLEARED - barb %d (no caravan entry)\n", b.id); releaseCaravanBarb(b); }
+    }
+
+    if (!caravan.active) {
+        if (--checkTimer <= 0) { checkTimer = kTradeCheckTicks; tryLaunchCaravan(barbs, squares, stores); }
+        return;
+    }
+    int from = clampRace(caravan.from), to = clampRace(caravan.to);
+    caravan.ticks++;
+    int ci[kTradeMembers];
+    for (int k = 0; k < kTradeMembers; k++) {
+        ci[k] = findBarbById(barbs, caravan.memberIds[k]);
+        if (ci[k] < 0 || ci[k] >= n) { abortCaravan(barbs, "member gone"); return; }
+        const barb& m = barbs[ci[k]];
+        if (m.activity != actCaravan || inRaid(m) || m.chopping || m.building || m.movingbspot || m.deertargeting
+            || m.race != from || m.health <= 0) {
+            printf("CARAVAN CONFLICT - barb %d (%s)\n", m.id, activityDefs[m.activity].name);
+            abortCaravan(barbs, "member state conflict");
+            return;
+        }
+    }
+    if (caravan.ticks > kTradeMaxTicks || !stores[from].built || (caravan.phase != caravanTrip::Home && !stores[to].built)) {
+        abortCaravan(barbs, caravan.ticks > kTradeMaxTicks ? "timeout" : "crate gone");
+        return;
+    }
+
+    if (caravan.phase == caravanTrip::Out) {
+        if (raidColumnStep(barbs, squares, ci, raidCrateSpot(to, 0))) {
+            caravan.phase = caravanTrip::Trade;
+            caravan.stayTicks = 0;
+            printf("CARAVAN ARRIVES - %s at the %s crate\n", racePlurals[from], racePlurals[to]);
+        }
+        return;
+    }
+    if (caravan.phase == caravanTrip::Trade) {
+        for (int k = 0; k < kTradeMembers; k++) {   // stand at the crate
+            barb& m = barbs[ci[k]];
+            if (m.moving) { m.moving = false; clearRoute(m); m.stepTimer = 0; }
+        }
+        if (++caravan.stayTicks < kTradeStayTicks) return;
+        caravanSwap();
+        caravan.phase = caravanTrip::Home;
+        return;
+    }
+    // Home: released on reaching their own crate; the cart's goods go into the sender's stock
+    if (raidColumnStep(barbs, squares, ci, raidCrateSpot(from, 0))) {
+        printf("CARAVAN HOME - %s back at their crate\n", racePlurals[from]);
+        endCaravan(barbs, true);
+    }
 }
 
 void barbspawner(vector<RectangleShape>& squares, vector<barb>& barbs, const vector<house>& houses, vector<RectangleShape>& houseshapes, vector<birthRing>& rings) {
@@ -12794,6 +13084,7 @@ int main() {
                 prowlerTick(prowlers, barbs, squares, houses, houseshapes, fire);   // R48-F1: bites land before starveDeathTick()
                 watchTick(barbs, squares, prowlers);   // R51-F1: watchmen patrol and fight; slain prowlers fade, prowlerTick() removes them
                 raidTick(barbs, squares, stores);   // R52-F1: raid march and fight; sets raidThreat[] for bellTick() just below
+                caravanTick(barbs, squares, stores);   // R54-F1: caravans, swaps and the friendly timers, once per sim tick
                 bellTick(barbs, squares, houses, houseshapes, wolves, stores, smoke, dwarfForge, fields,
                          trees, tris, rocks, octs, bushes);   // INBOX-F1: after the wolves move
                 expeditionTick(barbs, squares, wolves, stores);   // R45-F2: after the wolves and the bell, before hungerTick()
