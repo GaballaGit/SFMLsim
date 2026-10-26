@@ -655,7 +655,8 @@ const int watchRingPoints = 72;
 // armed barbs (1px red pennant on the spear) to the rival crate. A pulsing red marker sits on the target crate, the rival
 // bell rings through bellTick() (raidThreat[]), and raidTick() owns every raider's and defender's movement and runs its own
 // fight resolver. Damage never takes a barb below kRaidHealthFloor, so a raid costs health only. The win/loss ticker line
-// is the only outcome: no loot, no grudge, no relation change. raidParty holds stable barb ids, re-resolved every tick.
+// is the only outcome: no loot, no grudge, no relation change (R53-F1 adds the plunder below). raidParty holds stable
+// barb ids, re-resolved every tick.
 const int kRaidPartySize = 3;                 // raiders in the column
 const int kRaidMinMembers = 2;                // fewer live (or unbeaten, in the fight) raiders than this ends the raid
 const int kRaidDefenderMax = 3;               // defenders called out at once
@@ -685,6 +686,20 @@ const Color kRaidMarkerColor(222, 54, 46);    // alpha pulses between kRaidMarke
 const int kRaidMarkerAlphaMin = 90;
 const float kRaidMarkerPulseRate = 0.12f;     // radians per drawn frame (~0.9s period at 60fps)
 const Color kRaidTickerTint(222, 120, 104);   // launch and outcome ticker lines
+// R53-F1 Plunder, raid phase 2: on a won raid each unbeaten raider lifts one capped pack from the rival race's stock,
+// deducted at pickup, and carries it home as a 2px bundle at 0.8x walk. settleLoot() is the one way a pack ends: deposited
+// at the home crate, or dropped (abort, release away from home, death), in which case it goes back to the robbed race.
+// The pair's relation drops once per plundering raid. Envoys are phase 3.
+const int kLootPackFood = 3;                  // pack size per kind: a raider lifts one kind, the one the rival can spare most
+const int kLootPackWood = 3;
+const int kLootPackStone = 2;
+const int kLootRaidCap = 8;                   // units lifted by the whole raid at most
+const float kLootStockFrac = 0.3f;            // and never more than this share of any one rival stock...
+const raceStock kLootRivalFloor{6, 3, 6};     // ...nor below this floor (wood, stone, food), so a raid can't cripple a rival
+const float kLootSpeedMult = 0.8f;            // laden walk speed multiplier (folds into stepLimit())
+const float kLootRelationDelta = 0.15f;       // relation drop for the pair when anything is plundered
+const Vector2f kLootBundleSize(2.0f, 1.0f);   // carried low beside the body, one column out from the spear's foot
+const Color kLootBundleColor(176, 120, 190);  // muted violet sack: apart from every task stripe, the red pennant and the relic gold
 
 // Skittish deer: bolt away from a nearby barb for a short, capped time, then a cooldown so hunts can still land
 const int deerStepInterval = 3;            // ticks per 1px step while wandering (deer row of speciesDefs)
@@ -2860,6 +2875,8 @@ struct barb {
     int sickImmune = 0;          // R52-F4: ticks of immunity left after a recovery
     int cure = 0;                // R52-F4: reserved for phase 2 (herb hut remedy); unused in phase 1
     barbActivity activity = actNone; // R53-F4: the one exclusive state; written only by beginActivity()/endActivity()
+    raceStock loot{0, 0, 0};     // R53-F1: plunder pack carried home; set only by raidTick() on a win, emptied only by settleLoot()
+    int lootFrom = -1;           // R53-F1: race the pack was taken from (gets it back on a drop); -1 = no pack
 };
 // R53-F4: the only writer of barb.activity on the way in. Starting a second activity over a live one is a bug: a debug
 // build aborts; a release build ends the old one (with its cleanup) first so no state is left half-set.
@@ -2993,6 +3010,7 @@ void clearSick(barb& b) {
     b.sickImmune = 0;
     b.cure = 0;
 }
+bool lootLaden(const barb& b) { return b.loot.food + b.loot.wood + b.loot.stone > 0; }   // R53-F1
 void raidMemberLost(const barb& b) {
     if (!raid.active || !inRaid(b)) return;
     for (auto& id : raid.raiderIds) if (id == b.id) id = -1;
@@ -3257,6 +3275,38 @@ void setRelation(int a, int b, float v) {
         line = after == relUneasy ? pair + " thaw, but stay wary" : pair + " are at peace again";
     printf("RELATION - %s %s (%.2f)\n", pair.c_str(), after > before ? "worse" : "better", v);
     logEvent(line, after > before ? kRelationTickerColdTint : Color::Transparent);
+}
+
+// R53-F1: "3 food, 2 wood and 2 stone" (empty kinds skipped)
+string lootText(const raceStock& s) {
+    string parts[3];
+    int n = 0;
+    if (s.food > 0) parts[n++] = to_string(s.food) + " food";
+    if (s.wood > 0) parts[n++] = to_string(s.wood) + " wood";
+    if (s.stone > 0) parts[n++] = to_string(s.stone) + " stone";
+    string out;
+    for (int k = 0; k < n; k++) out += string(k == 0 ? "" : k == n - 1 ? " and " : ", ") + parts[k];
+    return out;
+}
+// R53-F1: the one way a plunder pack ends. home = deposited into the raider's own race stock (back at its crate); otherwise
+// dropped (abort, release away from home, death) and handed back to the robbed race. Always leaves the barb with no pack,
+// so nothing outlives a swapRemove. Safe on a barb with no pack.
+void settleLoot(barb& b, bool home) {
+    if (!lootLaden(b)) { b.loot = raceStock{0, 0, 0}; b.lootFrom = -1; return; }
+    string what = lootText(b.loot);
+    int own = clampRace(b.race);
+    if (home) {
+        raceStock& s = stockOfRace(own);
+        s.food += b.loot.food; s.wood += b.loot.wood; s.stone += b.loot.stone;
+        printf("LOOT DEPOSITED - %s (id %d) brings %s home to the %s\n", b.name, b.id, what.c_str(), racePlurals[own]);
+    } else if (b.lootFrom >= 0 && b.lootFrom < raceCount) {
+        raceStock& s = stockOfRace(b.lootFrom);
+        s.food += b.loot.food; s.wood += b.loot.wood; s.stone += b.loot.stone;
+        printf("LOOT DROPPED - %s (id %d) drops %s, back to the %s\n", b.name, b.id, what.c_str(), racePlurals[b.lootFrom]);
+        logEvent(string(racePlurals[b.lootFrom]) + " recover " + what + " dropped by the " + racePlurals[own], kRaidTickerTint);
+    } else printf("LOOT LOST - %s (id %d) drops %s (no owner)\n", b.name, b.id, what.c_str());
+    b.loot = raceStock{0, 0, 0};
+    b.lootFrom = -1;
 }
 
 // a claim clash between races a and b inside owner's frontier; counted at most once per pair per cooldown
@@ -3579,7 +3629,7 @@ const char* barbTaskName(const barb& b) {
              : "expedition: heading home";
     if (b.activity == actRaidDefend) return b.raidPreyId >= 0 ? "defending the crate: fighting" : "defending the crate";   // R52-F1
     if (b.activity == actRaidAttack)
-        return raid.phase == raidParty::Home ? "raiding: heading home"
+        return raid.phase == raidParty::Home ? (lootLaden(b) ? "raiding: carrying plunder home" : "raiding: heading home")   // R53-F1
              : b.raidBeaten ? "raiding: beaten"
              : raid.phase == raidParty::Fight ? (b.raidPreyId >= 0 ? "raiding: fighting" : "raiding: at the crate")
              : "raiding: on the march";
@@ -3926,6 +3976,7 @@ int stepLimit(const barb& b) {
     int lim = stepLimit() * (isHungry(b) ? hungerWorkSlowdown : 1);
     float speed = (b.trait == traitSwift ? swiftStepSpeed : 1.0f) * (b.shinobi ? shinobiStepSpeed : 1.0f); // R25-F1, R25-F2
     if (b.sick > 0) speed *= sickSpeedMult;   // R52-F4: the cough slows the walk through the same multiplier
+    if (lootLaden(b)) speed *= kLootSpeedMult;   // R53-F1: a plunder pack slows the walk home the same way
     return speed != 1.0f ? max(1, (int)(lim / speed)) : lim;
 }
 
@@ -4874,6 +4925,12 @@ void drawBarbs(RenderWindow& window, const vector<barb>& barbs, const vector<Rec
                 dot.setPosition(top + Vector2f(1.0f, 0.0f));
                 window.draw(dot);
             }
+        }
+        if (lootLaden(b)) {   // R53-F1: 2px violet pack on the bottom body row, one column out from the spear's foot (the
+            stripe.setSize(kLootBundleSize);   // shaft's side+1 pixels sit on rows 0-1, so this is clear for humans and elves)
+            stripe.setFillColor(kLootBundleColor);
+            stripe.setPosition(Vector2f(side + 1.0f, bodyTop + bodyH - kLootBundleSize.y));   // bobs with the body
+            window.draw(stripe);
         }
         if (b.activity == actWatch)   // R51-F1: torch held out left at head height, clear of horns, ears and the trait dot; drawn after the overlay
             watchTorchPts.push_back(Vector2f(base.x - 2.0f, bodyTop - 1.0f));
@@ -8595,6 +8652,7 @@ void removeBarb(vector<barb>& barbs, vector<RectangleShape>& squares, int i,
     setWeapon(b, weaponDrop);                     // R47-F8: the unequip half of the helper (craft already refunded above)
     clearWatch(b);                                // R51-F1: explicit, though releaseBarbWork()'s clearTraining() already did it
     raidMemberLost(b);                            // R52-F1: drops its raid id; raidTick() aborts under kRaidMinMembers raiders
+    settleLoot(b, false);                         // R53-F1: a dead raider's pack goes back to the robbed race before the swapRemove
     clearRaid(b);
     clearSick(b);                                 // R52-F4
     clearKneel(b);                                // R52-F3: explicit, though releaseBarbWork()'s clearTraining() already did it
@@ -9903,15 +9961,17 @@ void joinRaid(barb& b, raidRole side) {
     if (side == raidAttacker) { b.order = needNone; b.orderTicks = 0; }
 }
 // R52-F1: hand a barb back to the other systems, standing where it is (every exit goes through here)
-void releaseRaidBarb(barb& b) {
+// R53-F1: home = released at its own crate after the walk back (the pack is deposited); any other exit drops it
+void releaseRaidBarb(barb& b, bool home = false) {
+    settleLoot(b, home);
     if (!inRaid(b)) return;
     expeditionReset(b);
     clearRaid(b);
 }
 
 // R52-F1: the one way a raid ends: every member still in the raid is released, the bell threat drops
-void endRaid(vector<barb>& barbs) {
-    for (int id : raid.raiderIds) { int i = findBarbById(barbs, id); if (i >= 0) releaseRaidBarb(barbs[i]); }
+void endRaid(vector<barb>& barbs, bool home = false) {
+    for (int id : raid.raiderIds) { int i = findBarbById(barbs, id); if (i >= 0) releaseRaidBarb(barbs[i], home); }
     for (int id : raid.defenderIds) { int i = findBarbById(barbs, id); if (i >= 0) releaseRaidBarb(barbs[i]); }
     raid = raidParty{};
     for (auto& t : raidThreat) t = false;
@@ -10078,6 +10138,50 @@ bool raidFightStep(vector<barb>& barbs, vector<RectangleShape>& squares, int i, 
     return true;
 }
 
+// R53-F1: the pickup, on the tick a raid is won. Each unbeaten raider lifts one pack of the kind the rival can spare
+// most, deducted from the rival stock at once. The raid takes at most kLootRaidCap units, at most kLootStockFrac of any
+// one stock and never below kLootRivalFloor. One ticker line names the race and the amount; the pair's relation drops
+// once if anything was taken.
+void raidPlunder(vector<barb>& barbs, const int (&ri)[kRaidPartySize]) {
+    int att = clampRace(raid.att), def = clampRace(raid.def);
+    raceStock& rs = stockOfRace(def);
+    const int have[3] = {rs.food, rs.wood, rs.stone};
+    const int floorOf[3] = {kLootRivalFloor.food, kLootRivalFloor.wood, kLootRivalFloor.stone};
+    const int pack[3] = {kLootPackFood, kLootPackWood, kLootPackStone};
+    int avail[3];
+    for (int k = 0; k < 3; k++) avail[k] = max(0, min((int)(have[k] * kLootStockFrac), have[k] - floorOf[k]));
+    int capLeft = kLootRaidCap;
+    raceStock total{0, 0, 0};
+    for (int k = 0; k < kRaidPartySize && capLeft > 0; k++) {
+        int i = ri[k];
+        if (i < 0 || barbs[i].raidBeaten || barbs[i].activity != actRaidAttack) continue;
+        int kind = 0;
+        for (int q = 1; q < 3; q++) if (avail[q] > avail[kind]) kind = q;
+        int take = min(min(pack[kind], avail[kind]), capLeft);
+        if (take <= 0) break;
+        avail[kind] -= take;
+        capLeft -= take;
+        barb& b = barbs[i];
+        settleLoot(b, false);   // never stack on a stale pack
+        raceStock got{0, 0, 0};
+        (kind == 0 ? got.food : kind == 1 ? got.wood : got.stone) = take;
+        spend(rs, got.wood, got.stone, got.food);
+        b.loot = got;
+        b.lootFrom = def;
+        total.food += got.food; total.wood += got.wood; total.stone += got.stone;
+        printf("LOOT LIFTED - %s (id %d) lifts %s from the %s\n", b.name, b.id, lootText(got).c_str(), racePlurals[def]);
+    }
+    if (total.food + total.wood + total.stone == 0) {
+        printf("LOOT NONE - the %s stock is at its floor\n", racePlurals[def]);
+        logEvent(string(racePlurals[att]) + " find the " + racePlurals[def] + "' stores too bare to plunder", kRaidTickerTint);
+        return;
+    }
+    string line = string(racePlurals[att]) + " plunder " + lootText(total) + " from the " + racePlurals[def];
+    printf("---RAID PLUNDER--- %s\n", line.c_str());
+    logEvent(line, kRaidTickerTint);
+    setRelation(att, def, raceRelation[att][def] - kLootRelationDelta);
+}
+
 // R52-F1: runs after watchTick() and before bellTick() (which reads raidThreat[]). Owns every raider's and defender's
 // movement. Re-resolves every id each tick and drops a missing or dead member (its flags restored if it is still
 // there); under kRaidMinMembers raiders the raid breaks up. March: the column walks to the rival crate. Fight: inside
@@ -10094,7 +10198,10 @@ void raidTick(vector<barb>& barbs, vector<RectangleShape>& squares, const storeh
 
     for (int i = 0; i < n; i++) {   // backstop: a raid flag with no raid entry behind it is cleared
         barb& b = barbs[i];
-        if (!inRaid(b)) continue;
+        if (!inRaid(b)) {
+            if (lootLaden(b)) { printf("LOOT BACKSTOP - barb %d has a pack outside the raid\n", b.id); settleLoot(b, false); }   // R53-F1
+            continue;
+        }
         bool listed = false;
         if (raid.active) {
             if (b.activity == actRaidAttack) for (int id : raid.raiderIds) listed = listed || id == b.id;
@@ -10242,13 +10349,14 @@ void raidTick(vector<barb>& barbs, vector<RectangleShape>& squares, const storeh
                                                 : " (the raiders tire)");
         printf("---RAID %s--- %s after %d fight ticks\n", won ? "WON" : "LOST", line.c_str(), raid.fightTicks);
         logEvent(line, kRaidTickerTint);
+        if (won) raidPlunder(barbs, ri);   // R53-F1
         return;
     }
 
     // Home: beaten raiders walk too; released on reaching their own crate
     if (raidColumnStep(barbs, squares, ri, raidCrateSpot(att, 0))) {
         printf("RAID HOME - %s back at their crate (%s)\n", racePlurals[att], raid.won ? "won" : "lost");
-        endRaid(barbs);
+        endRaid(barbs, true);   // R53-F1: packs are deposited here
     }
 }
 
