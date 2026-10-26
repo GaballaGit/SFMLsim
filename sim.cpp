@@ -303,6 +303,21 @@ const seasonDef seasonDefs[seasonCount] = {
 };
 const char* const frostLine = "Frost is coming";   // dawn of autumn's last day
 int game_day = 0;   // day 0 = spring, day 1 of year 1
+// R54-F2 The Chronicle, phase 1: a dawn autosave of the clock, race stocks, relations and houses, restored at startup.
+// Binary, field by field (int32 each, never raw structs), magic + version header, written to a temp file then renamed.
+const char* const kChroniclePath = "chronicle.sav";
+const char* const kChronicleTmpPath = "chronicle.sav.tmp";
+const int32_t kChronicleMagic = 0x4C524843;         // "CHRL" little-endian
+const int32_t kChronicleEndMark = 0x444E4543;       // "CEND": trailer, so a truncated file is rejected
+const int32_t kChronicleVersion = 1;
+const int kChronicleMaxHouses = 600;                // a load with more houses than this is rejected outright
+const int kChronicleMaxDay = 1000000;               // game_day bound on load
+const int kChronicleMaxStock = 1000000;             // per wood/stone/food bound on load
+const float kChronicleRelScale = 10000.0f;          // relations stored as round(v * scale)
+const int kChronicleHouseTries = 60;                // quarter spots tried for a restored house whose old spot is blocked
+const int kChronicleSaveLineTicks = 150;            // the dawn save line shows ~2.5 s (ticker lines normally ~5 s)
+const Color kChronicleSaveTint(118, 126, 118);      // dim grey-green: low contrast on the black ticker strip
+const Color kChronicleRestoreTint(190, 180, 150);   // muted parchment for the one restore line
 int seasonOf(int day) { return (day % yearDays) / daysPerSeason; }
 int dayInSeason(int day) { return day % daysPerSeason; }
 bool isWinter() { return seasonOf(game_day) == seasonWinter; }
@@ -5997,6 +6012,7 @@ FloatRect drawHud(RenderWindow& window, const Font& font, const hudValues& v) {
         {iconHouse,  to_string(v.houses), pal.hudText},
         {v.night ? iconMoon : iconSun, hour, pal.hudText},
         {iconSeason, sd.name, pal.hudText, sd.iconKey, seasonW},   // R51-F3: leaf icon in the season's colours
+        {iconCount, "Year " + to_string(v.day / yearDays + 1), pal.hudText},   // R54-F2: elapsed year, text only
         {v.paused ? iconPause : iconSpeed, v.paused ? string("Paused") : string(speed), v.paused ? pal.hudAlert : pal.hudText},
     };
     if (v.goldFound) cells.push_back({iconCount, "gold " + to_string(v.gold), hudGoldColor}); // R46-F1a: text only (iconCount = no icon)
@@ -6649,6 +6665,20 @@ bool homesteadSpotOk(const vector<barb>& barbs, const vector<house>& houses, int
     return true;
 }
 
+// R54-F2: the one way a house enters the world; houses and houseshapes always grow together at the same index, and the id
+// comes from nextHouseId. Used by buildhouse() and the chronicle restore.
+int addHouse(vector<house>& houses, vector<RectangleShape>& houseshapes, int x, int y, bool foundation, barbRace race) {
+    house h{x, y, foundation, nextHouseId++, race};
+    houses.push_back(h);
+    RectangleShape hs(Vector2f(4, 4));
+    hs.setPosition(Vector2f(h.x, h.y));
+    hs.setFillColor(houseWallColor);
+    hs.setOutlineColor(Color(54, 35, 16));
+    hs.setOutlineThickness(1);
+    houseshapes.push_back(hs);
+    return (int)houses.size() - 1;
+}
+
 void buildhouse(vector<barb>& barbs,vector<RectangleShape>& squares, vector<house>& houses, vector<RectangleShape>& houseshapes, const fieldGrid& fields,
                 const storehouse (&stores)[raceCount], const vector<tree>& trees, const vector<rock>& rocks, const vector<CircleShape>& bushshapes) {
     bool canclaim = (int)houses.size() < (int)barbs.size();
@@ -6728,15 +6758,8 @@ void buildhouse(vector<barb>& barbs,vector<RectangleShape>& squares, vector<hous
                 if (workTick(b)) b.timer++;
                 if (b.timer >= houseBuildTicks) {
                     b.reservedwood = false;
-                    house h{b.targetx, b.targety, b.reservedstone > 0, nextHouseId++, b.race};
+                    const house h = houses[addHouse(houses, houseshapes, b.targetx, b.targety, b.reservedstone > 0, b.race)];   // R54-F2
                     b.reservedstone = 0;
-                    houses.push_back(h);
-                    RectangleShape hs(Vector2f(4, 4));
-                    hs.setPosition(Vector2f(h.x, h.y));
-                    hs.setFillColor(houseWallColor);
-                    hs.setOutlineColor(Color(54, 35, 16));
-                    hs.setOutlineThickness(1);
-                    houseshapes.push_back(hs);
                     bool far = isHomestead(h);   // R44-F4a
                     if (h.race >= 0 && h.race < raceCount && stores[h.race].built) {
                         seedQuarterTrail(h.race, houses, fields);   // R43-F1: only on placement, never per tick
@@ -6755,6 +6778,184 @@ void buildhouse(vector<barb>& barbs,vector<RectangleShape>& squares, vector<hous
             }
         }
     }
+}
+
+// R54-F2 The Chronicle, phase 1. Saved: the clock, race stocks, relations and houses. Houses are stored as offsets from
+// their race's crate, because the map and the quarters are rolled fresh at every start. Barbs, trails and the other
+// buildings are phase 2. Transient state (shortage announcements, clash cooldowns, friendly timers, raids, caravans) is
+// never saved and starts clean.
+struct chronicleHouse { int race, dx, dy; bool foundation; };
+struct chronicleData {
+    int day = 0, hour = 0;
+    raceStock stocks[raceCount];
+    float relation[raceCount][raceCount] = {};
+    vector<chronicleHouse> houses;
+};
+
+bool chronPut(FILE* f, int32_t v) { return fwrite(&v, sizeof v, 1, f) == 1; }
+bool chronGet(FILE* f, int32_t& v) { return fread(&v, sizeof v, 1, f) == 1; }
+// one bounded field: false on a short read or a value outside lo..hi
+bool chronGetIn(FILE* f, int lo, int hi, int& out) {
+    int32_t v = 0;
+    if (!chronGet(f, v) || v < lo || v > hi) return false;
+    out = v;
+    return true;
+}
+Vector2i chronicleCrate(int r) { Vector2f qc = quarterCentre(r); return Vector2i((int)floor(qc.x), (int)floor(qc.y)); }
+
+// Dawn autosave: written to kChronicleTmpPath, then renamed over kChroniclePath, so a crash mid-write never eats the old one
+bool chronicleSave(const vector<house>& houses) {
+    FILE* f = fopen(kChronicleTmpPath, "wb");
+    if (!f) { printf("CHRONICLE - save failed: cannot open %s\n", kChronicleTmpPath); return false; }
+    bool ok = chronPut(f, kChronicleMagic) && chronPut(f, kChronicleVersion) && chronPut(f, raceCount)
+           && chronPut(f, game_day) && chronPut(f, game_time);
+    for (int r = 0; ok && r < raceCount; r++)
+        ok = chronPut(f, stock[r].wood) && chronPut(f, stock[r].stone) && chronPut(f, stock[r].food);
+    for (int a = 0; ok && a < raceCount; a++)
+        for (int b = a + 1; ok && b < raceCount; b++)
+            ok = chronPut(f, (int32_t)lround(clamp(raceRelation[a][b], kRelationMin, kRelationMax) * kChronicleRelScale));
+    int n = min((int)houses.size(), kChronicleMaxHouses);   // never write a file the loader would reject
+    ok = ok && chronPut(f, n);
+    for (int i = 0; ok && i < n; i++) {
+        const house& h = houses[i];
+        int r = clampRace(h.race);
+        Vector2i c = chronicleCrate(r);
+        ok = chronPut(f, r) && chronPut(f, h.x - c.x) && chronPut(f, h.y - c.y) && chronPut(f, h.hasFoundation ? 1 : 0);
+    }
+    ok = ok && chronPut(f, kChronicleEndMark);
+    if (fclose(f) != 0) ok = false;
+    if (!ok) {
+        printf("CHRONICLE - save failed: write error\n");
+        remove(kChronicleTmpPath);
+        return false;
+    }
+    if (rename(kChronicleTmpPath, kChroniclePath) != 0) {   // Windows rename() will not replace an existing file
+        remove(kChroniclePath);
+        if (rename(kChronicleTmpPath, kChroniclePath) != 0) {
+            printf("CHRONICLE - save failed: cannot rename %s\n", kChronicleTmpPath);
+            remove(kChronicleTmpPath);
+            return false;
+        }
+    }
+    printf("CHRONICLE - saved day %d (year %d): %d houses\n", game_day + 1, game_day / yearDays + 1, n);
+    return true;
+}
+
+// Reads and bounds-checks the whole file into out; nothing global is touched here. why = the rejection reason.
+bool chronicleRead(chronicleData& out, const char*& why) {
+    why = nullptr;
+    FILE* f = fopen(kChroniclePath, "rb");
+    if (!f) return false;   // no chronicle yet: a fresh world, not an error
+    chronicleData d;
+    int32_t v = 0;
+    int n = 0;
+    const int relLo = (int)lround(kRelationMin * kChronicleRelScale), relHi = (int)lround(kRelationMax * kChronicleRelScale);
+    const int offMax = (int)worldSize;
+    do {
+        if (!chronGet(f, v) || v != kChronicleMagic) { why = "not a chronicle file"; break; }
+        if (!chronGet(f, v) || v != kChronicleVersion) { why = "unknown version"; break; }
+        if (!chronGet(f, v) || v != raceCount) { why = "race count differs"; break; }
+        if (!chronGetIn(f, 0, kChronicleMaxDay, d.day) || !chronGetIn(f, 0, 23, d.hour)) { why = "clock out of range"; break; }
+        bool ok = true;
+        for (int r = 0; ok && r < raceCount; r++)
+            ok = chronGetIn(f, 0, kChronicleMaxStock, d.stocks[r].wood) && chronGetIn(f, 0, kChronicleMaxStock, d.stocks[r].stone)
+              && chronGetIn(f, 0, kChronicleMaxStock, d.stocks[r].food);
+        if (!ok) { why = "stock out of range"; break; }
+        for (int a = 0; ok && a < raceCount; a++)
+            for (int b = a + 1; ok && b < raceCount; b++) {
+                int q = 0;
+                ok = chronGetIn(f, relLo, relHi, q);
+                d.relation[a][b] = d.relation[b][a] = q / kChronicleRelScale;
+            }
+        if (!ok) { why = "relation out of range"; break; }
+        if (!chronGet(f, v)) { why = "truncated"; break; }
+        if (v < 0 || v > kChronicleMaxHouses) { why = "house count over the cap"; break; }
+        n = v;
+        d.houses.reserve(n);
+        for (int i = 0; ok && i < n; i++) {
+            chronicleHouse h{};
+            int fnd = 0;
+            ok = chronGetIn(f, 0, raceCount - 1, h.race) && chronGetIn(f, -offMax, offMax, h.dx)
+              && chronGetIn(f, -offMax, offMax, h.dy) && chronGetIn(f, 0, 1, fnd);
+            h.foundation = fnd != 0;
+            if (ok) d.houses.push_back(h);
+        }
+        if (!ok) { why = "house out of range"; break; }
+        if (!chronGet(f, v) || v != kChronicleEndMark) { why = "missing end mark"; break; }
+        if (fgetc(f) != EOF) { why = "trailing data"; break; }
+    } while (false);
+    fclose(f);
+    if (why) return false;
+    out = d;
+    return true;
+}
+
+// A restored house's spot: the normal house checks, off the bushes, and the homestead checks when it lies past the clearing
+bool chronicleSpotOk(const vector<barb>& barbs, const vector<house>& houses, const fieldGrid& fields, int r, Vector2f qc,
+                     int tx, int ty, const vector<tree>& trees, const vector<rock>& rocks, const vector<CircleShape>& bushshapes) {
+    if (!houseSpotOk(barbs, houses, fields, r, qc, tx, ty)) return false;
+    FloatRect slab(Vector2f(tx - 3.0f, ty - 3.0f), houseSlabSize);
+    for (auto& bs : bushshapes) if (slab.findIntersection(bs.getGlobalBounds())) return false;
+    Vector2f d = Vector2f(tx + 2.0f, ty + 2.0f) - qc;
+    float cr = quarterClearRadiusFor(r);
+    if (d.x * d.x + d.y * d.y > cr * cr) return homesteadSpotOk(barbs, houses, r, qc, tx, ty, trees, rocks, bushshapes);
+    return true;
+}
+
+// Startup restore. Runs once the world, trees and houseshapes exist; the file is fully read and checked before any global
+// changes. Houses go back through addHouse() at their old offset from the crate, or the nearest free quarter spot.
+void chronicleRestore(const vector<barb>& barbs, vector<house>& houses, vector<RectangleShape>& houseshapes, const fieldGrid& fields,
+                      const vector<tree>& trees, const vector<rock>& rocks, const vector<CircleShape>& bushshapes) {
+    chronicleData d;
+    const char* why = nullptr;
+    if (!chronicleRead(d, why)) {
+        if (why) {
+            printf("CHRONICLE - load rejected (%s): a new chronicle begins\n", why);
+            logEvent("Chronicle unreadable - a new one begins", kChronicleSaveTint);
+        } else printf("CHRONICLE - none found: a new chronicle begins\n");
+        return;
+    }
+    game_day = d.day;
+    game_time = d.hour;
+    for (int r = 0; r < raceCount; r++) stock[r] = d.stocks[r];
+    for (int a = 0; a < raceCount; a++)
+        for (int b = 0; b < raceCount; b++) raceRelation[a][b] = a == b ? 0.0f : d.relation[a][b];   // direct: no tier lines on load
+    for (auto& row : stockAnnounced) for (auto& s : row) s = false;   // transient: re-armed against the restored stocks
+    for (auto& row : relationClashCooldown) for (auto& c : row) c = 0;
+    int placed = 0, moved = 0, dropped = 0;
+    for (auto& ch : d.houses) {
+        Vector2f qc = quarterCentre(ch.race);
+        Vector2i c = chronicleCrate(ch.race);
+        int tx = c.x + ch.dx, ty = c.y + ch.dy;
+        bool ok = chronicleSpotOk(barbs, houses, fields, ch.race, qc, tx, ty, trees, rocks, bushshapes);
+        if (!ok) {   // the new map put something there: the same disc roll buildhouse() uses for a quarter house
+            int qr = (int)quarterRadiusFor(ch.race);
+            uniform_int_distribution<int> spot(-qr, qr);
+            for (int k = 0; k < kChronicleHouseTries && !ok; k++) {
+                int dx = spot(gen), dy = spot(gen);
+                if (dx * dx + dy * dy > qr * qr) continue;
+                tx = (int)qc.x + dx; ty = (int)qc.y + dy;
+                ok = chronicleSpotOk(barbs, houses, fields, ch.race, qc, tx, ty, trees, rocks, bushshapes);
+            }
+            if (ok) moved++;
+        }
+        if (!ok) { dropped++; continue; }
+        addHouse(houses, houseshapes, tx, ty, ch.foundation, (barbRace)ch.race);
+        placed++;
+    }
+    int year = game_day / yearDays + 1;
+    const char* seasonName = seasonDefs[seasonOf(game_day)].name;
+    printf("CHRONICLE - restored day %d %02d:00 (year %d, %s): %d houses (%d moved, %d dropped), population %d\n",
+           game_day + 1, game_time, year, seasonName, placed, moved, dropped, (int)barbs.size());
+    logEvent("Chronicle restored: year " + to_string(year) + ", " + seasonName + ", population " + to_string(barbs.size()),
+             kChronicleRestoreTint);
+}
+
+// R54-F2: the brief, dim dawn line; starts part-way through its life so it leaves the ticker early
+void chronicleDawn(const vector<house>& houses) {
+    if (!chronicleSave(houses)) { logEvent("Chronicle could not be saved", kChronicleSaveTint); return; }
+    pushEvent("Chronicle saved, day " + to_string(game_day + 1), kChronicleSaveTint, true);
+    if (!events.empty()) events.back().age = max(events.back().age, eventFadeTicks - kChronicleSaveLineTicks);
 }
 
 // Slab top-left of a shrine built from this standing spot
@@ -12939,6 +13140,8 @@ int main() {
         s.stone = max(s.stone, startStock.stone);
         s.food = max(s.food, startStock.food);
     }
+    // R54-F2: after the world, trees and houseshapes exist, so restored houses are checked against the new map
+    chronicleRestore(barbs, houses, houseshapes, fields, trees, rocks, bushshapes);
 
     VertexArray treeVerts(PrimitiveType::Triangles);
     VertexArray rockVerts(PrimitiveType::Triangles), bushVerts(PrimitiveType::Triangles), stumpVerts(PrimitiveType::Triangles);   // rebuilt every frame
@@ -13089,7 +13292,11 @@ int main() {
                          trees, tris, rocks, octs, bushes);   // INBOX-F1: after the wolves move
                 expeditionTick(barbs, squares, wolves, stores);   // R45-F2: after the wolves and the bell, before hungerTick()
                 poiTick(barbs, squares);   // R47-F4: site discovery and spent-site crumbling, after the party's tick
-                clockk();
+                {
+                    int hourWas = game_time;
+                    clockk();
+                    if (game_time != hourWas && game_time == nightEndHour) chronicleDawn(houses);   // R54-F2: dawn autosave
+                }
                 weatherTick();
                 relationTick();   // R51-F4: drift to neutral and clash cooldowns, before the trader prices a visit
                 traderTick(activeTrader, barbs, stores);
