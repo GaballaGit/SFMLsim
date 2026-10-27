@@ -309,9 +309,19 @@ const char* const kChroniclePath = "chronicle.sav";
 const char* const kChronicleTmpPath = "chronicle.sav.tmp";
 const int32_t kChronicleMagic = 0x4C524843;         // "CHRL" little-endian
 const int32_t kChronicleEndMark = 0x444E4543;       // "CEND": trailer, so a truncated file is rejected
-const int32_t kChronicleVersion = 2;                // R54-F4: v2 adds the per-race era array after the relations
+const int32_t kChronicleVersion = 3;                // R55-F4: v3 adds tagged blocks (named barbs first) after the houses
+const int32_t kChronicleVersionEras = 2;            // R54-F4: v2 adds the per-race era array after the relations; still loads
 const int32_t kChronicleVersionNoEras = 1;          // v1 files (no eras) still load, with every race back at Camp
 const int kChronicleMaxHouses = 600;                // a load with more houses than this is rejected outright
+// R55-F4: from v3, everything after the houses is a list of {tag, word count, words} blocks ending at the end mark. A later
+// feature adds a new tag (no version bump); a loader that does not know a tag skips its words.
+const int32_t kChronicleBlockBarbs = 0x42524142;    // "BARB": the named barbs and leaders
+const int kChronicleMaxBlocks = 32;                 // blocks per file; more is rejected
+const int kChronicleMaxBlockWords = 1 << 20;        // int32 words in one block; more is rejected
+const int kChronicleMaxBarbs = 2000;                // a load with more barbs than this is rejected; a save writes at most this many
+const int kChronicleBarbWords = 8;                  // per barb: name, race, birthRace, trait, leader, hunger, age, home
+const int kChronicleMaxHungerMult = 4;              // hunger saved clamped to hungerThreshold * this; a larger value is rejected
+const int kChronicleReturnNames = 2;                // barbs named on the restore line ("Hild, Orm and 6 more return")
 const int kChronicleMaxDay = 1000000;               // game_day bound on load
 const int kChronicleMaxStock = 1000000;             // per wood/stone/food bound on load
 const float kChronicleRelScale = 10000.0f;          // relations stored as round(v * scale)
@@ -3184,6 +3194,7 @@ struct barb {
     raceStock loot{0, 0, 0};     // R53-F1: plunder pack carried home; set only by raidTick() on a win, emptied only by settleLoot()
     int lootFrom = -1;           // R53-F1: race the pack was taken from (gets it back on a drop); -1 = no pack
     int herbTimer = 0;           // R53-F2: work ticks at the herb bed (separate from timer); reset by endActivity()
+    int bornHour = 0;            // R55-F4: game hour of birth (game_day * 24 + game_time); set only in makeBarb(), age = now - this
 };
 // R53-F4: the only writer of barb.activity on the way in. Starting a second activity over a live one is a bug: a debug
 // build aborts; a release build ends the old one (with its cleanup) first so no state is left half-set.
@@ -7006,13 +7017,23 @@ void buildhouse(vector<barb>& barbs,vector<RectangleShape>& squares, vector<hous
 // buildings are phase 2. Transient state (shortage announcements, clash cooldowns, friendly timers, raids, caravans) is
 // never saved and starts clean.
 struct chronicleHouse { int race, dx, dy; bool foundation; };
+// R55-F4 (v3 "BARB" block): one named barb. name = barbNames index, -1 = Sasuke; home = index into the file's house list, -1 = none
+struct chronicleBarb { int name = -1, race = 0, birthRace = 0, trait = 0, leader = 0, hunger = 0, ageHours = 0, home = -1; };
 struct chronicleData {
     int day = 0, hour = 0;
     raceStock stocks[raceCount];
     float relation[raceCount][raceCount] = {};
     int era[raceCount] = {};   // R54-F4 (v2): settlementEra per race
     vector<chronicleHouse> houses;
+    vector<chronicleBarb> barbs;   // R55-F4 (v3): empty for a v1/v2 file, which keeps this run's founders
+    vector<int> houseNewId;        // R55-F4: filled by chronicleRestore(): file house index -> restored house.id (-1 = dropped)
 };
+
+int chronicleNameIndex(const barb& b) {   // R55-F4: -1 for Sasuke; names only ever come from barbNames or shinobiName
+    if (b.shinobi) return -1;
+    for (int k = 0; k < barbNameCount; k++) if (b.name == barbNames[k]) return k;
+    return 0;
+}
 
 bool chronPut(FILE* f, int32_t v) { return fwrite(&v, sizeof v, 1, f) == 1; }
 bool chronGet(FILE* f, int32_t& v) { return fread(&v, sizeof v, 1, f) == 1; }
@@ -7026,7 +7047,28 @@ bool chronGetIn(FILE* f, int lo, int hi, int& out) {
 Vector2i chronicleCrate(int r) { Vector2f qc = quarterCentre(r); return Vector2i((int)floor(qc.x), (int)floor(qc.y)); }
 
 // Dawn autosave: written to kChronicleTmpPath, then renamed over kChroniclePath, so a crash mid-write never eats the old one
-bool chronicleSave(const vector<house>& houses) {
+int chronicleNowHour() { return game_day * 24 + game_time; }   // R55-F4: the clock as a single hour count, for ages
+
+// R55-F4: the "BARB" block. Barbs dying this tick (health 0) are left out; a home house not in the written house list is -1.
+bool chronicleSaveBarbs(FILE* f, const vector<barb>& barbs, const vector<house>& houses, int housesWritten) {
+    vector<const barb*> keep;
+    for (auto& b : barbs) if (b.health > 0 && (int)keep.size() < kChronicleMaxBarbs) keep.push_back(&b);
+    int n = (int)keep.size();
+    bool ok = chronPut(f, kChronicleBlockBarbs) && chronPut(f, 1 + n * kChronicleBarbWords) && chronPut(f, n);
+    const int hungerCap = hungerThreshold * kChronicleMaxHungerMult, now = chronicleNowHour();
+    for (int i = 0; ok && i < n; i++) {
+        const barb& b = *keep[i];
+        int home = -1;
+        for (int k = 0; k < housesWritten && b.homeHouse >= 0; k++) if (houses[k].id == b.homeHouse) { home = k; break; }
+        ok = chronPut(f, chronicleNameIndex(b)) && chronPut(f, clampRace(b.race)) && chronPut(f, clampRace(b.birthRace))
+          && chronPut(f, clamp((int)b.trait, 0, traitCount - 1)) && chronPut(f, isLeader(b) ? 1 : 0)
+          && chronPut(f, clamp(b.hunger, 0, hungerCap)) && chronPut(f, clamp(now - b.bornHour, 0, kChronicleMaxDay * 24))
+          && chronPut(f, home);
+    }
+    return ok;
+}
+
+bool chronicleSave(const vector<barb>& barbs, const vector<house>& houses) {
     FILE* f = fopen(kChronicleTmpPath, "wb");
     if (!f) { printf("CHRONICLE - save failed: cannot open %s\n", kChronicleTmpPath); return false; }
     bool ok = chronPut(f, kChronicleMagic) && chronPut(f, kChronicleVersion) && chronPut(f, raceCount)
@@ -7045,6 +7087,7 @@ bool chronicleSave(const vector<house>& houses) {
         Vector2i c = chronicleCrate(r);
         ok = chronPut(f, r) && chronPut(f, h.x - c.x) && chronPut(f, h.y - c.y) && chronPut(f, h.hasFoundation ? 1 : 0);
     }
+    ok = ok && chronicleSaveBarbs(f, barbs, houses, n);   // R55-F4 (v3): tagged blocks follow the houses; later blocks go here
     ok = ok && chronPut(f, kChronicleEndMark);
     if (fclose(f) != 0) ok = false;
     if (!ok) {
@@ -7060,7 +7103,31 @@ bool chronicleSave(const vector<house>& houses) {
             return false;
         }
     }
-    printf("CHRONICLE - saved day %d (year %d): %d houses\n", game_day + 1, game_day / yearDays + 1, n);
+    printf("CHRONICLE - saved day %d (year %d): %d houses, %d barbs\n", game_day + 1, game_day / yearDays + 1, n,
+           min((int)barbs.size(), kChronicleMaxBarbs));
+    return true;
+}
+
+// R55-F4: the "BARB" block, words long, into d.barbs (d.houses is already read, so home indices are checked against it).
+// At most one Sasuke and one leader per race; anything else out of range rejects the whole file.
+bool chronicleReadBarbs(FILE* f, int words, chronicleData& d, const char*& why) {
+    int n = 0;
+    if (words < 1 || !chronGetIn(f, 0, kChronicleMaxBarbs, n)) { why = "barb count over the cap"; return false; }
+    if (words != 1 + n * kChronicleBarbWords) { why = "barb block size differs"; return false; }
+    const int hungerCap = hungerThreshold * kChronicleMaxHungerMult;
+    bool leader[raceCount] = {}, sasuke = false;
+    d.barbs.reserve(n);
+    for (int i = 0; i < n; i++) {
+        chronicleBarb c;
+        bool ok = chronGetIn(f, -1, barbNameCount - 1, c.name) && chronGetIn(f, 0, raceCount - 1, c.race)
+               && chronGetIn(f, 0, raceCount - 1, c.birthRace) && chronGetIn(f, 0, traitCount - 1, c.trait)
+               && chronGetIn(f, 0, 1, c.leader) && chronGetIn(f, 0, hungerCap, c.hunger)
+               && chronGetIn(f, 0, kChronicleMaxDay * 24, c.ageHours) && chronGetIn(f, -1, (int)d.houses.size() - 1, c.home);
+        if (!ok) { why = "barb out of range"; return false; }
+        if (c.name < 0) { if (sasuke) { why = "two Sasukes"; return false; } sasuke = true; }
+        if (c.leader) { if (leader[c.race]) { why = "two leaders of one race"; return false; } leader[c.race] = true; }
+        d.barbs.push_back(c);
+    }
     return true;
 }
 
@@ -7076,7 +7143,9 @@ bool chronicleRead(chronicleData& out, const char*& why) {
     const int offMax = (int)worldSize;
     do {
         if (!chronGet(f, v) || v != kChronicleMagic) { why = "not a chronicle file"; break; }
-        if (!chronGet(f, v) || (v != kChronicleVersion && v != kChronicleVersionNoEras)) { why = "unknown version"; break; }
+        if (!chronGet(f, v) || (v != kChronicleVersion && v != kChronicleVersionEras && v != kChronicleVersionNoEras)) {
+            why = "unknown version"; break;
+        }
         int version = v;
         if (!chronGet(f, v) || v != raceCount) { why = "race count differs"; break; }
         if (!chronGetIn(f, 0, kChronicleMaxDay, d.day) || !chronGetIn(f, 0, 23, d.hour)) { why = "clock out of range"; break; }
@@ -7107,7 +7176,26 @@ bool chronicleRead(chronicleData& out, const char*& why) {
             if (ok) d.houses.push_back(h);
         }
         if (!ok) { why = "house out of range"; break; }
-        if (!chronGet(f, v) || v != kChronicleEndMark) { why = "missing end mark"; break; }
+        if (version >= 3) {   // R55-F4: tagged blocks up to the end mark (v1/v2 go straight to the end mark)
+            bool haveBarbs = false;
+            int blocks = 0;
+            while (!why) {
+                if (!chronGet(f, v)) { why = "truncated"; break; }
+                if (v == kChronicleEndMark) break;
+                int32_t tag = v;
+                int words = 0;
+                if (++blocks > kChronicleMaxBlocks) { why = "too many blocks"; break; }
+                if (!chronGetIn(f, 0, kChronicleMaxBlockWords, words)) { why = "block size out of range"; break; }
+                if (tag == kChronicleBlockBarbs) {
+                    if (haveBarbs) { why = "two barb blocks"; break; }
+                    haveBarbs = true;
+                    if (!chronicleReadBarbs(f, words, d, why)) break;
+                } else {   // a block from a later feature: skipped word by word, so a short file still fails
+                    for (int k = 0; k < words && !why; k++) if (!chronGet(f, v)) why = "truncated";
+                }
+            }
+            if (why) break;
+        } else if (!chronGet(f, v) || v != kChronicleEndMark) { why = "missing end mark"; break; }
         if (fgetc(f) != EOF) { why = "trailing data"; break; }
     } while (false);
     fclose(f);
@@ -7130,17 +7218,18 @@ bool chronicleSpotOk(const vector<barb>& barbs, const vector<house>& houses, con
 
 // Startup restore. Runs once the world, trees and houseshapes exist; the file is fully read and checked before any global
 // changes. Houses go back through addHouse() at their old offset from the crate, or the nearest free quarter spot.
-void chronicleRestore(const vector<barb>& barbs, vector<house>& houses, vector<RectangleShape>& houseshapes, const fieldGrid& fields,
-                      const vector<tree>& trees, const vector<rock>& rocks, const vector<CircleShape>& bushshapes) {
-    chronicleData d;
+// R55-F4: returns true on a load and leaves the checked data in d (with d.houseNewId filled) for chronicleRestoreBarbs().
+bool chronicleRestore(const vector<barb>& barbs, vector<house>& houses, vector<RectangleShape>& houseshapes, const fieldGrid& fields,
+                      const vector<tree>& trees, const vector<rock>& rocks, const vector<CircleShape>& bushshapes, chronicleData& d) {
     const char* why = nullptr;
     if (!chronicleRead(d, why)) {
         if (why) {
             printf("CHRONICLE - load rejected (%s): a new chronicle begins\n", why);
             logEvent("Chronicle unreadable - a new one begins", kChronicleSaveTint);
         } else printf("CHRONICLE - none found: a new chronicle begins\n");
-        return;
+        return false;
     }
+    d.houseNewId.assign(d.houses.size(), -1);
     game_day = d.day;
     game_time = d.hour;
     for (int r = 0; r < raceCount; r++) stock[r] = d.stocks[r];
@@ -7152,7 +7241,8 @@ void chronicleRestore(const vector<barb>& barbs, vector<house>& houses, vector<R
     // no promotion lines on load; eraTick() later lowers a pre-Fourth era quietly if the live barbs don't support it.
     for (int r = 0; r < raceCount; r++) raceEra[r] = (settlementEra)d.era[r];
     int placed = 0, moved = 0, dropped = 0;
-    for (auto& ch : d.houses) {
+    for (int hi = 0; hi < (int)d.houses.size(); hi++) {
+        const chronicleHouse& ch = d.houses[hi];
         Vector2f qc = quarterCentre(ch.race);
         Vector2i c = chronicleCrate(ch.race);
         int tx = c.x + ch.dx, ty = c.y + ch.dy;
@@ -7169,20 +7259,22 @@ void chronicleRestore(const vector<barb>& barbs, vector<house>& houses, vector<R
             if (ok) moved++;
         }
         if (!ok) { dropped++; continue; }
-        addHouse(houses, houseshapes, tx, ty, ch.foundation, (barbRace)ch.race);
+        d.houseNewId[hi] = houses[addHouse(houses, houseshapes, tx, ty, ch.foundation, (barbRace)ch.race)].id;   // R55-F4
         placed++;
     }
     int year = game_day / yearDays + 1;
     const char* seasonName = seasonDefs[seasonOf(game_day)].name;
+    int population = d.barbs.empty() ? (int)barbs.size() : (int)d.barbs.size();   // R55-F4: the returners replace the founders
     printf("CHRONICLE - restored day %d %02d:00 (year %d, %s): %d houses (%d moved, %d dropped), population %d\n",
-           game_day + 1, game_time, year, seasonName, placed, moved, dropped, (int)barbs.size());
-    logEvent("Chronicle restored: year " + to_string(year) + ", " + seasonName + ", population " + to_string(barbs.size()),
+           game_day + 1, game_time, year, seasonName, placed, moved, dropped, population);
+    logEvent("Chronicle restored: year " + to_string(year) + ", " + seasonName + ", population " + to_string(population),
              kChronicleRestoreTint);
+    return true;
 }
 
 // R54-F2: the brief, dim dawn line; starts part-way through its life so it leaves the ticker early
-void chronicleDawn(const vector<house>& houses) {
-    if (!chronicleSave(houses)) { logEvent("Chronicle could not be saved", kChronicleSaveTint); return; }
+void chronicleDawn(const vector<barb>& barbs, const vector<house>& houses) {
+    if (!chronicleSave(barbs, houses)) { logEvent("Chronicle could not be saved", kChronicleSaveTint); return; }
     pushEvent("Chronicle saved, day " + to_string(game_day + 1), kChronicleSaveTint, true);
     if (!events.empty()) events.back().age = max(events.back().age, eventFadeTicks - kChronicleSaveLineTicks);
 }
@@ -8341,8 +8433,10 @@ struct birthRing {Vector2f pos; int age = 0; int soulRace = -1;};   // R50-F1b: 
 
 int nextBarbId = 0;
 
-// The only place a barb is created: keeps barbs/squares in sync and owns nextBarbId
-void makeBarb(Vector2i pos, vector<barb>& barbs, vector<RectangleShape>& squares, vector<birthRing>& rings, int homeHouse, int race) {
+// The only place a barb is created: keeps barbs/squares in sync and owns nextBarbId. R55-F4: saved = a chronicle barb
+// coming back (name, trait, birth race, hunger and age taken from the file instead of rolled); race is passed as usual.
+void makeBarb(Vector2i pos, vector<barb>& barbs, vector<RectangleShape>& squares, vector<birthRing>& rings, int homeHouse, int race,
+              const chronicleBarb* saved = nullptr) {
     barb b;
     b.id = nextBarbId++;
     b.homeHouse = homeHouse;
@@ -8372,23 +8466,38 @@ void makeBarb(Vector2i pos, vector<barb>& barbs, vector<RectangleShape>& squares
     b.memReturn = b.memShared = false;
     b.order = needNone;   // INBOX-F2b: a newborn holds no order
     b.orderTicks = 0;
-    b.trait =(barbTrait)uniform_int_distribution<int>(0, traitCount - 1)(gen);   // R25-F1
-    if (!sasukeTaken && homeHouse < 0) {   // R25-F2: the first founder is Sasuke (no table name is spent)
-        sasukeTaken = true;
-        b.shinobi = true;
-        b.name = shinobiName;
-    } else {   // R25-F1: a random unused name; once all are taken, any name may repeat
-        int freeCount = 0;
-        for (int k = 0; k < barbNameCount; k++) if (!barbNameUsed[k]) freeCount++;
-        int k = 0;
-        if (freeCount > 0) {
-            int pick = uniform_int_distribution<int>(0, freeCount - 1)(gen);
-            for (k = 0; k < barbNameCount; k++) if (!barbNameUsed[k] && pick-- == 0) break;
-            barbNameUsed[k] = true;
+    b.bornHour = chronicleNowHour();   // R55-F4
+    if (saved) {   // R55-F4: a returner keeps who it was; the caller has already cleared barbNameUsed and set sasukeTaken
+        b.birthRace = (barbRace)clampRace(saved->birthRace);
+        b.trait = (barbTrait)clamp(saved->trait, 0, traitCount - 1);
+        b.hunger = max(0, saved->hunger);
+        b.bornHour -= max(0, saved->ageHours);
+        if (saved->name < 0 || saved->name >= barbNameCount) {
+            b.shinobi = true;
+            b.name = shinobiName;
         } else {
-            k = uniform_int_distribution<int>(0, barbNameCount - 1)(gen);
+            barbNameUsed[saved->name] = true;
+            b.name = barbNames[saved->name];
         }
-        b.name = barbNames[k];
+    } else {
+        b.trait =(barbTrait)uniform_int_distribution<int>(0, traitCount - 1)(gen);   // R25-F1
+        if (!sasukeTaken && homeHouse < 0) {   // R25-F2: the first founder is Sasuke (no table name is spent)
+            sasukeTaken = true;
+            b.shinobi = true;
+            b.name = shinobiName;
+        } else {   // R25-F1: a random unused name; once all are taken, any name may repeat
+            int freeCount = 0;
+            for (int k = 0; k < barbNameCount; k++) if (!barbNameUsed[k]) freeCount++;
+            int k = 0;
+            if (freeCount > 0) {
+                int pick = uniform_int_distribution<int>(0, freeCount - 1)(gen);
+                for (k = 0; k < barbNameCount; k++) if (!barbNameUsed[k] && pick-- == 0) break;
+                barbNameUsed[k] = true;
+            } else {
+                k = uniform_int_distribution<int>(0, barbNameCount - 1)(gen);
+            }
+            b.name = barbNames[k];
+        }
     }
     barbs.push_back(b);
     Vector2f bodySize = raceOf(b).bodySize;   // hitbox = drawn body, so hover/collision match what you see
@@ -8398,7 +8507,48 @@ void makeBarb(Vector2i pos, vector<barb>& barbs, vector<RectangleShape>& squares
     sq.setFillColor(Color::White);
     squares.push_back(sq);
     rings.push_back({Vector2f(b.x, b.y) + bodySize / 2.0f}); // centred on the body
-    printf("BARB BORN - %s the %s (%s)%s\n", b.name, traitOf(b).name, raceOf(b).name, b.shinobi ? " - shinobi" : "");
+    printf("%s - %s the %s (%s)%s\n", saved ? "BARB RETURNS" : "BARB BORN", b.name, traitOf(b).name, raceOf(b).name, b.shinobi ? " - shinobi" : "");
+}
+
+// R55-F4: right after chronicleRestore() (houses are back, so d.houseNewId is filled). A v3 file's barbs replace this run's
+// founders, each made through makeBarb() round its race's crate as founders are; a home house that did not come back is
+// left unset (-1). Leaders are crowned again directly (no election line), so they keep the crown pixel. The return line
+// always fires on a load: the oldest returners by name, or the founders when the file had no barbs (v1/v2).
+void chronicleRestoreBarbs(const chronicleData& d, vector<barb>& barbs, vector<RectangleShape>& squares, vector<birthRing>& rings) {
+    if (d.barbs.empty()) {
+        for (auto& b : barbs) b.bornHour = chronicleNowHour();   // founders arrive on the restored clock, age 0
+        printf("CHRONICLE - no barbs saved: the %d founders stay\n", (int)barbs.size());
+        logEvent("No one returns - " + to_string(barbs.size()) + " founders arrive", kChronicleRestoreTint);
+        return;
+    }
+    barbs.clear();   // the founders were never saved anywhere and hold no references yet: dropped before the first tick
+    squares.clear();
+    rings.clear();
+    for (auto& u : barbNameUsed) u = false;
+    sasukeTaken = true;   // a Sasuke comes back only from the file; nobody else may roll the name
+    for (int r = 0; r < raceCount; r++) { raceLeaderId[r] = -1; raceElected[r] = false; raceNeed[r] = needNone; }
+    uniform_int_distribution<int> spread(-30, 30);
+    int homeless = 0;
+    for (auto& c : d.barbs) {
+        int home = c.home >= 0 && c.home < (int)d.houseNewId.size() ? d.houseNewId[c.home] : -1;
+        if (c.home >= 0 && home < 0) homeless++;
+        Vector2f qc = quarterCentre(c.race);
+        makeBarb(Vector2i((int)qc.x + spread(gen), (int)qc.y + spread(gen)), barbs, squares, rings, home, c.race, &c);
+        if (c.leader) { raceElected[c.race] = true; raceLeaderId[c.race] = barbs.back().id; }
+    }
+    vector<int> order((int)barbs.size());
+    for (int i = 0; i < (int)order.size(); i++) order[i] = i;
+    stable_sort(order.begin(), order.end(), [&](int a, int b) { return barbs[a].bornHour < barbs[b].bornHour; });   // oldest first
+    int n = (int)order.size(), named = min(n, kChronicleReturnNames);
+    string line;   // "Hild returns", "Hild and Orm return", "Hild, Orm and 6 more return"
+    for (int i = 0; i < named; i++)
+        line += string(i == 0 ? "" : (i == n - 1 ? " and " : ", ")) + barbs[order[i]].name;
+    if (n > named) line += " and " + to_string(n - named) + " more";
+    line += n == 1 ? " returns" : " return";
+    printf("CHRONICLE - %d barbs return (%d without their house)\n", n, homeless);
+    for (int r = 0; r < raceCount; r++)
+        if (raceElected[r]) printf("CHRONICLE - %s leader %s returns\n", racePlurals[r], barbs[findBarbById(barbs, raceLeaderId[r])].name);
+    logEvent(line, kChronicleRestoreTint);
 }
 
 // R25-F2: Sasuke's blink. Puffs live in their own vector, aged per drawn frame and removed in reverse.
@@ -13837,7 +13987,11 @@ int main() {
         s.food = max(s.food, startStock.food);
     }
     // R54-F2: after the world, trees and houseshapes exist, so restored houses are checked against the new map
-    chronicleRestore(barbs, houses, houseshapes, fields, trees, rocks, bushshapes);
+    {
+        chronicleData chron;
+        if (chronicleRestore(barbs, houses, houseshapes, fields, trees, rocks, bushshapes, chron))
+            chronicleRestoreBarbs(chron, barbs, squares, birthRings);   // R55-F4: after the houses, so home ids resolve
+    }
 
     VertexArray treeVerts(PrimitiveType::Triangles);
     VertexArray rockVerts(PrimitiveType::Triangles), bushVerts(PrimitiveType::Triangles), stumpVerts(PrimitiveType::Triangles);   // rebuilt every frame
@@ -13995,7 +14149,7 @@ int main() {
                     int hourWas = game_time;
                     clockk();
                     if (game_time != hourWas && game_time == nightEndHour) {
-                        chronicleDawn(houses);   // R54-F2: dawn autosave
+                        chronicleDawn(barbs, houses);   // R54-F2: dawn autosave; R55-F4: with the named barbs
                         exileDawn(barbs, houses, stores);   // R54-F3: the dawn emigration check
                     }
                 }
