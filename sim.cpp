@@ -316,6 +316,7 @@ const int kChronicleMaxHouses = 600;                // a load with more houses t
 // R55-F4: from v3, everything after the houses is a list of {tag, word count, words} blocks ending at the end mark. A later
 // feature adds a new tag (no version bump); a loader that does not know a tag skips its words.
 const int32_t kChronicleBlockBarbs = 0x42524142;    // "BARB": the named barbs and leaders
+const int32_t kChronicleBlockKnow = 0x574F4E4B;     // R55-F2 "KNOW": techs, then per race per tech {count, learned}
 const int kChronicleMaxBlocks = 32;                 // blocks per file; more is rejected
 const int kChronicleMaxBlockWords = 1 << 20;        // int32 words in one block; more is rejected
 const int kChronicleMaxBarbs = 2000;                // a load with more barbs than this is rejected; a save writes at most this many
@@ -2037,11 +2038,20 @@ const int seedSelectionHarvests = 6;          // wheat harvests to learn Seed Se
 const float seedSelectionGrowSpeed = 1.2f;    // wheat growth rate multiplier after Seed Selection (20% faster)
 const int knowPulseFrames = 60;               // newly learned HUD pip pulses white for ~1s (frames, frozen while paused)
 const int knowPulsePeriod = 20;               // one white flash per this many frames, fading over the pulse
-const float knowPipPx = 6.0f;                 // 6x6 HUD pip
-const float knowPipGap = 3.0f;                // between pips
+const float knowPipPx = 4.0f;                 // R55-F2: 4x4 HUD pip (three race rows fit in one 16px icon height)
+const float knowPipGap = 3.0f;                // between pips in a row
+const float knowRowGap = 2.0f;                // R55-F2: between the race rows: 3 x 4 + 2 x 2 = 16px = hudIconSize
+const float knowSwatchW = 2.0f;               // R55-F2: race-colour tick at the left of each row (2 x knowPipPx)
+const float knowSwatchGap = 2.0f;             // tick -> first pip
 const float knowPipEraGap = 10.0f;            // pips sit this far left of the right-aligned era text
 const float knowPipRimPx = 1.0f;              // unlearned pips: hollow 1px outline
 const Color knowPipEmptyColor(78, 86, 74);    // dim grey-green rim, same family as the HUD rim
+const float knowRimRaceTint = 0.35f;          // R55-F2: unlearned rims lean this far toward the row's race colour
+// R55-F2 per-race know-how: each race practises and learns on its own. A race's favoured tech (its trait) needs
+// kKnowFavouredMult of the base threshold; the others need the full base, so every tech stays reachable for every race.
+const float kKnowFavouredMult = 0.8f;         // humans Hand Axe 32, dwarves Pickwork 20, elves Seed Selection 5 (of 40/25/6)
+const int kChronicleMaxKnowCount = 1000000;   // saved practice counters are clamped to this on load
+const int kChronicleMaxKnowTechs = 64;        // "KNOW" block tech count bound
 const Color steelToolColor(178, 186, 198);    // Hand Axe head: cool pale steel, clear of chop green and bird blue-white
 
 // Flint spears (R20-F3): an idle barb walks to the campfire and knaps a spear; spear holders hit game animals harder
@@ -2793,11 +2803,20 @@ struct knowHow {
     bool learned[techCount] = {};
     int pulseFrames[techCount] = {}; // >0 = HUD pip flashing white after it was learned
 };
-knowHow know;
-void resetKnowHow() { know = knowHow{}; }   // called on (re)start in main; practice() is defined after logEvent
+knowHow know[raceCount];   // R55-F2: one per race, indexed by barbRace
+void resetKnowHow() { for (auto& k : know) k = knowHow{}; }   // called on (re)start in main; practice() is defined after logEvent
+const techId raceFavouredTech[raceCount] = {techHandAxe, techPickwork, techSeedSelection};   // R55-F2: trait bias, by race
+int knowRace(int race) { return (race >= 0 && race < raceCount) ? race : 0; }
+// R55-F2: practice needed by this race for this tech (always >= 1, so every tech is reachable)
+int knowThreshold(int race, techId t) {
+    float mult = raceFavouredTech[knowRace(race)] == t ? kKnowFavouredMult : 1.0f;
+    return max(1, (int)ceil(techDefs[t].threshold * mult - 0.001f));
+}
+bool canLearn(int race, techId t) { (void)race; (void)t; return true; }   // R55-F2: phase 2 adds prereqs and era gates here
+bool knows(int race, techId t) { return know[knowRace(race)].learned[t]; }
 
-int chopTicks() { return know.learned[techHandAxe] ? handAxeChopTicks : treeChopTicks; }
-int wheatGrowTicks() { return know.learned[techSeedSelection] ? (int)(fieldGrowTicks / seedSelectionGrowSpeed) : fieldGrowTicks; }
+int chopTicks(int race) { return knows(race, techHandAxe) ? handAxeChopTicks : treeChopTicks; }
+int wheatGrowTicks(int race) { return knows(race, techSeedSelection) ? (int)(fieldGrowTicks / seedSelectionGrowSpeed) : fieldGrowTicks; }
 
 // A wheat plot (R19-F3). rect/shape are set once the spot is chosen; growth counts up to fieldGrowTicks once sown.
 // FARM-F1: held per race in a fieldGrid (fields[race][k]); the race is the row index.
@@ -2820,20 +2839,20 @@ struct plot {
 };
 using fieldGrid = plot[raceCount][fieldsPerRace];
 
-bool fieldRipe(const plot& fp) { return fp.built && fp.growth >= wheatGrowTicks(); }
+bool fieldRipe(const plot& fp, int race) { return fp.built && fp.growth >= wheatGrowTicks(race); }   // R55-F2: race = row
 
 // 0..2 growing stages, fieldGrowStages = ripe
-int fieldStage(const plot& fp) { return fieldRipe(fp) ? fieldGrowStages : fp.growth * fieldGrowStages / wheatGrowTicks(); }
+int fieldStage(const plot& fp, int race) { return fieldRipe(fp, race) ? fieldGrowStages : fp.growth * fieldGrowStages / wheatGrowTicks(race); }
 
 // R32-F1: restart plot k of a race's row (just sown or reaped) at growth 0. If a growing sibling is less than
 // fieldStaggerStages stages ahead of it (effective growth = growth - fallow), it lies fallow until it is that far behind,
 // so the race's plots show different stages. Ripe siblings are skipped: they restart (and re-stagger) once reaped.
-void replantField(plot (&row)[fieldsPerRace], int k) {
-    int step = wheatGrowTicks() * fieldStaggerStages / fieldGrowStages;
+void replantField(plot (&row)[fieldsPerRace], int k, int race) {   // R55-F2: race = the row's race (its know-how)
+    int step = wheatGrowTicks(race) * fieldStaggerStages / fieldGrowStages;
     int delay = leanHoursLeft() * ticksPerGameHour;   // R52-F2: no resowing in winter; bare soil until spring, then staggered
     for (int pass = 0; pass < fieldsPerRace; pass++)
         for (int j = 0; j < fieldsPerRace; j++) {
-            if (j == k || !row[j].built || fieldRipe(row[j])) continue;
+            if (j == k || !row[j].built || fieldRipe(row[j], race)) continue;
             int g = row[j].growth - row[j].fallow;
             if (abs(g + delay) < step) delay = step - g;
         }
@@ -3412,10 +3431,10 @@ bool isLeader(const barb& b) {
     return b.race >= 0 && b.race < raceCount && raceElected[b.race] && raceLeaderId[b.race] >= 0 && raceLeaderId[b.race] == b.id;
 }
 int mineTicks(const barb& b) {   // R47-F7: / the tool tier snapshotted at job start (b.jobTier), never looked up per tick
-    return (int)(rockMineTicks / raceOf(b).mineSpeed / (know.learned[techPickwork] ? pickworkMineSpeed : 1.0f)
+    return (int)(rockMineTicks / raceOf(b).mineSpeed / (knows(b.race, techPickwork) ? pickworkMineSpeed : 1.0f)   // R55-F2
                  / toolTierSpeed[clamp(b.jobTier, 0, toolTierCount - 1)]);
 }
-int chopTicks(const barb& b) { return (int)(chopTicks() / toolTierSpeed[clamp(b.jobTier, 0, toolTierCount - 1)]); }   // R47-F7
+int chopTicks(const barb& b) { return (int)(chopTicks(b.race) / toolTierSpeed[clamp(b.jobTier, 0, toolTierCount - 1)]); }   // R47-F7
 // R47-F7: called on the tick a chop or mine begins (the barb is not yet chopping): the one place the tier is read
 void startToolJob(barb& b) { if (!b.chopping) b.jobTier = toolTierOf(b.race); }
 
@@ -3717,14 +3736,19 @@ int tradeCostOf(int r, bool food) {
     return (int)ceil(base * tradePriceMultOf(r) - 0.001f);
 }
 
-// Know-how (R20-F1): one unit of practice; at the threshold the tech is learned once, with a ticker line
-void practice(techId t) {
-    know.count[t]++;
-    if (know.learned[t] || know.count[t] < techDefs[t].threshold) return;
-    know.learned[t] = true;
-    know.pulseFrames[t] = knowPulseFrames;
-    printf("---KNOW-HOW--- %s learned after %d (%s)\n", techDefs[t].name, know.count[t], techDefs[t].effect);
-    logEvent(string("Learned ") + techDefs[t].name + ": " + techDefs[t].effect);
+// Know-how (R20-F1): one unit of practice; at the threshold the tech is learned once.
+// R55-F2: per race. The HUD pip always flashes; only the race's first learned tech gets a ticker line, in its colour.
+void practice(int race, techId t) {
+    if (race < 0 || race >= raceCount) return;
+    knowHow& k = know[race];
+    if (k.count[t] < kChronicleMaxKnowCount) k.count[t]++;
+    if (k.learned[t] || !canLearn(race, t) || k.count[t] < knowThreshold(race, t)) return;
+    bool first = true;
+    for (int o = 0; o < techCount; o++) if (k.learned[o]) first = false;
+    k.learned[t] = true;
+    k.pulseFrames[t] = knowPulseFrames;
+    printf("---KNOW-HOW--- %s learned %s after %d (%s)\n", racePlurals[race], techDefs[t].name, k.count[t], techDefs[t].effect);
+    if (first) logRaceEvent(string(racePlurals[race]) + " learn " + techDefs[t].name + ": " + techDefs[t].effect, race);
 }
 
 // Ages ticker lines once per rendered frame so fade time is real-time regardless of sim speed
@@ -5263,7 +5287,7 @@ void drawBarbs(RenderWindow& window, const vector<barb>& barbs, const vector<Rec
             window.draw(tool);
         } else if (working && b.timer > 0) {
             bool raised = (phase / barbToolFrames) % 2 == 0;
-            if (b.chopping && b.target == targetNone && know.learned[techHandAxe]) tool.setFillColor(steelToolColor); // R20-F1: 1px axe head
+            if (b.chopping && b.target == targetNone && knows(b.race, techHandAxe)) tool.setFillColor(steelToolColor); // R20-F1: 1px axe head (R55-F2: own race's)
             tool.setPosition(Vector2f(side, raised ? bodyTop - barbToolSize.y : bodyTop + 1.0f));
             window.draw(tool);
             if (raised && b.chopping && (b.target == targetNone || b.target == targetRock) && b.jobTier > 0) {   // R47-F7: the one tier mark,
@@ -5825,8 +5849,8 @@ optional<hoverHit> pickHover(Vector2f p, float radius, const vector<barb>& barbs
     }
     auto plotState = [&](int r, int k) {   // R32-F1: one plot's state, for the per-plot list
         const plot& fp = fields[r][k];
-        if (fp.built) return fp.fallow > 0 ? string("fallow") : fieldRipe(fp) ? string("ripe")
-                                           : to_string(fp.growth * 100 / wheatGrowTicks()) + "% grown";
+        if (fp.built) return fp.fallow > 0 ? string("fallow") : fieldRipe(fp, r) ? string("ripe")
+                                           : to_string(fp.growth * 100 / wheatGrowTicks(r)) + "% grown";
         if (fp.claimed) return string("being sown");
         if (k > 0 && !fp.placed && fp.fallback) return string("re-siting");   // R37-F1: slot given up, ring spot pending
         if (k > 0 && mills[r].placed && !fp.placed && !fp.reserved) return string("no room");
@@ -6082,7 +6106,7 @@ void drawBeacons(RenderWindow& window, const View& worldView, float zoom, int fr
     for (int r = 0; r < raceCount && count < beaconMaxCount; r++)
         for (int k = 0; k < fieldsPerRace && count < beaconMaxCount; k++) {
             const plot& fp = fields[r][k];
-            if (!fieldRipe(fp) || !view.findIntersection(fp.rect)) continue;
+            if (!fieldRipe(fp, r) || !view.findIntersection(fp.rect)) continue;
             appendBeacon(va, fp.rect, line, c);
             count++;
         }
@@ -6158,8 +6182,8 @@ struct hudValues {
     const char* trader;      // Away / Arriving / Trading / Leaving
     const char* tradeLine;   // last trade message, "" when expired
     const char* era;         // settlement rank: Camp / Hamlet / Town / Fourth Age (R54-F4: the leading race's)
-    bool learned[techCount]; // know-how pips (R20-F1)
-    int pulse[techCount];    // frames of white pulse left per pip
+    bool learned[raceCount][techCount]; // know-how pips (R20-F1), R55-F2: one row per race
+    int pulse[raceCount][techCount];    // frames of white pulse left per pip
     int gold;                // R46-F1a: global nuggets
     bool goldFound;          // R46-F1a: gold cell hidden until the first nugget
     int day;                 // R51-F3: game_day; the season comes from seasonOf()
@@ -6207,10 +6231,17 @@ string hudDetailText(const hudValues& v) {
             s += string("\n  ") + racePlurals[r] + ": " + to_string((int)round(veil.faith[r] * 100.0f)) + "%"
                  + (veil.faithTier[r] == 2 ? " (high)" : veil.faithTier[r] == 0 ? " (low)" : "");
     }
-    s += "\nKnow-how:";
-    for (int t = 0; t < techCount; t++)   // learned techs, or progress toward each
-        s += string("\n  ") + techDefs[t].name + ": " + (v.learned[t] ? "learned"
-             : to_string(min(know.count[t], techDefs[t].threshold)) + "/" + to_string(techDefs[t].threshold));
+    s += "\nKnow-how (strip rows: humans, dwarves, elves):";   // R55-F2: per race, learned or progress toward each
+    for (int r = 0; r < raceCount; r++) {
+        s += string("\n  ") + racePlurals[r] + ":";
+        for (int t = 0; t < techCount; t++) {
+            int need = knowThreshold(r, (techId)t);
+            s += string(t ? ", " : " ") + techDefs[t].name + " "
+                 + (v.learned[r][t] ? string("learned") : to_string(min(know[r].count[t], need)) + "/" + to_string(need))
+                 + (raceFavouredTech[r] == t ? "*" : "");
+        }
+    }
+    s += "\n  (* = the race's knack: learned sooner)";
     return s;
 }
 
@@ -6277,36 +6308,52 @@ FloatRect drawHud(RenderWindow& window, const Font& font, const hudValues& v) {
     }
 
     // Know-how pips (R20-F1), right-aligned just left of the era text so the rain cell never moves them.
-    // Unlearned: hollow dim rim. Learned: solid tech colour. Newly learned: flashes white, fading over ~1s.
-    float pipsW = techCount * knowPipPx + (techCount - 1) * knowPipGap;
+    // R55-F2: one slim row per race (humans top), led by a 2px tick in the race's crate colour; the three rows together are
+    // exactly one icon tall. Unlearned: hollow rim tinted toward the race colour. Learned: solid tech colour. Newly learned:
+    // flashes white, fading over ~1s. A race with no living barbs keeps its row, dimmed.
+    float pipsW = knowSwatchW + knowSwatchGap + techCount * knowPipPx + (techCount - 1) * knowPipGap;
+    float rowsH = raceCount * knowPipPx + (raceCount - 1) * knowRowGap;
     float pipX = round(eraX - knowPipEraGap - pipsW);
-    float pipY = round((inner - knowPipPx) / 2);
+    float rowsY = round((inner - rowsH) / 2);
     if (eraX >= x && pipX >= x) {
         RectangleShape pip({knowPipPx, knowPipPx});
-        for (int t = 0; t < techCount; t++) {
-            pip.setPosition({pipX + t * (knowPipPx + knowPipGap), pipY});
-            if (!v.learned[t]) {
-                pip.setSize({knowPipPx - 2 * knowPipRimPx, knowPipPx - 2 * knowPipRimPx});
-                pip.setPosition(pip.getPosition() + Vector2f(knowPipRimPx, knowPipRimPx));
-                pip.setFillColor(Color::Transparent);
-                pip.setOutlineThickness(knowPipRimPx);   // outline grows outward: 6x6 overall
-                pip.setOutlineColor(knowPipEmptyColor);
-            } else {
-                Color c = techDefs[t].pip;
-                if (v.pulse[t] > 0) {
-                    int age = knowPulseFrames - v.pulse[t];
-                    float fade = (float)v.pulse[t] / knowPulseFrames;                         // 1 -> 0 over the pulse
-                    float wave = 0.5f + 0.5f * cos(2.0f * 3.14159265f * age / knowPulsePeriod); // 1 at each flash
-                    float w = fade * wave;
-                    c.r = (uint8_t)(c.r + (255 - c.r) * w);
-                    c.g = (uint8_t)(c.g + (255 - c.g) * w);
-                    c.b = (uint8_t)(c.b + (255 - c.b) * w);
-                }
-                pip.setSize({knowPipPx, knowPipPx});
-                pip.setFillColor(c);
-                pip.setOutlineThickness(0.0f);
-            }
+        for (int r = 0; r < raceCount; r++) {
+            float rowY = rowsY + r * (knowPipPx + knowRowGap);
+            bool empty = v.members[r] <= 0;
+            Color raceC = empty ? stockEmptyRaceColor : stockSwatchColors[r];
+            pip.setOutlineThickness(0.0f);
+            pip.setSize({knowSwatchW, knowPipPx});
+            pip.setPosition({pipX, rowY});
+            pip.setFillColor(raceC);
             window.draw(pip);
+            auto tint = [&](uint8_t a, uint8_t b) { return (uint8_t)(a + (int)round((b - a) * knowRimRaceTint)); };
+            Color rim(tint(knowPipEmptyColor.r, raceC.r), tint(knowPipEmptyColor.g, raceC.g), tint(knowPipEmptyColor.b, raceC.b));
+            float x0 = pipX + knowSwatchW + knowSwatchGap;
+            for (int t = 0; t < techCount; t++) {
+                pip.setPosition({x0 + t * (knowPipPx + knowPipGap), rowY});
+                if (!v.learned[r][t]) {
+                    pip.setSize({knowPipPx - 2 * knowPipRimPx, knowPipPx - 2 * knowPipRimPx});
+                    pip.setPosition(pip.getPosition() + Vector2f(knowPipRimPx, knowPipRimPx));
+                    pip.setFillColor(Color::Transparent);
+                    pip.setOutlineThickness(knowPipRimPx);   // outline grows outward: 4x4 overall
+                    pip.setOutlineColor(rim);
+                } else {
+                    Color c = empty ? stockEmptyRaceColor : techDefs[t].pip;
+                    if (v.pulse[r][t] > 0) {
+                        int age = knowPulseFrames - v.pulse[r][t];
+                        float fade = (float)v.pulse[r][t] / knowPulseFrames;                      // 1 -> 0 over the pulse
+                        float wave = 0.5f + 0.5f * cos(2.0f * 3.14159265f * age / knowPulsePeriod); // 1 at each flash
+                        float w = fade * wave;
+                        c.r = (uint8_t)(c.r + (255 - c.r) * w);
+                        c.g = (uint8_t)(c.g + (255 - c.g) * w);
+                        c.b = (uint8_t)(c.b + (255 - c.b) * w);
+                    }
+                    pip.setSize({knowPipPx, knowPipPx});
+                    pip.setFillColor(c);
+                    pip.setOutlineThickness(0.0f);
+                }
+                window.draw(pip);
+            }
         }
     }
     return bar;
@@ -7027,6 +7074,9 @@ struct chronicleData {
     vector<chronicleHouse> houses;
     vector<chronicleBarb> barbs;   // R55-F4 (v3): empty for a v1/v2 file, which keeps this run's founders
     vector<int> houseNewId;        // R55-F4: filled by chronicleRestore(): file house index -> restored house.id (-1 = dropped)
+    bool haveKnow = false;                         // R55-F2: a "KNOW" block was read (absent in v1/v2 and early v3 files)
+    int knowCount[raceCount][techCount] = {};      // clamped to 0..kChronicleMaxKnowCount
+    bool knowLearned[raceCount][techCount] = {};
 };
 
 int chronicleNameIndex(const barb& b) {   // R55-F4: -1 for Sasuke; names only ever come from barbNames or shinobiName
@@ -7068,6 +7118,15 @@ bool chronicleSaveBarbs(FILE* f, const vector<barb>& barbs, const vector<house>&
     return ok;
 }
 
+// R55-F2: the "KNOW" block: techCount, then for each race and tech its practice count and learned flag
+bool chronicleSaveKnow(FILE* f) {
+    bool ok = chronPut(f, kChronicleBlockKnow) && chronPut(f, 1 + raceCount * techCount * 2) && chronPut(f, techCount);
+    for (int r = 0; ok && r < raceCount; r++)
+        for (int t = 0; ok && t < techCount; t++)
+            ok = chronPut(f, clamp(know[r].count[t], 0, kChronicleMaxKnowCount)) && chronPut(f, know[r].learned[t] ? 1 : 0);
+    return ok;
+}
+
 bool chronicleSave(const vector<barb>& barbs, const vector<house>& houses) {
     FILE* f = fopen(kChronicleTmpPath, "wb");
     if (!f) { printf("CHRONICLE - save failed: cannot open %s\n", kChronicleTmpPath); return false; }
@@ -7088,6 +7147,7 @@ bool chronicleSave(const vector<barb>& barbs, const vector<house>& houses) {
         ok = chronPut(f, r) && chronPut(f, h.x - c.x) && chronPut(f, h.y - c.y) && chronPut(f, h.hasFoundation ? 1 : 0);
     }
     ok = ok && chronicleSaveBarbs(f, barbs, houses, n);   // R55-F4 (v3): tagged blocks follow the houses; later blocks go here
+    ok = ok && chronicleSaveKnow(f);                      // R55-F2: same v3 format, one more block
     ok = ok && chronPut(f, kChronicleEndMark);
     if (fclose(f) != 0) ok = false;
     if (!ok) {
@@ -7128,6 +7188,24 @@ bool chronicleReadBarbs(FILE* f, int words, chronicleData& d, const char*& why) 
         if (c.leader) { if (leader[c.race]) { why = "two leaders of one race"; return false; } leader[c.race] = true; }
         d.barbs.push_back(c);
     }
+    return true;
+}
+
+// R55-F2: the "KNOW" block into d. A size that doesn't match its tech count rejects the file; the values themselves are
+// clamped (count to 0..kChronicleMaxKnowCount, learned to 0/1). Techs past this build's techCount are read and ignored.
+bool chronicleReadKnow(FILE* f, int words, chronicleData& d, const char*& why) {
+    int techs = 0;
+    if (words < 1 || !chronGetIn(f, 1, kChronicleMaxKnowTechs, techs)) { why = "know tech count out of range"; return false; }
+    if (words != 1 + raceCount * techs * 2) { why = "know block size differs"; return false; }
+    for (int r = 0; r < raceCount; r++)
+        for (int t = 0; t < techs; t++) {
+            int32_t cnt = 0, lrn = 0;
+            if (!chronGet(f, cnt) || !chronGet(f, lrn)) { why = "truncated"; return false; }
+            if (t >= techCount) continue;
+            d.knowCount[r][t] = clamp((int)cnt, 0, kChronicleMaxKnowCount);
+            d.knowLearned[r][t] = lrn != 0;
+        }
+    d.haveKnow = true;
     return true;
 }
 
@@ -7190,6 +7268,9 @@ bool chronicleRead(chronicleData& out, const char*& why) {
                     if (haveBarbs) { why = "two barb blocks"; break; }
                     haveBarbs = true;
                     if (!chronicleReadBarbs(f, words, d, why)) break;
+                } else if (tag == kChronicleBlockKnow) {   // R55-F2
+                    if (d.haveKnow) { why = "two know blocks"; break; }
+                    if (!chronicleReadKnow(f, words, d, why)) break;
                 } else {   // a block from a later feature: skipped word by word, so a short file still fails
                     for (int k = 0; k < words && !why; k++) if (!chronGet(f, v)) why = "truncated";
                 }
@@ -7240,6 +7321,16 @@ bool chronicleRestore(const vector<barb>& barbs, vector<house>& houses, vector<R
     // R54-F4: eras before the houses, so addHouse() rebuilds a Fourth Age race's houses as townhouses. Written directly:
     // no promotion lines on load; eraTick() later lowers a pre-Fourth era quietly if the live barbs don't support it.
     for (int r = 0; r < raceCount; r++) raceEra[r] = (settlementEra)d.era[r];
+    // R55-F2: per-race know-how, written directly (no learn lines or flashes on load). A count already at the race's
+    // threshold counts as learned. v1/v2 files (and v3 files from before the KNOW block) never saved the old shared
+    // know-how, so every race gets the same one: a fresh start.
+    for (int r = 0; r < raceCount; r++) {
+        know[r] = knowHow{};
+        for (int t = 0; t < techCount && d.haveKnow; t++) {
+            know[r].count[t] = clamp(d.knowCount[r][t], 0, kChronicleMaxKnowCount);
+            know[r].learned[t] = d.knowLearned[r][t] || know[r].count[t] >= knowThreshold(r, (techId)t);
+        }
+    }
     int placed = 0, moved = 0, dropped = 0;
     for (int hi = 0; hi < (int)d.houses.size(); hi++) {
         const chronicleHouse& ch = d.houses[hi];
@@ -8124,9 +8215,9 @@ void buildfield(vector<barb>& barbs, vector<RectangleShape>& squares, const vect
                 fp.built = true;
                 fp.claimed = false;
                 fp.sowerId = -1;
-                replantField(fields[r], k);   // R32-F1: may lie fallow first, so it ripens out of step with its siblings
+                replantField(fields[r], k, r);   // R32-F1: may lie fallow first, so it ripens out of step with its siblings
                 printf("---FIELD SOWN--- %s plot %d, ripe in %d ticks (+%d fallow), +%d food per harvest\n", racePlurals[r], k + 1,
-                       wheatGrowTicks(), fp.fallow, fieldFoodYield);
+                       wheatGrowTicks(r), fp.fallow, fieldFoodYield);
                 logEvent(string(racePlurals[r]) + " sow a wheat field");
             }
             if (fp.claimed) return;   // one being sown at a time
@@ -8312,9 +8403,9 @@ void fieldTick(fieldGrid& fields) {
     for (int r = 0; r < raceCount; r++)
         for (auto& fp : fields[r])
             if (fp.built && fp.fallow > 0) fp.fallow--;   // R32-F1: resting before it grows again
-            else if (fp.built && fp.growth < wheatGrowTicks()) {
+            else if (fp.built && fp.growth < wheatGrowTicks(r)) {
                 fp.growth++;
-                if (fp.growth == wheatGrowTicks()) printf("WHEAT RIPE - %s\n", racePlurals[r]);
+                if (fp.growth == wheatGrowTicks(r)) printf("WHEAT RIPE - %s\n", racePlurals[r]);
             }
 }
 
@@ -8326,7 +8417,7 @@ void drawField(RenderWindow& window, const plot& fp, int race, int frame) {
     if (!fp.built) return;
     drawSnapped(window, fp.shape);
     Vector2f o = snapPx(fp.rect.position);
-    int stage = fieldStage(fp);
+    int stage = fieldStage(fp, race);
     const float rowW = fieldSize.x - 2.0f;
     RectangleShape r(Vector2f(1.0f, 1.0f));
     r.setFillColor(fieldRaceTints[race]);
@@ -12389,7 +12480,7 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
             int bestField = -1;
             for (int k = 0; b.race >= 0 && b.race < raceCount && k < fieldsPerRace; k++) {
                 const plot& fp = fields[b.race][k];
-                if (!fieldRipe(fp) || fieldTaken[b.race][k]) continue;
+                if (!fieldRipe(fp, b.race) || fieldTaken[b.race][k]) continue;
                 Vector2f d = fieldWorkSpot(fp) - bpos;
                 float dSq = d.x * d.x + d.y * d.y;
                 if (dSq < fieldSearchRadius * fieldSearchRadius && dSq / (bushW * bushW) < fieldScore) {
@@ -12588,17 +12679,17 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
             if (k < 0) { clearHarvest(b); continue; }   // retargeted, or not a plot of its own race
             plot& fp = fields[b.race][k];
             Vector2f wp = fieldWorkSpot(fp);
-            if (!fp.built || (!fieldRipe(fp) && !b.chopping)) {
+            if (!fp.built || (!fieldRipe(fp, b.race) && !b.chopping)) {
                 clearHarvest(b);   // nothing to reap
                 continue;
             }
             // FARM-F2: the reaped sheaf adds no food here; it is carried (carryWheat) to the race's mill, or to the
             // storehouse/campfire if no mill stands, and counted on arrival in haulTick() (Forager bonus applied there)
             if (harvestTick(b, wp, bpos, fieldHarvestTicks, 0)) {
-                replantField(fields[b.race], k);   // replanted at once (R32-F1: maybe fallow first, to stay staggered)
+                replantField(fields[b.race], k, b.race);   // replanted at once (R32-F1: maybe fallow first, to stay staggered)
                 startHaul(b, carryWheat, stores);
                 printf("WHEAT REAPED - barb %d carries the sheaf to the %s\n", b.id, millDepot(b) ? "mill" : "storehouse");
-                practice(techSeedSelection);
+                practice(b.race, techSeedSelection);
             }
             continue;
 	}
@@ -12648,7 +12739,7 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
                 int yield = min(kShaftYield, ms.seam);
                 ms.seam = max(0, ms.seam - yield);
                 leaveMine(b, true);   // R40-F1: climbs out with the stone; lintel flash
-                practice(techPickwork);
+                practice(b.race, techPickwork);
                 toolWearOnJobDone(b, bpos);   // R49-F1
                 if (b.race == raceDwarf) forgeEmberFrames = forgeEmberBoostFrames;   // same flare as a mined rock
                 startHaul(b, carryStone, stores, yield);
@@ -12675,7 +12766,7 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
                 trees[i].dying = true;
                 if (workTick(b)) b.timer++;
                 if (b.timer >= chopTicks(b)) {
-                    practice(techHandAxe);
+                    practice(b.race, techHandAxe);
                     toolWearOnJobDone(b, bpos);   // R49-F1
                     memRecord(b, memTree, Vector2f((int)tix, (int)tiy));   // INBOX-F2: by position; the tree index dies with the swapRemove
                     swapRemove(trees,  i);
@@ -12706,7 +12797,7 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
 			rocks[i].dying = true;
 			if (workTick(b)) b.timer++;
 			if (b.timer >= mineTicksFor(b)) {        // dwarves finish rocks faster; R41-F2: a tempered pick faster still
-				practice(techPickwork);
+				practice(b.race, techPickwork);
 				toolWearOnJobDone(b, bpos);   // R49-F1
 				if (b.toolCharges > 0) {             // R41-F2: one charge per completed rock, after the scaled check above
 					b.toolCharges--;
@@ -14326,8 +14417,9 @@ int main() {
         if (ballotFramesLeft > 0 && !paused) ballotFramesLeft--;
         if (window.hasFocus() && Keyboard::isKeyPressed(Keyboard::Key::H))   // R44-F2: held, not toggled; under select/hover marks
             drawBeacons(window, worldView, zoom, frameCount, barbs, squares, fields, bushes, bushshapes);
-        for (int k = 0; k < techCount; k++)
-            if (know.pulseFrames[k] > 0 && !paused) know.pulseFrames[k]--;   // know-how pip flash (R20-F1)
+        for (auto& kh : know)   // R55-F2: every race's row
+            for (int k = 0; k < techCount; k++)
+                if (kh.pulseFrames[k] > 0 && !paused) kh.pulseFrames[k]--;   // know-how pip flash (R20-F1)
 
         // UIO-F2: resolve the selection once per frame; a vanished barb (died/removed) clears it
         int selIdx = findBarbById(barbs, selectedBarbId);
@@ -14386,7 +14478,8 @@ int main() {
             hv.gold = gold;              // R46-F1a
             hv.goldFound = goldFound;
             hv.day = game_day;           // R51-F3
-            for (int k = 0; k < techCount; k++) { hv.learned[k] = know.learned[k]; hv.pulse[k] = know.pulseFrames[k]; }
+            for (int r = 0; r < raceCount; r++)   // R55-F2: one pip row per race
+                for (int k = 0; k < techCount; k++) { hv.learned[r][k] = know[r].learned[k]; hv.pulse[r][k] = know[r].pulseFrames[k]; }
             hudRect = drawHud(window, hudFont, hv);
             tickerRect = drawEvents(window, hudFont);
             drawMinimap(window, minimapVerts, worldView, barbs, squares, houses, houseshapes, stores);   // UIO-F1: after the HUD, under tooltips
