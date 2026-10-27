@@ -1798,6 +1798,59 @@ const Color MM_POI_COLOR(176, 158, 214);   // found sites on the minimap (undisc
 const Color MM_POI_SPENT_COLOR(96, 90, 116);
 const float MM_POI_PX = 2.0f;
 
+// R55-F1 Wildfolk Camp, phase 1: one nomad camp in the wild band, run as its own small system (wildfolk are NOT a
+// raceCount slot). It starts with one hide tent and grows to a ring of at most kCampMaxTents; each tent keeps one hunter,
+// who uses the barbs' deer-hunt flags (deertargeting / targetDeerId, re-resolved by id) to bring deer meat home. A passing
+// barb can trade its race's food for a lot of meat. Woodcutting near the camp gently lowers that race's regard (no tiers).
+const int kCampMaxTents = 3;                    // fixed cap: a ring of three tents
+const Vector2f kCampTentSize(6.0f, 5.0f);       // hide tent: under a house (8x7), over a lean-to (5x4)
+const float kCampRingRadius = 9.0f;             // tent centre -> camp centre (tents ~15px apart)
+const float kCampFootprintHalf = 18.0f;         // camp square half side: trees, rocks, bushes and homesteads kept off it
+const float kCampMinDist = 520.0f;              // camp centre from the campfire (wild band starts at zoneCoreRadius 420)
+const float kCampMaxDist = 780.0f;
+const float kCampPoiGap = 120.0f;               // camp centre -> any hut/well centre
+const float kCampRuinGap = 140.0f;              // camp centre -> ruin centre
+const int kCampPlaceTries = 600;
+const int kCampHunterStepTicks = 6;             // ticks per 1px step (barbs 10, wandering deer 3 but pausing)
+const float kCampHuntRadius = 600.0f;           // a hunter looks for deer this far from the camp centre
+const int kCampHuntMinDeer = 8;                 // hunters stay home unless more deer than this remain (barbs eat too)
+const int kCampHunterDamage = 20;               // per hit; deer have 100 hp (barbs 5, so the camp is the better hunter)
+const int kCampHuntMaxTicks = 7200;             // a hunt that takes longer than this (~2 min at 1x) is given up
+const int kCampHunterRestTicks = 2400;          // rest at the tent between hunts (~40s at 1x)
+const int kCampSearchEveryTicks = 60;           // a resting hunter looks for prey this often
+const int kCampMeatCap = 4;                     // meat lots the camp holds; hunters rest while it is full
+const int kCampEatTicks = 3 * ticksPerGameHour; // the camp eats one lot this often (so the hunters keep going out)
+const int kCampTentPlenty = 8;                  // plenty (meat brought + trades) for the next tent
+const int kCampScanEveryTicks = 30;             // barb scan for finding, trade and trespass: O(barbs), never barbs x trees
+const float kCampFindRadius = 60.0f;            // a barb this close to the camp centre finds it (ticker, minimap dot)
+const float kCampTradeRadius = 40.0f;           // a free barb this close can trade
+const int kCampMeatPriceFood = 2;               // food the race pays for one lot...
+const int kCampMeatLotFood = 4;                 // ...and the food the lot of deer meat adds to its stock
+const int kCampTradeCooldownTicks = 2 * ticksPerGameHour;   // per race between trades
+const float kCampTrespassRadius = 70.0f;        // a barb chopping a tree this close to the camp centre trespasses
+const int kCampTrespassCooldownTicks = ticksPerGameHour;    // per race: at most one nudge (and ticker line) an hour
+const float kCampTrespassDelta = 0.03f;         // gentle: regard lost per trespass
+const float kCampTradeDelta = 0.02f;            // regard gained per trade
+const float kCampRegardDriftPerTick = 0.05f / ticksPerGameHour;   // regard eases back toward 0
+// Look: hide tents (A-frame with crossed pole tips, not a house or lean-to), a small hearth with one smoke pixel (two at
+// night), an ochre pennant on the first tent; hunters are buckskin 2x4 figures
+const Color kCampHideColor(134, 100, 74);
+const Color kCampHideLitColor(156, 120, 90);
+const Color kCampHideShadeColor(104, 76, 56);
+const Color kCampDoorColor(38, 28, 20);
+const Color kCampPoleColor(86, 66, 46);
+const Color kCampPennantColor(184, 138, 62);    // muted ochre
+const Color kCampHearthColor(92, 86, 78);       // hearth stones
+const Color kCampEmberColor(196, 104, 52);
+const Color kCampSmokeColor(196, 196, 190, 140);
+const int kCampSmokeFrames = 24;                // smoke pixel rises one row every this many frames, 3 rows then restarts
+const Color kCampHunterColor(170, 136, 98);     // buckskin: lighter than the tents, far from barb task colours
+const Color kCampHunterHairColor(62, 46, 32);
+const Color kCampMeatColor(146, 62, 50);        // carried lot of meat
+const Color kCampTickerTint(206, 172, 116);     // pale ochre ticker lines
+const Color MM_CAMP_WILD_COLOR(196, 150, 86);   // found camp on the minimap
+const float MM_CAMP_WILD_PX = 3.0f;
+
 // Expeditions (R45-F2, phase 1): one party at a time of expPartySize same-race barbs walks from its crate to its race's
 // lean-to, delves at the ruin stones, and walks home with a relic (or nothing). Rations are paid from the race's food.
 const int expPartySize = 2;                // members per party, all one race
@@ -2956,6 +3009,62 @@ bool poiClear(const FloatRect& r) {
     }
     return true;
 }
+
+// R55-F1: the wildfolk camp. wildCamps[i] and wildCampShapes[i] (footprint square) always describe the same camp; only
+// spawnWildCamp() adds and only removeCamp() removes, touching both. Hunters hold camp.id (never an index) and
+// re-resolve it with findCampById() every tick; a hunter whose camp is gone is removed. Phase 1 has exactly one camp.
+struct wildCamp {
+    int id = -1;
+    int tents = 1;                         // 1..kCampMaxTents; tent k sits on ring slot k (never shrinks in phase 1)
+    int meat = 0;                          // lots of deer meat in camp (<= kCampMeatCap)
+    int plenty = 0;                        // meat brought + trades since the last tent
+    int eatTimer = 0;
+    int lotsTraded = 0;                    // tooltip: how many lots barbs have bought
+    bool found = false;                    // a barb has been here: minimap dot from now on
+    int tradeCooldown[raceCount] = {};
+    int trespassCooldown[raceCount] = {};
+};
+vector<wildCamp> wildCamps;
+vector<RectangleShape> wildCampShapes;
+int nextCampId = 0;
+float campRegard[raceCount] = {};          // per-race regard of the wildfolk, kRelationMin..kRelationMax, no tiers in phase 1
+int findCampById(int id) {
+    for (int i = 0; i < (int)wildCamps.size(); i++) if (wildCamps[i].id == id) return i;
+    return -1;
+}
+Vector2f campCentre(int i) { return wildCampShapes[i].getPosition() + wildCampShapes[i].getSize() / 2.0f; }
+// top-left of tent slot k (0 north, then the ring at 120 degree steps), whole pixels
+Vector2f campTentPos(int i, int k) {
+    float a = -1.5707963f + k * 2.0943951f;
+    return snapPx(campCentre(i) + Vector2f(cos(a), sin(a)) * kCampRingRadius - kCampTentSize / 2.0f);
+}
+void removeCamp(int i) {
+    if (i < 0 || i >= (int)wildCamps.size()) return;
+    printf("WILDFOLK - camp %d struck\n", wildCamps[i].id);
+    wildCamps[i] = move(wildCamps.back()); wildCamps.pop_back();               // swapRemove, both vectors at the same index
+    wildCampShapes[i] = move(wildCampShapes.back()); wildCampShapes.pop_back();
+}
+// False if r touches any camp footprint
+bool campClear(const FloatRect& r) {
+    for (auto& s : wildCampShapes)
+        if (r.findIntersection(s.getGlobalBounds())) return false;
+    return true;
+}
+// A wildfolk hunter: not a barb, never in barbs[]. Shares the barbs' hunt flags; hunterShapes[i] is its 2x4 body.
+struct campHunter {
+    int id = -1;
+    int campId = -1;                       // stable camp id, re-resolved every tick
+    int tent = 0;                          // ring slot it rests at
+    bool deertargeting = false;            // same meaning as barb::deertargeting
+    int targetDeerId = -1;                 // same meaning as barb::targetDeerId (an id, never an index)
+    bool carryingMeat = false;
+    int stepTimer = 0;
+    int tripTicks = 0;
+    int restTicks = 0;
+};
+vector<campHunter> campHunters;
+vector<RectangleShape> campHunterShapes;
+int nextCampHunterId = 0;
 
 // Work target of a barb. targetNone with a set targetx is a tree (or a hunt/wander/build spot, which own their flags).
 enum targetKind {targetNone, targetBush, targetRock, targetLake, targetField, targetDepot}; // targetDepot: hauling a load (R29-F1)
@@ -5601,6 +5710,12 @@ optional<hoverHit> pickHover(Vector2f p, float radius, const vector<barb>& barbs
         else               label += ", buys nothing";
         return hoverHit{label, tr->shape, nullopt};
     }
+    for (int i = 0; i < (int)campHunters.size() && i < (int)campHunterShapes.size(); i++)   // R55-F1
+        if (near(campHunterShapes[i])) {
+            const campHunter& h = campHunters[i];
+            return hoverHit{string("Wildfolk hunter: ") + (h.carryingMeat ? "bringing deer meat home" : h.deertargeting ? "tracking a deer" : "at camp"),
+                            campHunterShapes[i], nullopt};
+        }
     for (auto& w : wolves)
         if (near(w.shape)) return hoverHit{w.phase == wolf::Hunting ? "Wolf: hunting" : "Wolf: leaving", w.shape, nullopt};
     for (int i = 0; i < (int)deershape.size() && i < (int)deers.size(); i++)
@@ -5622,6 +5737,27 @@ optional<hoverHit> pickHover(Vector2f p, float radius, const vector<barb>& barbs
         RectangleShape body(campSize);
         body.setPosition(snapPx(c.pos));
         if (near(body)) return hoverHit{string(raceDefs[clampRace(c.race)].name) + " lean-to camp", body, nullopt};
+    }
+    for (int i = 0; i < (int)wildCamps.size() && i < (int)wildCampShapes.size(); i++) {   // R55-F1: the tent ring, not the whole footprint
+        const float half = kCampRingRadius + kCampTentSize.x / 2.0f + 2.0f;
+        RectangleShape body(Vector2f(2 * half, 2 * half));
+        body.setPosition(campCentre(i) - Vector2f(half, half));
+        if (!near(body)) continue;
+        const wildCamp& c = wildCamps[i];
+        int hunters = 0, out = 0;
+        for (auto& h : campHunters) if (h.campId == c.id) { hunters++; if (h.deertargeting || h.carryingMeat) out++; }
+        string label = "Wildfolk camp: " + to_string(c.tents) + "/" + to_string(kCampMaxTents) + (c.tents == 1 ? " tent, " : " tents, ")
+                     + to_string(hunters) + (hunters == 1 ? " hunter" : " hunters") + (out > 0 ? " (" + to_string(out) + " out)" : string());
+        label += "\nDeer meat: " + to_string(c.meat) + "/" + to_string(kCampMeatCap) + " lots, " + to_string(kCampMeatPriceFood)
+               + " food buys one (+" + to_string(kCampMeatLotFood) + " food)";
+        if (c.lotsTraded > 0) label += ", " + to_string(c.lotsTraded) + " traded";
+        label += "\nRegard:";
+        for (int r = 0; r < raceCount; r++) {
+            char buf[16];
+            snprintf(buf, sizeof buf, "%+.2f", campRegard[r]);
+            label += string(r == 0 ? " " : ", ") + racePlurals[r] + " " + buf;
+        }
+        return hoverHit{label, body, nullopt};
     }
     for (int i = 0; i < (int)pois.size() && i < (int)poiShapes.size(); i++) {   // R47-F4
         RectangleShape body(poiShapes[i].getSize() + Vector2f(2 * ruinHoverPad, 2 * ruinHoverPad));
@@ -6238,6 +6374,8 @@ void drawMinimap(RenderWindow& window, VertexArray& va, const View& worldView,
         if (stores[k].built) minimapDot(va, inner, quarterCentre(k), MM_STORE_PX, MM_STORE_COLORS[k]);
     if (hasRuins()) minimapDot(va, inner, ruinCentre, MM_RUIN_PX, MM_RUIN_COLOR);   // R45-F1b: site, then camps over it
     for (auto& c : camps) minimapDot(va, inner, c.pos + campSize / 2.0f, MM_CAMP_PX, MM_STORE_COLORS[clampRace(c.race)]);
+    for (int i = 0; i < (int)wildCamps.size() && i < (int)wildCampShapes.size(); i++)   // R55-F1: once a barb has found it
+        if (wildCamps[i].found) minimapDot(va, inner, campCentre(i), MM_CAMP_WILD_PX, MM_CAMP_WILD_COLOR);
     for (int i = 0; i < (int)pois.size() && i < (int)poiShapes.size(); i++)   // R47-F4: found sites only, spent ones dim
         if (pois[i].found) minimapDot(va, inner, poiCentre(i), MM_POI_PX, pois[i].spent ? MM_POI_SPENT_COLOR : MM_POI_COLOR);
     for (int i = 0; i < (int)barbs.size(); i++)
@@ -6741,6 +6879,7 @@ bool homesteadSpotOk(const vector<barb>& barbs, const vector<house>& houses, int
         if (slab.findIntersection(FloatRect(Vector2f((float)k.x, (float)k.y), Vector2f(12.0f, 12.0f)))) return false; // 6px-radius pentagon
     for (auto& bs : bushshapes)
         if (slab.findIntersection(bs.getGlobalBounds())) return false;
+    if (!campClear(slab)) return false;          // R55-F1: nor in the wildfolk camp
     Vector2f from = qc - houseSlabSize / 2.0f;   // lakeClear's path test works in slab top-left coordinates
     if (!lakeClear(FloatRect(Vector2f(tx - 3.0f, ty - 3.0f), houseSlabSize), &from)) return false;
     return true;
@@ -12489,6 +12628,7 @@ void treespawn(vector<tree>& trees, vector<CircleShape>& tris, vector<RectangleS
     }
     if (!ruinsClear(FloatRect(Vector2f(t.x, t.y), Vector2f(treeFootprint, treeFootprint)))) return;  // R45-F1b: nor in the ruin site
     if (!poiClear(FloatRect(Vector2f(t.x, t.y), Vector2f(treeFootprint, treeFootprint)))) return;    // R47-F4: nor on a hut or well
+    if (!campClear(FloatRect(Vector2f(t.x, t.y), Vector2f(treeFootprint, treeFootprint)))) return;   // R55-F1: nor in the wildfolk camp
     trees.push_back(t);
 
     tris.push_back(makeTreeTri(t.x, t.y));
@@ -12889,6 +13029,293 @@ void poiTick(const vector<barb>& barbs, const vector<RectangleShape>& squares) {
             break;
         }
     }
+}
+
+// R55-F1: where hunter k of camp i rests: just right of its tent, feet level with the tent's lower half
+Vector2f campRestPos(int i, int k) { return campTentPos(i, k) + Vector2f(kCampTentSize.x + 1.0f, 1.0f); }
+
+// R55-F1: the one way a hunter enters the world; campHunters and campHunterShapes always grow together
+void addCampHunter(int campIdx, int tent) {
+    campHunter h;
+    h.id = nextCampHunterId++;
+    h.campId = wildCamps[campIdx].id;
+    h.tent = tent;
+    h.restTicks = kCampHunterRestTicks;
+    campHunters.push_back(h);
+    RectangleShape s(Vector2f(2.0f, 4.0f));   // a human-sized body, so it reads as a person
+    s.setPosition(campRestPos(campIdx, tent));
+    campHunterShapes.push_back(s);
+}
+void removeCampHunter(int i) {
+    swapRemove(campHunters, i);
+    swapRemove(campHunterShapes, i);
+}
+
+// R55-F1: one camp, after the huts and wells. Placed through placePoi: in the wild band (every footprint corner too),
+// kCampMinDist..kCampMaxDist from the campfire, clear of the quarters, the ruins, every hut/well and the water. Startup
+// trees (trees/tris/stumps), rocks (rocks/octs/rockGold) and bushes (bushes/bushshapes) on the footprint go together.
+void spawnWildCamp(vector<tree>& trees, vector<CircleShape>& tris, vector<RectangleShape>& stumps, vector<rock>& rocks,
+                   vector<CircleShape>& octs, vector<char>& rockGold, vector<bush>& bushes, vector<CircleShape>& bushshapes) {
+    while (!wildCamps.empty()) removeCamp((int)wildCamps.size() - 1);
+    campHunters.clear();
+    campHunterShapes.clear();
+    for (auto& g : campRegard) g = 0.0f;
+    const float h = kCampFootprintHalf;
+    Vector2f c;
+    bool ok = placePoi(h + poiEdgeMargin, kCampPlaceTries, [&](Vector2f p) {
+        float d = hypot(p.x - villageCenter.x, p.y - villageCenter.y);
+        if (d < kCampMinDist || d > kCampMaxDist) return false;
+        for (Vector2f k : {Vector2f(-h, -h), Vector2f(h, -h), Vector2f(-h, h), Vector2f(h, h)})
+            if (zoneAt(p + k) != zoneWild) return false;
+        if (nearQuarter(p, poiQuarterGap)) return false;
+        if (hasRuins() && hypot(p.x - ruinCentre.x, p.y - ruinCentre.y) < kCampRuinGap) return false;
+        for (int i = 0; i < (int)pois.size(); i++) {
+            Vector2f q = poiCentre(i) - p;
+            if (q.x * q.x + q.y * q.y < kCampPoiGap * kCampPoiGap) return false;
+        }
+        return lakeClear(FloatRect(p - Vector2f(h, h), Vector2f(2 * h, 2 * h)));
+    }, c);
+    if (!ok) { printf("Wildfolk: no camp spot found, none placed\n"); return; }
+    wildCamp camp;
+    camp.id = nextCampId++;
+    wildCamps.push_back(camp);
+    RectangleShape fp(Vector2f(2 * h, 2 * h));
+    fp.setPosition(snapPx(c - Vector2f(h, h)));
+    wildCampShapes.push_back(fp);
+    addCampHunter(0, 0);
+    int clearedT = 0, clearedR = 0, clearedB = 0;
+    for (int i = (int)tris.size() - 1; i >= 0; i--) {
+        if (campClear(FloatRect(tris[i].getPosition(), Vector2f(treeFootprint, treeFootprint)))) continue;
+        swapRemove(trees, i); swapRemove(tris, i); swapRemove(stumps, i);
+        clearedT++;
+    }
+    for (int i = (int)octs.size() - 1; i >= 0; i--) {
+        if (campClear(octs[i].getGlobalBounds())) continue;
+        swapRemove(rocks, i); swapRemove(octs, i); swapRemove(rockGold, i);
+        clearedR++;
+    }
+    for (int i = (int)bushshapes.size() - 1; i >= 0; i--) {
+        if (campClear(bushshapes[i].getGlobalBounds())) continue;
+        swapRemove(bushes, i); swapRemove(bushshapes, i);
+        clearedB++;
+    }
+    printf("Wildfolk: camp at (%.0f, %.0f), %.0f px out (cleared %d trees, %d rocks, %d bushes)\n", c.x, c.y,
+           hypot(c.x - villageCenter.x, c.y - villageCenter.y), clearedT, clearedR, clearedB);
+}
+
+// R55-F1: walks a hunter shape one step toward goal every kCampHunterStepTicks; true once it is there
+bool campHunterStep(campHunter& h, RectangleShape& s, Vector2f goal) {
+    Vector2f d = goal - s.getPosition();
+    float dSq = d.x * d.x + d.y * d.y;
+    if (dSq < 1.0f) { s.setPosition(goal); return true; }
+    if (++h.stepTimer < kCampHunterStepTicks) return false;
+    h.stepTimer = 0;
+    s.move(d / sqrt(dSq));
+    return false;
+}
+
+// R55-F1: drop a hunt as one unit (same rule as clearHunt for barbs); the hunter walks back to its tent
+void clearCampHunt(campHunter& h) {
+    h.deertargeting = false;
+    h.targetDeerId = -1;
+    h.tripTicks = 0;
+}
+
+static const char* const campTentWords[kCampMaxTents + 1] = {"no", "a first", "a second", "a third"};
+
+// R55-F1: runs in the fixed-step sim loop after caravanTick(). Every camp lookup is by id, re-resolved here each tick, so
+// nothing holds a camp index across removeCamp(). The barb scan is O(barbs) every kCampScanEveryTicks (no tree scan:
+// trespass reads the chopping barb's own flags). Deer killed here are swapRemoved from deers/deershape together and
+// every barb chasing it is freed through validateDeerTargets().
+void campTick(vector<barb>& barbs, const vector<RectangleShape>& squares, vector<deer>& deers, vector<RectangleShape>& deershape) {
+    for (int i = (int)campHunters.size() - 1; i >= 0; i--)   // a hunter whose camp is gone leaves with it
+        if (findCampById(campHunters[i].campId) < 0) removeCampHunter(i);
+    for (auto& g : campRegard)
+        g = g > 0.0f ? max(0.0f, g - kCampRegardDriftPerTick) : min(0.0f, g + kCampRegardDriftPerTick);
+    static int scanTimer = 0;
+    bool scan = ++scanTimer >= kCampScanEveryTicks;
+    if (scan) scanTimer = 0;
+    int n = min((int)barbs.size(), (int)squares.size());
+    for (int ci = 0; ci < (int)wildCamps.size(); ci++) {
+        wildCamp& camp = wildCamps[ci];
+        for (int r = 0; r < raceCount; r++) {
+            if (camp.tradeCooldown[r] > 0) camp.tradeCooldown[r]--;
+            if (camp.trespassCooldown[r] > 0) camp.trespassCooldown[r]--;
+        }
+        if (++camp.eatTimer >= kCampEatTicks) {   // the camp eats; hunters go out again once there is room
+            camp.eatTimer = 0;
+            if (camp.meat > 0) camp.meat--;
+        }
+        if (!scan) continue;
+        Vector2f cc = campCentre(ci);
+        for (int j = 0; j < n; j++) {
+            barb& b = barbs[j];
+            if (barbHidden(b) || barbUnderground(b) || b.race < 0 || b.race >= raceCount) continue;
+            Vector2f d = squares[j].getPosition() + squares[j].getSize() / 2.0f - cc;
+            float dSq = d.x * d.x + d.y * d.y;
+            if (dSq >= kCampTrespassRadius * kCampTrespassRadius) continue;
+            int r = b.race;
+            if (!camp.found && dSq < kCampFindRadius * kCampFindRadius) {
+                camp.found = true;
+                printf("WILDFOLK - camp %d found by %s (%s)\n", camp.id, b.name, racePlurals[r]);
+                logEvent(string(b.name) + " comes upon a wildfolk camp in the wilds", kCampTickerTint);
+            }
+            raceStock& rs = stockOfRace(r);
+            if (dSq < kCampTradeRadius * kCampTradeRadius && camp.meat > 0 && camp.tradeCooldown[r] == 0 && rs.food >= kCampMeatPriceFood
+                && barbAvailable(b) && !b.deertargeting) {
+                rs.food += kCampMeatLotFood - kCampMeatPriceFood;   // pays the price, takes the lot home in the same write
+                camp.meat--;
+                camp.lotsTraded++;
+                camp.plenty++;
+                camp.tradeCooldown[r] = kCampTradeCooldownTicks;
+                camp.found = true;
+                campRegard[r] = min(kRelationMax, campRegard[r] + kCampTradeDelta);
+                printf("WILDFOLK TRADE - %s (%s) pays %d food for deer meat (+%d), %s food: %d\n", b.name, racePlurals[r],
+                       kCampMeatPriceFood, kCampMeatLotFood, racePlurals[r], rs.food);
+                logEvent(string(b.name) + " trades " + to_string(kCampMeatPriceFood) + " food to the wildfolk for deer meat (+"
+                         + to_string(kCampMeatLotFood) + " food, " + racePlurals[r] + " " + to_string(rs.food) + ")", kCampTickerTint);
+            }
+            if (b.chopping && b.target == targetNone && camp.trespassCooldown[r] == 0) {   // felling a tree by the camp
+                camp.trespassCooldown[r] = kCampTrespassCooldownTicks;
+                campRegard[r] = max(kRelationMin, campRegard[r] - kCampTrespassDelta);
+                printf("WILDFOLK TRESPASS - %s (%s) chops by the camp, regard %.2f\n", b.name, racePlurals[r], campRegard[r]);
+                logEvent(string("The wildfolk frown at ") + racePlurals[r] + " woodcutters near their camp", kCampTickerTint);
+            }
+        }
+    }
+
+    int deerLeft = -1;   // counted on first need, at most once per tick
+    static int searchTimer = 0;
+    bool search = ++searchTimer >= kCampSearchEveryTicks;   // resting hunters look for prey only on these ticks
+    if (search) searchTimer = 0;
+    for (int i = 0; i < (int)campHunters.size(); i++) {
+        campHunter& h = campHunters[i];
+        RectangleShape& s = campHunterShapes[i];
+        int ci = findCampById(h.campId);   // re-resolved every tick
+        if (ci < 0) continue;              // removed at the top of the next tick
+        wildCamp& camp = wildCamps[ci];
+        Vector2f home = campRestPos(ci, h.tent);
+        if (h.deertargeting && findDeerById(deers, h.targetDeerId) == -1) clearCampHunt(h);   // a barb or wolf got it first
+        if (h.carryingMeat) {
+            if (!campHunterStep(h, s, home)) continue;
+            h.carryingMeat = false;
+            camp.meat = min(kCampMeatCap, camp.meat + 1);
+            camp.plenty++;
+            h.restTicks = kCampHunterRestTicks;
+            printf("WILDFOLK - hunter %d brings deer meat home (camp meat %d, plenty %d)\n", h.id, camp.meat, camp.plenty);
+            continue;
+        }
+        if (h.deertargeting) {
+            if (++h.tripTicks > kCampHuntMaxTicks) {
+                printf("WILDFOLK - hunter %d gives up on deer %d\n", h.id, h.targetDeerId);
+                clearCampHunt(h);
+                h.restTicks = kCampHunterRestTicks;
+                continue;
+            }
+            int k = findDeerById(deers, h.targetDeerId);
+            RectangleShape& ds = deershape[k];
+            deer& d = deers[k];
+            campHunterStep(h, s, ds.getPosition() + ds.getSize() / 2.0f - s.getSize() / 2.0f);
+            if (d.invincible || !s.getGlobalBounds().findIntersection(ds.getGlobalBounds())) continue;
+            d.health -= kCampHunterDamage;
+            d.invincible = true;   // deerkilling() counts the timer down and ends the red flash
+            d.invincibleTimer = animalHitInvincibleTicks;
+            ds.setFillColor(Color::Red);
+            if (d.health > 0) continue;
+            swapRemove(deers, k);      // d and ds are invalid from here on
+            swapRemove(deershape, k);
+            validateDeerTargets(barbs, deers);   // no barb keeps hunting the dead deer
+            if (deerLeft >= 0) deerLeft--;
+            clearCampHunt(h);
+            h.carryingMeat = true;
+            printf("WILDFOLK - hunter %d killed a deer\n", h.id);
+            continue;
+        }
+        if (!campHunterStep(h, s, home)) continue;   // walking back empty-handed
+        if (h.restTicks > 0) { h.restTicks--; continue; }
+        if (!search || camp.meat >= kCampMeatCap) continue;
+        if (deerLeft < 0) deerLeft = countSpecies(deers, speciesDeer);
+        if (deerLeft <= kCampHuntMinDeer) continue;
+        int prey = findNearest(campCentre(ci), kCampHuntRadius, (int)deershape.size(),
+                               [&](int k) { return deershape[k].getPosition(); },
+                               [&](int k) {
+                                   if (deers[k].species != speciesDeer) return true;
+                                   for (auto& o : campHunters) if (o.deertargeting && o.targetDeerId == deers[k].id) return true;
+                                   return false;
+                               });
+        if (prey < 0) continue;
+        h.deertargeting = true;
+        h.targetDeerId = deers[prey].id;
+        h.tripTicks = 0;
+        printf("WILDFOLK - hunter %d goes after deer %d\n", h.id, h.targetDeerId);
+    }
+
+    for (int ci = 0; ci < (int)wildCamps.size(); ci++) {   // growth: a tent and its hunter, up to the fixed cap
+        wildCamp& camp = wildCamps[ci];
+        if (camp.tents >= kCampMaxTents) { camp.plenty = min(camp.plenty, kCampTentPlenty); continue; }
+        if (camp.plenty < kCampTentPlenty) continue;
+        camp.plenty -= kCampTentPlenty;
+        int slot = camp.tents++;
+        addCampHunter(ci, slot);   // may reallocate campHunters: no hunter reference is held here
+        printf("WILDFOLK - camp %d pitches tent %d of %d\n", camp.id, camp.tents, kCampMaxTents);
+        logEvent(string("The wildfolk camp pitches ") + campTentWords[camp.tents] + " tent", kCampTickerTint);
+    }
+}
+
+// R55-F1: hide tents, hearth, smoke and pennant in one vertex array, with the buildings (under barbs and trees), culled
+// to the view. Tent (6x5): A-frame of hide, lit left face, shaded right face, dark door flap at the bottom middle and two
+// crossed pole tips above the peak. Tent 0 carries a thin ochre pennant. Hearth: two stones and a 2px ember at the camp
+// centre; one smoke pixel rises 1..3 rows above it, 2px wide at night.
+void drawWildCamp(RenderWindow& window, const FloatRect& camRect, int frame, bool night) {
+    static VertexArray va(PrimitiveType::Triangles);
+    va.clear();
+    for (int ci = 0; ci < (int)wildCamps.size() && ci < (int)wildCampShapes.size(); ci++) {
+        if (!camRect.findIntersection(wildCampShapes[ci].getGlobalBounds())) continue;
+        for (int k = 0; k < wildCamps[ci].tents; k++) {
+            Vector2f o = campTentPos(ci, k);
+            pushQuad(va, o + Vector2f(1.0f, -1.0f), Vector2f(1.0f, 1.0f), kCampPoleColor);   // crossed pole tips
+            pushQuad(va, o + Vector2f(4.0f, -1.0f), Vector2f(1.0f, 1.0f), kCampPoleColor);
+            pushQuad(va, o + Vector2f(2.0f, 0.0f), Vector2f(1.0f, 1.0f), kCampHideLitColor);  // peak
+            pushQuad(va, o + Vector2f(3.0f, 0.0f), Vector2f(1.0f, 1.0f), kCampHideColor);
+            pushQuad(va, o + Vector2f(1.0f, 1.0f), Vector2f(2.0f, 1.0f), kCampHideLitColor);
+            pushQuad(va, o + Vector2f(3.0f, 1.0f), Vector2f(2.0f, 1.0f), kCampHideColor);
+            pushQuad(va, o + Vector2f(1.0f, 2.0f), Vector2f(1.0f, 1.0f), kCampHideLitColor);
+            pushQuad(va, o + Vector2f(2.0f, 2.0f), Vector2f(2.0f, 1.0f), kCampHideColor);
+            pushQuad(va, o + Vector2f(4.0f, 2.0f), Vector2f(1.0f, 1.0f), kCampHideShadeColor);
+            pushQuad(va, o + Vector2f(0.0f, 3.0f), Vector2f(2.0f, 1.0f), kCampHideLitColor);
+            pushQuad(va, o + Vector2f(0.0f, 4.0f), Vector2f(2.0f, 1.0f), kCampHideColor);
+            pushQuad(va, o + Vector2f(2.0f, 3.0f), Vector2f(2.0f, 2.0f), kCampDoorColor);     // door flap
+            pushQuad(va, o + Vector2f(4.0f, 3.0f), Vector2f(2.0f, 2.0f), kCampHideShadeColor);
+            if (k == 0) {   // pennant: the right pole runs up 2px more, 2+1px ochre flag off its top
+                pushQuad(va, o + Vector2f(4.0f, -3.0f), Vector2f(1.0f, 2.0f), kCampPoleColor);
+                pushQuad(va, o + Vector2f(5.0f, -3.0f), Vector2f(2.0f, 1.0f), kCampPennantColor);
+                pushQuad(va, o + Vector2f(5.0f, -2.0f), Vector2f(1.0f, 1.0f), kCampPennantColor);
+            }
+        }
+        Vector2f hc = snapPx(campCentre(ci));
+        pushQuad(va, hc + Vector2f(-2.0f, 0.0f), Vector2f(1.0f, 1.0f), kCampHearthColor);
+        pushQuad(va, hc + Vector2f(1.0f, 0.0f), Vector2f(1.0f, 1.0f), kCampHearthColor);
+        pushQuad(va, hc + Vector2f(-1.0f, 0.0f), Vector2f(2.0f, 1.0f), kCampEmberColor);
+        int step = (frame / kCampSmokeFrames) % 3;
+        Color sm = kCampSmokeColor;
+        sm.a = (uint8_t)(kCampSmokeColor.a * (3 - step) / 3);
+        pushQuad(va, hc + Vector2f(night ? -1.0f : 0.0f, -1.0f - step), Vector2f(night ? 2.0f : 1.0f, 1.0f), sm);
+    }
+    if (va.getVertexCount() > 0) window.draw(va);
+}
+
+// R55-F1: hunters as 2x4 buckskin figures with a dark hair row; a carried lot of meat is a 2x2 red-brown pack on the back
+void drawCampHunters(RenderWindow& window, const FloatRect& camRect) {
+    static VertexArray va(PrimitiveType::Triangles);
+    va.clear();
+    for (int i = 0; i < (int)campHunters.size() && i < (int)campHunterShapes.size(); i++) {
+        Vector2f o = snapPx(campHunterShapes[i].getPosition());
+        if (!camRect.contains(o)) continue;
+        pushQuad(va, o, Vector2f(2.0f, 4.0f), kCampHunterColor);
+        pushQuad(va, o, Vector2f(2.0f, 1.0f), kCampHunterHairColor);
+        if (campHunters[i].carryingMeat) pushQuad(va, o + Vector2f(-2.0f, 1.0f), Vector2f(2.0f, 2.0f), kCampMeatColor);
+    }
+    if (va.getVertexCount() > 0) window.draw(va);
 }
 
 // R45-F1b: one lean-to per race at the ruins, through buildOneOff (jobCamp) by a builder of that race, once its crate
@@ -13403,6 +13830,7 @@ int main() {
     checkQuarters(trees, tris, stumps, rocks, octs, rockGold, bushshapes);   // R30-F1: no quarter short of wood/stone
     spawnRuins(trees, tris, stumps, rocks, octs, rockGold, bushes, bushshapes);   // R45-F1b: last, so it clears whatever landed on the site
     spawnPois(trees, tris, stumps, rocks, octs, rockGold, bushes, bushshapes);    // R47-F4: after the ruins, so sites keep clear of them
+    spawnWildCamp(trees, tris, stumps, rocks, octs, rockGold, bushes, bushshapes);   // R55-F1: after the sites, so it keeps clear of them
     for (auto& s : stock) {   // RACE-F1: every race starts with at least startStock
         s.wood = max(s.wood, startStock.wood);
         s.stone = max(s.stone, startStock.stone);
@@ -13556,6 +13984,7 @@ int main() {
                 watchTick(barbs, squares, prowlers);   // R51-F1: watchmen patrol and fight; slain prowlers fade, prowlerTick() removes them
                 raidTick(barbs, squares, stores);   // R52-F1: raid march and fight; sets raidThreat[] for bellTick() just below
                 caravanTick(barbs, squares, stores);   // R54-F1: caravans, swaps and the friendly timers, once per sim tick
+                campTick(barbs, squares, deers, deershape);   // R55-F1: wildfolk hunters, deer trade, trespass and tents
                 exileTick(barbs, squares, stores);     // R54-F3: walks the migrant; an arrival is only queued here...
                 applyExileTransfers(barbs, squares, houses);   // ...and applied here, outside every barb loop
                 bellTick(barbs, squares, houses, houseshapes, wolves, stores, smoke, dwarfForge, fields,
@@ -13660,6 +14089,7 @@ int main() {
 	drawHollow(window);  // R47-F5: the stair mouth, beside the stones
 	drawCamps(window);
 	drawPois(window, camRect, frameCount);   // R47-F4: huts and wells, with the buildings
+	drawWildCamp(window, camRect, frameCount, isNightHour(game_time));   // R55-F1: hide tents, hearth smoke, pennant
 	drawStall(window, activeTrader);
 	drawForge(window, dwarfForge, frameCount, forgeBonusPending(barbs, dwarfForge), forgeSmelting(barbs));   // R47-F7: smoke wisp
 	if (forgeEmberFrames > 0 && !paused) forgeEmberFrames--;
@@ -13688,6 +14118,7 @@ int main() {
 
         drawOmenAuras(window, shrines);   // R53-F3: faint aura round a shrine while its race's omen holds
         drawRiteRings(window, shrines);   // R52-F3: faint ring round each rite shrine, under the kneelers
+        drawCampHunters(window, camRect);   // R55-F1: with the barbs, under the trees
         drawBarbs(window, barbs, squares, frameCount, zoom);
         for (auto& b : barbs) if (b.raidFlash > 0 && !paused) b.raidFlash--;   // R52-F1: the hit flash lasts 2 drawn frames
 	if (activeTrader) drawSnapped(window, activeTrader->shape);
