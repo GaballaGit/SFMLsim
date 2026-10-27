@@ -54,7 +54,7 @@ const float wolfCoreMarginPx = 80.0f;
 const int wolfSpawnTries = 12;
 constexpr float deerEntryDepthPx = 80.0f;   // arriving animals walk this far in past mapEdgeInset from their side edge
 constexpr float deerOffMapPx = 20.0f;       // arriving animals start this far outside the side edge
-// Gold Veins (R46-F1a): a few rocks are gold-flecked; mining one also adds goldPerRock to the global gold count.
+// Gold Veins (R46-F1a): a few rocks are gold-flecked; mining one also adds goldPerRock to the miner's race purse (R55-F3).
 // The flag lives in rockGold, parallel to rocks/octs. Draw: warmer diamond plus one pale-gold fleck pixel.
 const float goldRockChance = 0.08f;         // per spawned rock
 const int goldPerRock = 1;                  // nuggets per gold rock, on top of its normal stone
@@ -317,7 +317,9 @@ const int kChronicleMaxHouses = 600;                // a load with more houses t
 // feature adds a new tag (no version bump); a loader that does not know a tag skips its words.
 const int32_t kChronicleBlockBarbs = 0x42524142;    // "BARB": the named barbs and leaders
 const int32_t kChronicleBlockKnow = 0x574F4E4B;     // R55-F2 "KNOW": techs, then per race per tech {count, learned}
-const int kChronicleMaxBlocks = 32;                 // blocks per file; more is rejected
+const int32_t kChronicleBlockPurse = 0x53525550;   // R55-F3 "PURS": raceCount, then each race's purse
+const int kChronicleMaxPurse = 1000000;             // per-race purse bound on load
+const int kChronicleMaxBlocks = 32;                // blocks per file; more is rejected
 const int kChronicleMaxBlockWords = 1 << 20;        // int32 words in one block; more is rejected
 const int kChronicleMaxBarbs = 2000;                // a load with more barbs than this is rejected; a save writes at most this many
 const int kChronicleBarbWords = 8;                  // per barb: name, race, birthRace, trait, leader, hunger, age, home
@@ -770,6 +772,12 @@ const Vector2f kTradeCartSize(2.0f, 2.0f);    // cart on the ground behind the l
 const float kTradeCartGapPx = 2.0f;           // cart's left edge this far right of the body (clear of the arm/spear foot)
 const Color kTradeCartColor(128, 112, 90);    // weathered grey-brown wood, the same for every race
 const Color kTradeCoinColor(206, 190, 136);   // 1px pale brass pip on the cart while it carries goods
+// R55-F3 Race Gold Purses, phase 1: gold lives in purse[raceCount] (the HUD gold cell is their sum, never stored apart).
+// Mining a gold rock credits the miner's race. At the rival crate the buyer (the rival) pays coin for the caravan's lot
+// at a two-step price, fixed once per trade; a buyer that can't pay falls back to the old barter, so no race is locked out.
+const int kPriceNormal = 2;                   // coin per lot when the buyer holds at least its trade keep of that kind
+const int kPriceShort = 4;                    // coin per lot when the buyer is short of it (below the keep); the only "+Nc" ticker
+const Color kTradeCoinPaidColor(240, 222, 150);   // the same 1px cart pip, brighter, on a cart paid in coin (no new shape)
 const float kRelFriendlyMinRelation = 0.0f;   // a swap leaving the pair at or above this makes it friendly
 const int kRelFriendlyDays = 2;               // friendly timer per swap, in game days
 const int kRelFriendlyTicks = kRelFriendlyDays * 24 * ticksPerGameHour;
@@ -2432,7 +2440,8 @@ int toolTierOf(int r) {
     while (t + 1 < toolTierCount && n >= toolTierIngots[t + 1]) t++;
     return t;
 }
-int gold = 0;             // R46-F1a: global nuggets, from gold rocks only
+int purse[raceCount] = {};   // R55-F3: each race's nuggets (was the one global gold count); the only store of gold
+int goldTotal() { int s = 0; for (int r = 0; r < raceCount; r++) s += purse[r]; return s; }   // the HUD gold cell
 bool goldFound = false;    // R46-F1a: set by the first nugget; the HUD gold cell stays shown from then on
 char rollGoldRock() { return bernoulli_distribution(goldRockChance)(gen) ? 1 : 0; }   // one roll per spawned rock
 int forgeEmberFrames = 0;  // >0 = ember glows hot; set when a dwarf mines a rock, counted down per drawn frame
@@ -3342,6 +3351,8 @@ struct caravanTrip {
     raceStock cargo{0, 0, 0};               // on the cart now
     int cargoOwner = -1;                    // race the cargo goes back to on an abort (sender out, rival home)
     int giveKind = -1;                      // kind sent out (0 food, 1 wood, 2 stone)
+    int paidCoin = 0;                       // R55-F3: coin the rival paid at the swap. A record for the pip and tooltip only:
+                                            // the coin moved purse to purse at the swap, it never rides on the cart
     int ticks = 0, stayTicks = 0;
 };
 caravanTrip caravan;
@@ -3360,6 +3371,7 @@ void caravanMemberLost(const barb& b) {
 }
 int caravanCartId() { return caravan.active ? caravan.memberIds[0] : -1; }   // R54-F1: drawBarbs() puts the cart on this barb
 bool caravanLaden() { return caravan.active && caravan.cargo.food + caravan.cargo.wood + caravan.cargo.stone > 0; }
+bool caravanPaidInCoin() { return caravan.active && caravan.paidCoin > 0; }   // R55-F3: brighter cart pip on the way home
 
 // R54-F3: the one migrant on the road. Held by barb id (never an index) and re-resolved by exileTick() every tick; a
 // removed barb simply stops resolving and the trip is cancelled. An arrival is queued in exileQueue and applied by
@@ -3411,6 +3423,21 @@ bool isGentry(const barb& b) { return b.homeHouse < 0; }   // R24-F1: founders; 
 int clampRace(int r) { return (r >= 0 && r < raceCount) ? r : 0; }
 raceStock& stockOfRace(int r) { return stock[clampRace(r)]; }
 raceStock& stockOf(const barb& b) { return stockOfRace(b.race); }
+// R55-F3: the one way coin moves between races. Checked before anything changes; both purses change in the same step.
+bool transferCoin(int payer, int payee, int amount) {
+    if (payer < 0 || payer >= raceCount || payee < 0 || payee >= raceCount || payer == payee) return false;
+    if (amount <= 0 || purse[payer] < amount) return false;
+    purse[payer] -= amount;
+    purse[payee] += amount;
+    return true;
+}
+// R55-F3: what race `buyer` pays for one lot of `kind` (0 food, 1 wood, 2 stone): short of it (below its trade keep)
+// is kPriceShort, otherwise kPriceNormal. Callers price a trade once and keep the result.
+bool priceShort(int buyer, int kind) {
+    const raceStock& s = stockOfRace(buyer);
+    return kind == 0 ? s.food < kTradeKeep.food : kind == 1 ? s.wood < kTradeKeep.wood : s.stone < kTradeKeep.stone;
+}
+int priceOf(int buyer, int kind) { return priceShort(buyer, kind) ? kPriceShort : kPriceNormal; }
 bool canAfford(const raceStock& s, int w, int st, int f = 0) { return s.wood >= w && s.stone >= st && s.food >= f; }
 void spend(raceStock& s, int w, int st, int f = 0) {   // callers check canAfford first; the max() keeps a stock from going negative
     s.wood = max(0, s.wood - w);
@@ -5150,6 +5177,7 @@ void drawBarbs(RenderWindow& window, const vector<barb>& barbs, const vector<Rec
     int lootId = lootCarrierId();       // R47-F5
     int cartId = caravanCartId();       // R54-F1
     bool cartLaden = caravanLaden();
+    bool cartCoin = caravanPaidInCoin();   // R55-F3
     static VertexArray lookVerts(PrimitiveType::Triangles);   // R35-F1: every race mark this frame, one draw after the loop
     lookVerts.clear();
     watchTorchPts.clear();   // R51-F1
@@ -5349,8 +5377,8 @@ void drawBarbs(RenderWindow& window, const vector<barb>& barbs, const vector<Rec
             stripe.setFillColor(kTradeCartColor);
             stripe.setPosition(cart);
             window.draw(stripe);
-            if (cartLaden) {
-                dot.setFillColor(kTradeCoinColor);
+            if (cartLaden || cartCoin) {   // R55-F3: same pixel, brighter brass when the lot was paid in coin
+                dot.setFillColor(cartCoin ? kTradeCoinPaidColor : kTradeCoinColor);
                 dot.setPosition(cart + Vector2f(kTradeCartSize.x - 1.0f, -1.0f));
                 window.draw(dot);
             }
@@ -5659,7 +5687,8 @@ string ledgerLine(int target, const vector<barb>& barbs, const storehouse (&stor
     if (target < raceCount) races.push_back(target);
     else for (int r = 0; r < raceCount; r++) if (!stores[r].built) races.push_back(r);
     vector<int> key{target < raceCount ? 0 : campfireWood};
-    for (int r : races) key.insert(key.end(), {r, stock[r].wood, stock[r].stone, stock[r].food, hungry[r], spears[r], raceIngots[r], raceWear[r]});
+    for (int r : races) key.insert(key.end(), {r, stock[r].wood, stock[r].stone, stock[r].food, hungry[r], spears[r], raceIngots[r], raceWear[r],
+                                               purse[r], goldFound ? 1 : 0});   // R55-F3 (prices follow the stock, already keyed)
     if (ledgerCache.target == target && ledgerCache.key == key) return ledgerCache.text;
     string s = target < raceCount ? "" : "Campfire: fire wood " + to_string(campfireWood);
     bool full = races.size() == 1;   // several races at the campfire: stock only, so the single line stays short
@@ -5674,6 +5703,10 @@ string ledgerLine(int target, const vector<barb>& barbs, const storehouse (&stor
             s += "\n" + to_string(raceIngots[r]) + (raceIngots[r] == 1 ? " ingot" : " ingots") + ", tool tier " + to_string(toolTierOf(r));
             int left = max(1, kWearJobs - raceWear[r]);   // R49-F1: read-only, jobs until the next ingot wears away
             s += ", wear in " + to_string(left) + (left == 1 ? " job" : " jobs");
+        }
+        if (full && goldFound) {   // R55-F3: shown once gold exists anywhere; the price a caravan's lot would fetch here
+            auto tier = [&](int kind) { return priceShort(r, kind) ? string("short ") + to_string(kPriceShort) + "c" : to_string(kPriceNormal) + "c"; };
+            s += "\npurse " + to_string(purse[r]) + "c; pays wood " + tier(1) + ", stone " + tier(2) + ", food " + tier(0);
         }
     }
     ledgerCache = {target, key, s};
@@ -5714,6 +5747,7 @@ optional<hoverHit> pickHover(Vector2f p, float radius, const vector<barb>& barbs
                 int dest = caravan.phase == caravanTrip::Home ? caravan.from : caravan.to;
                 label += string("\nCaravan ") + (caravan.phase == caravanTrip::Home ? "home to the " : "to the ") + racePlurals[clampRace(dest)];
                 if (b.id == caravanCartId() && caravanLaden()) label += ", cart: " + lootText(caravan.cargo);
+                if (b.id == caravanCartId() && caravanPaidInCoin()) label += ", paid " + to_string(caravan.paidCoin) + "c";   // R55-F3
             }
             if (isLeader(b) && raceNeed[b.race] != needNone) label += string("\nNeeds: ") + leaderNeedNames[raceNeed[b.race]];   // R30-F2
             if (b.order != needNone)   // INBOX-F2b: hours rounded up so a live order never reads 0h
@@ -6184,7 +6218,7 @@ struct hudValues {
     const char* era;         // settlement rank: Camp / Hamlet / Town / Fourth Age (R54-F4: the leading race's)
     bool learned[raceCount][techCount]; // know-how pips (R20-F1), R55-F2: one row per race
     int pulse[raceCount][techCount];    // frames of white pulse left per pip
-    int gold;                // R46-F1a: global nuggets
+    int gold;                // R46-F1a: nuggets; R55-F3: goldTotal(), the sum of the purses (per race: tooltip only)
     bool goldFound;          // R46-F1a: gold cell hidden until the first nugget
     int day;                 // R51-F3: game_day; the season comes from seasonOf()
 };
@@ -6223,6 +6257,10 @@ string hudDetailText(const hudValues& v) {
     for (int r = 0; r < raceCount; r++)
         s += string("\n  ") + racePlurals[r] + ": " + to_string(v.stock[r].wood) + " / " + to_string(v.stock[r].stone) + " / " + to_string(v.stock[r].food);
     s += "\n  Campfire wood: " + to_string(v.campfireWood);
+    if (v.goldFound) {   // R55-F3: the strip's gold cell is the total; the split lives here
+        s += "\nPurses (gold " + to_string(v.gold) + "):";
+        for (int r = 0; r < raceCount; r++) s += string("\n  ") + racePlurals[r] + ": " + to_string(purse[r]) + "c";
+    }
     s += "\nEras:";   // R54-F4: each race's own rank (the strip shows the leading one)
     for (int r = 0; r < raceCount; r++) s += string("\n  ") + racePlurals[r] + ": " + eraNames[raceEra[r]];
     if (veil.faithSeen) {   // R51-F2: the stock panel's faith tick, in words
@@ -7077,6 +7115,8 @@ struct chronicleData {
     bool haveKnow = false;                         // R55-F2: a "KNOW" block was read (absent in v1/v2 and early v3 files)
     int knowCount[raceCount][techCount] = {};      // clamped to 0..kChronicleMaxKnowCount
     bool knowLearned[raceCount][techCount] = {};
+    bool havePurse = false;                        // R55-F3: a "PURS" block was read (absent in v1/v2 and earlier v3 files)
+    int purse[raceCount] = {};                     // 0..kChronicleMaxPurse each
 };
 
 int chronicleNameIndex(const barb& b) {   // R55-F4: -1 for Sasuke; names only ever come from barbNames or shinobiName
@@ -7127,6 +7167,13 @@ bool chronicleSaveKnow(FILE* f) {
     return ok;
 }
 
+// R55-F3: the "PURS" block: raceCount, then each race's purse
+bool chronicleSavePurse(FILE* f) {
+    bool ok = chronPut(f, kChronicleBlockPurse) && chronPut(f, 1 + raceCount) && chronPut(f, raceCount);
+    for (int r = 0; ok && r < raceCount; r++) ok = chronPut(f, clamp(purse[r], 0, kChronicleMaxPurse));
+    return ok;
+}
+
 bool chronicleSave(const vector<barb>& barbs, const vector<house>& houses) {
     FILE* f = fopen(kChronicleTmpPath, "wb");
     if (!f) { printf("CHRONICLE - save failed: cannot open %s\n", kChronicleTmpPath); return false; }
@@ -7148,6 +7195,7 @@ bool chronicleSave(const vector<barb>& barbs, const vector<house>& houses) {
     }
     ok = ok && chronicleSaveBarbs(f, barbs, houses, n);   // R55-F4 (v3): tagged blocks follow the houses; later blocks go here
     ok = ok && chronicleSaveKnow(f);                      // R55-F2: same v3 format, one more block
+    ok = ok && chronicleSavePurse(f);                     // R55-F3: same v3 format, one more block
     ok = ok && chronPut(f, kChronicleEndMark);
     if (fclose(f) != 0) ok = false;
     if (!ok) {
@@ -7206,6 +7254,16 @@ bool chronicleReadKnow(FILE* f, int words, chronicleData& d, const char*& why) {
             d.knowLearned[r][t] = lrn != 0;
         }
     d.haveKnow = true;
+    return true;
+}
+
+// R55-F3: the "PURS" block into d. Its race count must match this build's and every purse be in range, else the file is rejected.
+bool chronicleReadPurse(FILE* f, int words, chronicleData& d, const char*& why) {
+    int races = 0;
+    if (words != 1 + raceCount || !chronGetIn(f, raceCount, raceCount, races)) { why = "purse block size differs"; return false; }
+    for (int r = 0; r < raceCount; r++)
+        if (!chronGetIn(f, 0, kChronicleMaxPurse, d.purse[r])) { why = "purse out of range"; return false; }
+    d.havePurse = true;
     return true;
 }
 
@@ -7271,6 +7329,9 @@ bool chronicleRead(chronicleData& out, const char*& why) {
                 } else if (tag == kChronicleBlockKnow) {   // R55-F2
                     if (d.haveKnow) { why = "two know blocks"; break; }
                     if (!chronicleReadKnow(f, words, d, why)) break;
+                } else if (tag == kChronicleBlockPurse) {   // R55-F3
+                    if (d.havePurse) { why = "two purse blocks"; break; }
+                    if (!chronicleReadPurse(f, words, d, why)) break;
                 } else {   // a block from a later feature: skipped word by word, so a short file still fails
                     for (int k = 0; k < words && !why; k++) if (!chronGet(f, v)) why = "truncated";
                 }
@@ -7331,6 +7392,11 @@ bool chronicleRestore(const vector<barb>& barbs, vector<house>& houses, vector<R
             know[r].learned[t] = d.knowLearned[r][t] || know[r].count[t] >= knowThreshold(r, (techId)t);
         }
     }
+    // R55-F3: purses, written directly. Migration choice: v1/v2 files (and v3 files from before the PURS block) never
+    // saved the old global gold count, so the gold they carry is 0, split evenly: every race's purse starts at 0.
+    // goldFound follows, so the HUD gold cell shows at once for a world that already has gold.
+    for (int r = 0; r < raceCount; r++) purse[r] = d.havePurse ? clamp(d.purse[r], 0, kChronicleMaxPurse) : 0;
+    goldFound = goldTotal() > 0;
     int placed = 0, moved = 0, dropped = 0;
     for (int hi = 0; hi < (int)d.houses.size(); hi++) {
         const chronicleHouse& ch = d.houses[hi];
@@ -9063,10 +9129,10 @@ void cancelKeep(int r) {
 void buildkeeps(vector<barb>& barbs, vector<RectangleShape>& squares, const storehouse (&stores)[raceCount]) {
     for (int r = 0; r < raceCount; r++) {
         keep& kp = keeps[r];
-        if (kp.built && !kp.gilded && gold >= keepGildCost) {   // R46-F1b: checked before deducting; gilds once
-            gold -= keepGildCost;
+        if (kp.built && !kp.gilded && purse[r] >= keepGildCost) {   // R46-F1b: checked before deducting; gilds once
+            purse[r] -= keepGildCost;                                // R55-F3: from the race's own purse
             kp.gilded = true;
-            printf("---KEEP GILDED--- %s, id %d (%d gold, %d left)\n", raceDefs[r].name, kp.id, keepGildCost, gold);
+            printf("---KEEP GILDED--- %s, id %d (%d gold, %d left in purse)\n", raceDefs[r].name, kp.id, keepGildCost, purse[r]);
             logRaceEvent(string(racePlurals[r]) + " gild their keep's gate", r);
         }
         if (kp.built) continue;
@@ -11428,7 +11494,7 @@ void tryLaunchCaravan(vector<barb>& barbs, vector<RectangleShape>& squares, cons
         for (int d = 0; d < 2; d++) {
             int from = (d == first) ? a : b, to = from == a ? b : a;
             int give = tradeSpareKind(from, -1);
-            if (give < 0 || tradeSpareKind(to, give) < 0) continue;
+            if (give < 0 || (tradeSpareKind(to, give) < 0 && purse[to] < kPriceNormal)) continue;   // R55-F3: or it can pay coin
             int pick[kTradeMembers];
             bool ok = true;
             for (int k = 0; k < kTradeMembers && ok; k++) {
@@ -11471,23 +11537,31 @@ void tryLaunchCaravan(vector<barb>& barbs, vector<RectangleShape>& squares, cons
 // R54-F1: at the rival crate. The sender's lot goes into the rival stock and the rival's best other spare kind comes
 // back on the cart; the relation warms and, at or above kRelFriendlyMinRelation, the friendly timer is (re)set.
 // A rival with nothing left to spare sends the cart home with its own goods.
-void caravanSwap() {
+// R55-F3: price is fixed once by caravanTick() for this trade. The rival pays it in coin through transferCoin() (checked,
+// then both purses move together) and the cart goes home empty with a brighter pip; a rival that can't pay barters as
+// before, so a broke race still trades. "+Nc" reaches the ticker only at the short price.
+void caravanSwap(int price) {
     int a = clampRace(caravan.from), b = clampRace(caravan.to);
-    int get = tradeSpareKind(b, caravan.giveKind);
-    if (get < 0) {
+    bool coin = transferCoin(b, a, price);
+    int get = coin ? -1 : tradeSpareKind(b, caravan.giveKind);
+    if (!coin && get < 0) {
         string line = string(racePlurals[b]) + " have nothing to spare: the " + racePlurals[a] + "' caravan heads home";
-        printf("---CARAVAN NO TRADE--- %s\n", line.c_str());
+        printf("---CARAVAN NO TRADE--- %s (purse %d, price %d)\n", line.c_str(), purse[b], price);
         logEvent(line, kTradeTickerTint);
         return;
     }
     raceStock& rb = stockOfRace(b);
     rb.food += caravan.cargo.food; rb.wood += caravan.cargo.wood; rb.stone += caravan.cargo.stone;
-    raceStock sent = caravan.cargo, got = tradeLot(get);
+    raceStock sent = caravan.cargo, got = coin ? raceStock{0, 0, 0} : tradeLot(get);
     spend(rb, got.wood, got.stone, got.food);
     caravan.cargo = got;
     caravan.cargoOwner = b;
+    caravan.paidCoin = coin ? price : 0;
     setRelation(a, b, raceRelation[a][b] + kTradeRelationDelta);
-    string line = string(racePlurals[a]) + " and " + racePlurals[b] + " trade " + lootText(sent) + " for " + lootText(got);
+    string line = coin ? string(racePlurals[a]) + " sell " + lootText(sent) + " to the " + racePlurals[b]
+                         + (price >= kPriceShort ? ": +" + to_string(price) + "c, they ran short" : " for coin")
+                       : string(racePlurals[a]) + " and " + racePlurals[b] + " trade " + lootText(sent) + " for " + lootText(got);
+    if (coin) printf("CARAVAN COIN - %s paid %d to the %s (purses %d / %d)\n", racePlurals[b], price, racePlurals[a], purse[b], purse[a]);
     if (raceRelation[a][b] >= kRelFriendlyMinRelation) {
         bool renewed = pairFriendly(a, b);
         relFriendlyTicks[a][b] = relFriendlyTicks[b][a] = kRelFriendlyTicks;
@@ -11561,7 +11635,7 @@ void caravanTick(vector<barb>& barbs, vector<RectangleShape>& squares, const sto
             if (m.moving) { m.moving = false; clearRoute(m); m.stepTimer = 0; }
         }
         if (++caravan.stayTicks < kTradeStayTicks) return;
-        caravanSwap();
+        caravanSwap(priceOf(to, caravan.giveKind));   // R55-F3: priced once, here, for this one trade
         caravan.phase = caravanTrip::Home;
         return;
     }
@@ -12805,10 +12879,11 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
 				}
 				if (b.race == raceDwarf) forgeEmberFrames = forgeEmberBoostFrames; // forge ember flares (drawn only once built)
 				memRecord(b, memRock, Vector2f((int)rix, (int)riy));   // INBOX-F2
-				if (i < (int)rockGold.size() && rockGold[i]) {   // R46-F1a: nuggets go straight to the global count; stone still hauls
-					gold += goldPerRock;
+				if (i < (int)rockGold.size() && rockGold[i]) {   // R46-F1a: nuggets go straight in; stone still hauls
+					purse[clampRace(b.race)] += goldPerRock;     // R55-F3: into the miner's race's purse
 					goldFound = true;
-					printf("GOLD ROCK MINED - barb %d, +%d gold (total %d)\n", b.id, goldPerRock, gold);
+					printf("GOLD ROCK MINED - barb %d, +%d gold to the %s (purse %d, total %d)\n", b.id, goldPerRock,
+					       racePlurals[clampRace(b.race)], purse[clampRace(b.race)], goldTotal());
 				}
 				swapRemove(rocks, i);
 				swapRemove(octs, i);
@@ -14475,7 +14550,7 @@ int main() {
                 : activeTrader->phase == trader::Trading ? "Trading" : "Leaving";
             hv.tradeLine = tradeMsgTimer > 0 ? tradeMsg : "";
             hv.era = eraNames[leadingEra()];   // R54-F4: the leading race's rank; the tooltip lists each race
-            hv.gold = gold;              // R46-F1a
+            hv.gold = goldTotal();       // R46-F1a; R55-F3: the sum of the purses, no separate count
             hv.goldFound = goldFound;
             hv.day = game_day;           // R51-F3
             for (int r = 0; r < raceCount; r++)   // R55-F2: one pip row per race
